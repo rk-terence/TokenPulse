@@ -85,9 +85,10 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
     // MARK: - Reset checks
 
     private func checkResets(provider: String, previous: ProviderSnapshot, current: ProviderSnapshot) {
+        // A real 5h reset jumps resetsAt forward by hours; ignore jitter under 1h
         if let prevReset = previous.fiveHourResetsAt,
            let curReset = current.fiveHourResetsAt,
-           curReset != prevReset {
+           curReset.timeIntervalSince(prevReset) > 3600 {
             send(
                 id: "\(provider)-5h-reset",
                 title: String(
@@ -98,9 +99,10 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
             )
         }
 
+        // A real 7d reset jumps resetsAt forward by days; ignore jitter under 1 day
         if let prevReset = previous.sevenDayResetsAt,
            let curReset = current.sevenDayResetsAt,
-           curReset != prevReset {
+           curReset.timeIntervalSince(prevReset) > 86400 {
             send(
                 id: "\(provider)-7d-reset",
                 title: String(
