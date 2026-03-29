@@ -35,6 +35,36 @@ struct ZenMuxProvider: UsageProvider {
         return try parseResponse(data)
     }
 
+    func classifyError(_ error: Error) -> FailureDisposition {
+        if let error = error as? KeychainError {
+            switch error {
+            case .itemNotFound:
+                return .unconfigured
+            case .invalidData, .unexpectedStatus:
+                return .persistent(error.localizedDescription)
+            }
+        }
+
+        if let error = error as? ZenMuxProviderError {
+            switch error {
+            case .missingAPIKey:
+                return .unconfigured
+            case .httpError(let code) where code == 422 || code == 429 || code >= 500:
+                return .transient(String(localized: "ZenMux API returned HTTP \(code). Showing last successful data."))
+            case .httpError(401), .httpError(403):
+                return .persistent(String(localized: "ZenMux API key was rejected. Update it in Settings."))
+            case .httpError(let code):
+                return .persistent(String(localized: "ZenMux API returned HTTP \(code)"))
+            }
+        }
+
+        if let error = error as? URLError {
+            return classifyURLError(error)
+        }
+
+        return .persistent(error.localizedDescription)
+    }
+
     // MARK: - Internal
 
     static let keychainService = "TokenPulse-ZenMuxAPIKey"
@@ -99,6 +129,17 @@ struct ZenMuxProvider: UsageProvider {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f.date(from: string)
+    }
+
+    private func classifyURLError(_ error: URLError) -> FailureDisposition {
+        switch error.code {
+        case .timedOut:
+            return .transient(String(localized: "Request timed out. Showing last successful data."))
+        case .notConnectedToInternet, .networkConnectionLost:
+            return .transient(String(localized: "Network connection dropped. Showing last successful data."))
+        default:
+            return .transient(String(localized: "\(error.localizedDescription). Showing last successful data."))
+        }
     }
 }
 

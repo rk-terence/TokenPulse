@@ -7,6 +7,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let providerManager = ProviderManager()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Request notification permission
+        NotificationService.shared.requestAuthorization()
+
         // Register providers
         providerManager.register(ClaudeProvider())
         providerManager.register(ZenMuxProvider())
@@ -15,8 +18,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusBarController = StatusBarController(providerManager: providerManager)
 
         // Wire icon updates
-        providerManager.onIconUpdate = { [weak self] label, utilization in
-            self?.statusBarController?.updateIcon(label: label, utilization: utilization)
+        providerManager.onIconUpdate = { [weak self] model in
+            self?.statusBarController?.updateIcon(model)
         }
 
         // Wire right-click to cycle active provider

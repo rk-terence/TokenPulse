@@ -14,7 +14,7 @@ final class StatusBarController {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         // Placeholder icon
-        updateIcon(label: "?", utilization: 0)
+        updateIcon(StatusBarIconModel(label: "?", utilization: nil, state: .unconfigured))
 
         // Popover content
         let view = PopoverView(manager: providerManager) { [weak self] in
@@ -49,8 +49,8 @@ final class StatusBarController {
         }
     }
 
-    func updateIcon(label: String, utilization: Double) {
-        let image = BarIconRenderer.renderIcon(label: label, utilization: utilization)
+    func updateIcon(_ model: StatusBarIconModel) {
+        let image = BarIconRenderer.renderIcon(model)
         statusItem.button?.image = image
         statusItem.length = image.size.width
     }

@@ -35,6 +35,40 @@ struct ClaudeProvider: UsageProvider {
         return try parseResponse(data)
     }
 
+    func classifyError(_ error: Error) -> FailureDisposition {
+        if let error = error as? KeychainError {
+            switch error {
+            case .itemNotFound:
+                return .unconfigured
+            case .invalidData:
+                return .auth(String(localized: "Claude credentials changed. Sign in to Claude Code again. TokenPulse will recover automatically."))
+            case .unexpectedStatus:
+                return .persistent(error.localizedDescription)
+            }
+        }
+
+        if let error = error as? ClaudeProviderError {
+            switch error {
+            case .credentialParseFailed:
+                return .auth(String(localized: "Claude credentials changed. Sign in to Claude Code again. TokenPulse will recover automatically."))
+            case .rateLimited:
+                return .transient(String(localized: "Claude is rate limited. Showing last successful data."))
+            case .httpError(401):
+                return .auth(String(localized: "Claude session expired. Sign in to Claude Code. TokenPulse will recover automatically."))
+            case .httpError(let code) where code >= 500:
+                return .transient(String(localized: "Claude API returned HTTP \(code). Showing last successful data."))
+            case .httpError(let code):
+                return .persistent(String(localized: "Claude API returned HTTP \(code)"))
+            }
+        }
+
+        if let error = error as? URLError {
+            return classifyURLError(error)
+        }
+
+        return .persistent(error.localizedDescription)
+    }
+
     // MARK: - Private
 
     private static let credentialService = "Claude Code-credentials"
@@ -85,6 +119,17 @@ struct ClaudeProvider: UsageProvider {
             extras: extras,
             fetchedAt: .now
         )
+    }
+
+    private func classifyURLError(_ error: URLError) -> FailureDisposition {
+        switch error.code {
+        case .timedOut:
+            return .transient(String(localized: "Request timed out. Showing last successful data."))
+        case .notConnectedToInternet, .networkConnectionLost:
+            return .transient(String(localized: "Network connection dropped. Showing last successful data."))
+        default:
+            return .transient(String(localized: "\(error.localizedDescription). Showing last successful data."))
+        }
     }
 }
 

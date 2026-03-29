@@ -27,17 +27,18 @@ struct PopoverView: View {
 
             Divider()
 
-            // Provider rows
-            if manager.providerEntries.isEmpty {
-                Text("No providers configured")
+            if manager.configuredProviderCount == 0 {
+                Text("No providers configured. Open Settings to connect Claude or ZenMux.")
                     .foregroundStyle(.secondary)
                     .font(.callout)
-            } else {
-                ForEach(manager.providerEntries, id: \.id) { entry in
-                    ProviderRow(entry: entry)
-                    if entry.id != manager.providerEntries.last?.id {
-                        Divider()
-                    }
+                Divider()
+            }
+
+            // Provider rows
+            ForEach(manager.providerEntries, id: \.id) { entry in
+                ProviderRow(entry: entry)
+                if entry.id != manager.providerEntries.last?.id {
+                    Divider()
                 }
             }
 
@@ -46,7 +47,7 @@ struct PopoverView: View {
             // Footer
             HStack {
                 if let lastUpdate = manager.lastUpdated {
-                    Text("Updated \(lastUpdate, style: .relative) ago")
+                    Text("Last checked \(lastUpdate, style: .relative)")
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                 }
@@ -60,7 +61,7 @@ struct PopoverView: View {
             }
         }
         .padding(12)
-        .frame(width: 280)
+        .frame(width: 320)
     }
 
 }
@@ -85,43 +86,111 @@ private struct ProviderRow: View {
                     .foregroundStyle(.secondary)
             }
 
-            if case .ready(let data) = entry.status {
-                // Quota rows
-                QuotaGrid(entry: entry, data: data)
+            if let data = entry.status.displayData {
+                QuotaGrid(entry: entry, data: data, tone: dataTone)
             }
 
-            if case .error(let msg) = entry.status {
-                Text(msg)
+            if let detailText = entry.status.message {
+                Text(detailText)
                     .font(.caption)
-                    .foregroundStyle(.red)
-                    .lineLimit(2)
+                    .foregroundStyle(detailColor)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if showsLastSuccessHint, let lastSuccessAt = entry.lastSuccessAt {
+                Text("Last success \(lastSuccessAt, style: .relative)")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
             }
         }
     }
 
     private var statusColor: Color {
         switch entry.status {
-        case .idle: return .gray
-        case .loading: return .blue
+        case .unconfigured: return .gray
+        case .pendingFirstLoad, .refreshing: return .blue
         case .ready(let data):
             guard let u = data.fiveHour?.utilization else { return .gray }
             if u <= 50 { return .green }
             else if u <= 80 { return .orange }
             else { return .red }
+        case .stale: return .gray
         case .error: return .red
         }
     }
 
     private var fiveHourText: String {
+        if let u = entry.status.displayData?.fiveHour?.utilization {
+            return String(format: "%.0f%%", u)
+        }
+
         switch entry.status {
-        case .ready(let data):
-            if let u = data.fiveHour?.utilization {
-                return String(format: "%.0f%%", u)
-            }
+        case .refreshing:
+            return "..."
+        case .stale(_, let reason, _) where reason == .auth:
+            return "auth"
+        case .error:
+            return "err"
+        case .unconfigured, .pendingFirstLoad, .ready, .stale:
             return "--"
-        case .loading: return "..."
-        case .error: return "err"
-        case .idle: return "--"
+        }
+    }
+
+    private var dataTone: ProviderDataTone {
+        switch entry.status {
+        case .ready:
+            return .fresh
+        case .refreshing:
+            return .refreshing
+        case .stale:
+            return .stale
+        case .unconfigured, .pendingFirstLoad, .error:
+            return .fresh
+        }
+    }
+
+    private var detailColor: Color {
+        switch entry.status {
+        case .stale(_, let reason, _) where reason == .auth:
+            return .orange
+        case .error:
+            return .red
+        case .unconfigured, .pendingFirstLoad, .refreshing, .stale, .ready:
+            return .secondary
+        }
+    }
+
+    private var showsLastSuccessHint: Bool {
+        switch entry.status {
+        case .refreshing(let lastData):
+            return lastData != nil
+        case .stale:
+            return true
+        case .unconfigured, .pendingFirstLoad, .ready, .error:
+            return false
+        }
+    }
+}
+
+// MARK: - Data Tone
+
+private enum ProviderDataTone {
+    case fresh
+    case refreshing
+    case stale
+
+    var opacity: Double {
+        switch self {
+        case .fresh: return 1.0
+        case .refreshing: return 0.82
+        case .stale: return 0.74
+        }
+    }
+
+    var grayscaleAmount: Double {
+        switch self {
+        case .fresh, .refreshing: return 0
+        case .stale: return 1
         }
     }
 }
@@ -131,6 +200,7 @@ private struct ProviderRow: View {
 private struct QuotaGrid: View {
     let entry: ProviderEntry
     let data: UsageData
+    let tone: ProviderDataTone
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -164,6 +234,8 @@ private struct QuotaGrid: View {
                 EmptyView()
             }
         }
+        .grayscale(tone.grayscaleAmount)
+        .opacity(tone.opacity)
     }
 
     // MARK: - Claude extras

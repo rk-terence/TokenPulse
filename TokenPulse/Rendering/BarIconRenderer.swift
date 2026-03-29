@@ -9,21 +9,20 @@ enum BarIconRenderer {
     private static let percentFontSize: CGFloat = 7.5
     private static let labelBarGap: CGFloat = 3
 
-    /// Render: [C][==65%==]  — label to the left, remaining % inside the bar.
+    /// Render: [C][==65%==] — label to the left, remaining % inside the bar.
     @MainActor
-    static func renderIcon(label: String, utilization: Double) -> NSImage {
+    static func renderIcon(_ model: StatusBarIconModel) -> NSImage {
         let isDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
 
         // Measure label width
-        let labelStr = attributedLabel(label, isDark: isDark)
+        let labelStr = attributedLabel(model.label, isDark: isDark)
         let labelWidth = ceil(labelStr.size().width)
 
         let totalWidth = labelWidth + labelBarGap + shellWidth
         let height: CGFloat = 22
 
         let image = NSImage(size: NSSize(width: totalWidth, height: height), flipped: false) { rect in
-            let clamped = min(max(utilization, 0), 100)
-            drawIcon(label: label, utilization: clamped, isDark: isDark, labelWidth: labelWidth, in: rect)
+            drawIcon(model, isDark: isDark, labelWidth: labelWidth, in: rect)
             return true
         }
         image.isTemplate = false
@@ -32,12 +31,12 @@ enum BarIconRenderer {
 
     // MARK: - Drawing
 
-    private static func drawIcon(label: String, utilization: Double, isDark: Bool, labelWidth: CGFloat, in rect: NSRect) {
-        let shellColor: NSColor = isDark ? .white : .black
+    private static func drawIcon(_ model: StatusBarIconModel, isDark: Bool, labelWidth: CGFloat, in rect: NSRect) {
+        let shellColor = shellStrokeColor(for: model.state, isDark: isDark)
         let shellY = (rect.height - shellHeight) / 2
 
         // Draw provider label to the left
-        let labelStr = attributedLabel(label, isDark: isDark)
+        let labelStr = attributedLabel(model.label, isDark: isDark)
         let labelSize = labelStr.size()
         let labelPoint = NSPoint(
             x: 0,
@@ -53,27 +52,27 @@ enum BarIconRenderer {
         shellPath.lineWidth = shellLineWidth
         shellPath.stroke()
 
-        // Fill bar — inverted: full when usage=0, empty when usage=100
-        let remaining = 100.0 - utilization
-        let inset: CGFloat = shellLineWidth + 0.5
-        let fillableWidth = shellWidth - inset * 2
-        let fillWidth = fillableWidth * CGFloat(remaining / 100.0)
+        if let utilization = model.utilization {
+            // Fill bar — inverted: full when usage=0, empty when usage=100
+            let remaining = 100.0 - min(max(utilization, 0), 100)
+            let inset: CGFloat = shellLineWidth + 0.5
+            let fillableWidth = shellWidth - inset * 2
+            let fillWidth = fillableWidth * CGFloat(remaining / 100.0)
 
-        if fillWidth > 0 {
-            let fillRect = NSRect(
-                x: shellRect.origin.x + inset,
-                y: shellRect.origin.y + inset,
-                width: fillWidth,
-                height: shellRect.height - inset * 2
-            )
-            let fillPath = NSBezierPath(roundedRect: fillRect, xRadius: 1, yRadius: 1)
-            fillColor(for: utilization).setFill()
-            fillPath.fill()
+            if fillWidth > 0 {
+                let fillRect = NSRect(
+                    x: shellRect.origin.x + inset,
+                    y: shellRect.origin.y + inset,
+                    width: fillWidth,
+                    height: shellRect.height - inset * 2
+                )
+                let fillPath = NSBezierPath(roundedRect: fillRect, xRadius: 1, yRadius: 1)
+                fillColor(for: utilization, state: model.state).setFill()
+                fillPath.fill()
+            }
         }
 
-        // Remaining percentage centered inside bar
-        let remainingInt = Int(round(remaining))
-        drawPercentage("\(remainingInt)", in: shellRect, isDark: isDark)
+        drawCenterText(centerText(for: model), in: shellRect, state: model.state, isDark: isDark)
     }
 
     private static func attributedLabel(_ text: String, isDark: Bool) -> NSAttributedString {
@@ -86,7 +85,7 @@ enum BarIconRenderer {
         return NSAttributedString(string: String(text.prefix(1)), attributes: attrs)
     }
 
-    private static func drawPercentage(_ text: String, in shellRect: NSRect, isDark: Bool) {
+    private static func drawCenterText(_ text: String, in shellRect: NSRect, state: StatusBarIconState, isDark: Bool) {
         let font = NSFont.monospacedDigitSystemFont(ofSize: percentFontSize, weight: .bold)
 
         let shadow = NSShadow()
@@ -94,7 +93,7 @@ enum BarIconRenderer {
         shadow.shadowOffset = NSSize(width: 0, height: -0.5)
         shadow.shadowBlurRadius = 1.5
 
-        let color: NSColor = isDark ? .white : .black
+        let color = centerTextColor(for: state, isDark: isDark)
         let attrs: [NSAttributedString.Key: Any] = [
             .font: font,
             .foregroundColor: color.withAlphaComponent(0.95),
@@ -109,14 +108,70 @@ enum BarIconRenderer {
         attrStr.draw(at: drawPoint)
     }
 
-    /// Color based on usage: green <=50% (plenty left), amber 51-80%, red >80% (nearly exhausted).
-    private static func fillColor(for utilization: Double) -> NSColor {
+    // MARK: - State-aware colors
+
+    private static func fillColor(for utilization: Double, state: StatusBarIconState) -> NSColor {
+        let baseColor: NSColor
         if utilization <= 50 {
-            return NSColor.systemGreen
+            baseColor = NSColor.systemGreen
         } else if utilization <= 80 {
-            return NSColor.systemOrange
+            baseColor = NSColor.systemOrange
         } else {
+            baseColor = NSColor.systemRed
+        }
+
+        switch state {
+        case .ready:
+            return baseColor
+        case .refreshing:
+            return baseColor.withAlphaComponent(0.55)
+        case .stale:
+            return NSColor.systemGray
+        case .error, .unconfigured:
+            return .clear
+        }
+    }
+
+    private static func shellStrokeColor(for state: StatusBarIconState, isDark: Bool) -> NSColor {
+        let base = isDark ? NSColor.white : NSColor.black
+        switch state {
+        case .ready, .refreshing:
+            return base
+        case .stale, .unconfigured:
+            return NSColor.secondaryLabelColor
+        case .error:
             return NSColor.systemRed
+        }
+    }
+
+    private static func centerTextColor(for state: StatusBarIconState, isDark: Bool) -> NSColor {
+        let base = isDark ? NSColor.white : NSColor.black
+        switch state {
+        case .ready, .refreshing:
+            return base
+        case .stale, .unconfigured:
+            return NSColor.secondaryLabelColor
+        case .error:
+            return NSColor.systemRed
+        }
+    }
+
+    private static func centerText(for model: StatusBarIconModel) -> String {
+        switch model.state {
+        case .unconfigured:
+            return "?"
+        case .error:
+            return "!"
+        case .ready, .stale:
+            if let utilization = model.utilization {
+                return "\(Int(round(100.0 - utilization)))"
+            }
+            return "?"
+        case .refreshing:
+            if let utilization = model.utilization {
+                return "\(Int(round(100.0 - utilization)))"
+            }
+            return "~"
         }
     }
 }

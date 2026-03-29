@@ -5,7 +5,6 @@ final class PollingManager {
     private let providerManager: ProviderManager
     private var timer: Timer?
     private var interval: TimeInterval
-    private var backoffInterval: TimeInterval?
 
     init(providerManager: ProviderManager, interval: TimeInterval = ProviderConfig.defaultPollInterval) {
         self.providerManager = providerManager
@@ -13,8 +12,7 @@ final class PollingManager {
     }
 
     func start() {
-        // Fire immediately on start
-        Task { await providerManager.refreshAll() }
+        providerManager.requestRefresh(.automatic)
         scheduleTimer()
     }
 
@@ -33,10 +31,7 @@ final class PollingManager {
 
     private func scheduleTimer() {
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            Task { @MainActor in
-                await self.providerManager.refreshAll()
-            }
+            self?.providerManager.requestRefresh(.automatic)
         }
     }
 }

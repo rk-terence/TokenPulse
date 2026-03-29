@@ -24,6 +24,8 @@ enum UsageExporter {
         let sevenDay: WindowUsage?
         let extras: [String: String]?
         let fetchedAt: Date?
+        let lastAttemptAt: Date?
+        let lastSuccessAt: Date?
     }
 
     static func write(entries: [ProviderEntry]) {
@@ -31,6 +33,42 @@ enum UsageExporter {
         for entry in entries {
             let payload: ProviderPayload
             switch entry.status {
+            case .unconfigured:
+                payload = ProviderPayload(
+                    displayName: entry.displayName,
+                    status: "unconfigured",
+                    error: nil,
+                    fiveHour: nil,
+                    sevenDay: nil,
+                    extras: nil,
+                    fetchedAt: nil,
+                    lastAttemptAt: entry.lastAttemptAt,
+                    lastSuccessAt: entry.lastSuccessAt
+                )
+            case .pendingFirstLoad:
+                payload = ProviderPayload(
+                    displayName: entry.displayName,
+                    status: "pending_first_load",
+                    error: nil,
+                    fiveHour: nil,
+                    sevenDay: nil,
+                    extras: nil,
+                    fetchedAt: nil,
+                    lastAttemptAt: entry.lastAttemptAt,
+                    lastSuccessAt: entry.lastSuccessAt
+                )
+            case .refreshing(let lastData):
+                payload = ProviderPayload(
+                    displayName: entry.displayName,
+                    status: "refreshing",
+                    error: nil,
+                    fiveHour: lastData?.fiveHour,
+                    sevenDay: lastData?.sevenDay,
+                    extras: lastData?.extras.isEmpty == false ? lastData?.extras : nil,
+                    fetchedAt: lastData?.fetchedAt,
+                    lastAttemptAt: entry.lastAttemptAt,
+                    lastSuccessAt: entry.lastSuccessAt
+                )
             case .ready(let data):
                 payload = ProviderPayload(
                     displayName: entry.displayName,
@@ -39,7 +77,21 @@ enum UsageExporter {
                     fiveHour: data.fiveHour,
                     sevenDay: data.sevenDay,
                     extras: data.extras.isEmpty ? nil : data.extras,
-                    fetchedAt: data.fetchedAt
+                    fetchedAt: data.fetchedAt,
+                    lastAttemptAt: entry.lastAttemptAt,
+                    lastSuccessAt: entry.lastSuccessAt
+                )
+            case .stale(let data, let reason, let msg):
+                payload = ProviderPayload(
+                    displayName: entry.displayName,
+                    status: reason == .auth ? "auth_stale" : "stale",
+                    error: msg,
+                    fiveHour: data.fiveHour,
+                    sevenDay: data.sevenDay,
+                    extras: data.extras.isEmpty ? nil : data.extras,
+                    fetchedAt: data.fetchedAt,
+                    lastAttemptAt: entry.lastAttemptAt,
+                    lastSuccessAt: entry.lastSuccessAt
                 )
             case .error(let msg):
                 payload = ProviderPayload(
@@ -49,27 +101,9 @@ enum UsageExporter {
                     fiveHour: nil,
                     sevenDay: nil,
                     extras: nil,
-                    fetchedAt: nil
-                )
-            case .loading:
-                payload = ProviderPayload(
-                    displayName: entry.displayName,
-                    status: "loading",
-                    error: nil,
-                    fiveHour: nil,
-                    sevenDay: nil,
-                    extras: nil,
-                    fetchedAt: nil
-                )
-            case .idle:
-                payload = ProviderPayload(
-                    displayName: entry.displayName,
-                    status: "idle",
-                    error: nil,
-                    fiveHour: nil,
-                    sevenDay: nil,
-                    extras: nil,
-                    fetchedAt: nil
+                    fetchedAt: nil,
+                    lastAttemptAt: entry.lastAttemptAt,
+                    lastSuccessAt: entry.lastSuccessAt
                 )
             }
             providers[entry.id] = payload
