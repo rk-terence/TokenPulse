@@ -263,8 +263,16 @@ private struct QuotaGrid: View {
 
     @ViewBuilder
     private var zenMuxExtras: some View {
-        // Monthly cap
-        if let maxUsd = data.extras["moMaxUsd"] {
+        // Monthly utilization (from subscription_summary) or fallback to cap-only display
+        if let utilizationStr = data.extras["moUtilization"],
+           let utilization = Double(utilizationStr) {
+            QuotaRow(
+                label: "mo",
+                utilization: utilization,
+                resetsAt: data.extras["moResetsAt"].flatMap { ISO8601DateFormatter().date(from: $0) },
+                detail: usdDetail(used: "moUsedUsd", max: "moMaxUsd")
+            )
+        } else if let maxUsd = data.extras["moMaxUsd"] {
             HStack(spacing: 4) {
                 Text("mo")
                     .font(.body)

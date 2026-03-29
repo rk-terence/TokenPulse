@@ -20,7 +20,7 @@ A macOS menu bar app that monitors your AI platform token usage at a glance. It 
 | Provider | Auth method | What it shows |
 |----------|-------------|---------------|
 | **Claude** (Anthropic) | Keychain (Claude Code OAuth token) | 5h window, 7-day quota, Opus quota |
-| **ZenMux** | Management API key (from ZenMux dashboard) | 5h window, 7-day quota, monthly quota, tier, account status |
+| **ZenMux** | Management API key + Chrome cookies (auto-extracted) | 5h window, 7-day quota, monthly utilization*, tier, account status |
 
 ## Why TokenPulse?
 
@@ -64,6 +64,8 @@ TokenPulse reads your Claude Code OAuth credentials from the macOS Keychain auto
 1. Get a **Management API Key** from your [ZenMux dashboard](https://zenmux.ai)
 2. Open **Settings > Providers > ZenMux** and paste the key
 3. Click **Save** — the key is stored securely in your macOS Keychain
+
+*Monthly utilization requires an active ZenMux session in Chrome. TokenPulse reads Chrome's encrypted cookies automatically (via the Keychain-stored Chrome Safe Storage key). If Chrome cookies are unavailable, everything else still works — only the monthly usage bar is hidden, and the monthly cap is shown as a static value instead.
 
 ## Usage
 
@@ -110,7 +112,7 @@ TokenPulse/
 ├── App/            # AppDelegate, StatusBarController, entry point
 ├── Models/         # UsageData, ProviderStatus, ProviderConfig
 ├── Providers/      # UsageProvider protocol + Claude, ZenMux implementations
-├── Services/       # KeychainService, ConfigService, PollingManager, ProviderManager, NotificationService
+├── Services/       # KeychainService, ChromeCookieService, ConfigService, PollingManager, ProviderManager, NotificationService
 ├── Views/          # PopoverView, SettingsView (SwiftUI)
 └── Rendering/      # BarIconRenderer (Core Graphics)
 ```

@@ -23,16 +23,16 @@ struct ZenMuxProvider: UsageProvider {
             throw ZenMuxProviderError.missingAPIKey
         }
 
-        let request = buildRequest(apiKey: apiKey)
-        let (data, response) = try await session.data(for: request)
+        // Fetch management API (primary) and subscription summary (optional) concurrently
+        let cookies = try? ChromeCookieService.extractZenMuxCookies()
 
-        guard let http = response as? HTTPURLResponse,
-              (200..<300).contains(http.statusCode) else {
-            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-            throw ZenMuxProviderError.httpError(code)
-        }
+        async let primaryFetch = fetchManagementAPI(apiKey: apiKey)
+        async let summaryFetch = fetchSubscriptionSummary(cookies: cookies)
 
-        return try parseResponse(data)
+        let primaryData = try await primaryFetch
+        let summaryData = await summaryFetch
+
+        return buildUsageData(primary: primaryData, summary: summaryData)
     }
 
     func classifyError(_ error: Error) -> FailureDisposition {
@@ -69,20 +69,55 @@ struct ZenMuxProvider: UsageProvider {
 
     static let keychainService = "TokenPulse-ZenMuxAPIKey"
 
-    private static let endpoint = "https://zenmux.ai/api/v1/management/subscription/detail"
+    private static let managementEndpoint = "https://zenmux.ai/api/v1/management/subscription/detail"
+    private static let summaryEndpoint = "https://zenmux.ai/api/dashboard/cost/query/subscription_summary"
 
-    private func buildRequest(apiKey: String) -> URLRequest {
-        var req = URLRequest(url: URL(string: Self.endpoint)!)
+    // MARK: - Management API (primary)
+
+    private func fetchManagementAPI(apiKey: String) async throws -> ZenMuxData {
+        var req = URLRequest(url: URL(string: Self.managementEndpoint)!)
         req.httpMethod = "GET"
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         req.setValue("TokenPulse/1.0", forHTTPHeaderField: "User-Agent")
-        return req
+
+        let (data, response) = try await session.data(for: req)
+
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw ZenMuxProviderError.httpError(code)
+        }
+
+        return try JSONDecoder().decode(ZenMuxResponse.self, from: data).data
     }
 
-    private func parseResponse(_ data: Data) throws -> UsageData {
-        let raw = try JSONDecoder().decode(ZenMuxResponse.self, from: data)
-        let d = raw.data
+    // MARK: - Subscription summary (optional, cookie-based)
 
+    private func fetchSubscriptionSummary(cookies: ZenMuxCookies?) async -> ZenMuxSummaryData? {
+        guard let cookies else { return nil }
+
+        var components = URLComponents(string: Self.summaryEndpoint)!
+        components.queryItems = [URLQueryItem(name: "ctoken", value: cookies.ctoken)]
+
+        var req = URLRequest(url: components.url!)
+        req.httpMethod = "GET"
+        let cookieHeader = "ctoken=\(cookies.ctoken); sessionId=\(cookies.sessionId); sessionId.sig=\(cookies.sessionIdSig)"
+        req.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+        req.setValue("TokenPulse/1.0", forHTTPHeaderField: "User-Agent")
+
+        do {
+            let (data, response) = try await session.data(for: req)
+            guard let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode) else { return nil }
+            return try JSONDecoder().decode(ZenMuxSummaryResponse.self, from: data).data
+        } catch {
+            return nil
+        }
+    }
+
+    // MARK: - Build UsageData
+
+    private func buildUsageData(primary d: ZenMuxData, summary: ZenMuxSummaryData?) -> UsageData {
         let fiveHour = d.quota5Hour.map { q in
             WindowUsage(utilization: (q.usagePercentage ?? 0) * 100.0, resetsAt: parseISO8601(q.resetsAt))
         }
@@ -109,11 +144,23 @@ struct ZenMuxProvider: UsageProvider {
             if let v = q.maxValueUsd { extras["7dMaxUsd"] = String(format: "%.2f", v) }
         }
         if let q = d.quotaMonthly {
-            if let v = q.usedFlows { extras["moUsedFlows"] = String(format: "%.2f", v) }
-            if let v = q.remainingFlows { extras["moRemainingFlows"] = String(format: "%.2f", v) }
             if let v = q.maxFlows { extras["moMaxFlows"] = String(format: "%.0f", v) }
-            if let v = q.usedValueUsd { extras["moUsedUsd"] = String(format: "%.2f", v) }
             if let v = q.maxValueUsd { extras["moMaxUsd"] = String(format: "%.2f", v) }
+        }
+
+        // Monthly utilization from subscription summary
+        if let summary, let monthlyMax = d.quotaMonthly?.maxValueUsd, monthlyMax > 0 {
+            let totalCost = summary.totalCost
+            let utilization = totalCost / monthlyMax * 100.0
+            extras["moUtilization"] = String(format: "%.1f", utilization)
+            extras["moUsedUsd"] = String(format: "%.2f", totalCost)
+            extras["moRequestCounts"] = summary.requestCounts
+            extras["moTotalTokens"] = summary.totalTokens
+        }
+
+        // Monthly resets at (plan expiry)
+        if let expiresAt = d.plan.expiresAt, let date = parseISO8601(expiresAt) {
+            extras["moResetsAt"] = ISO8601DateFormatter().string(from: date)
         }
 
         return UsageData(
@@ -143,7 +190,7 @@ struct ZenMuxProvider: UsageProvider {
     }
 }
 
-// MARK: - Response models
+// MARK: - Management API response models
 
 private struct ZenMuxResponse: Decodable {
     let data: ZenMuxData
@@ -196,6 +243,40 @@ private struct ZenMuxQuota: Decodable {
         case remainingFlows = "remaining_flows"
         case usedValueUsd = "used_value_usd"
         case maxValueUsd = "max_value_usd"
+    }
+}
+
+// MARK: - Subscription summary response models
+
+private struct ZenMuxSummaryResponse: Decodable {
+    let data: ZenMuxSummaryData
+}
+
+private struct ZenMuxSummaryData: Decodable {
+    let totalCost: Double
+    let inputCost: Double
+    let outputCost: Double
+    let otherCost: Double
+    let requestCounts: String
+    let totalTokens: String
+
+    enum CodingKeys: String, CodingKey {
+        case totalCost, inputCost, outputCost, otherCost, requestCounts, totalTokens
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        // These come as strings from the API
+        let totalStr = try container.decode(String.self, forKey: .totalCost)
+        let inputStr = try container.decode(String.self, forKey: .inputCost)
+        let outputStr = try container.decode(String.self, forKey: .outputCost)
+        let otherStr = try container.decode(String.self, forKey: .otherCost)
+        totalCost = Double(totalStr) ?? 0
+        inputCost = Double(inputStr) ?? 0
+        outputCost = Double(outputStr) ?? 0
+        otherCost = Double(otherStr) ?? 0
+        requestCounts = try container.decode(String.self, forKey: .requestCounts)
+        totalTokens = try container.decode(String.self, forKey: .totalTokens)
     }
 }
 

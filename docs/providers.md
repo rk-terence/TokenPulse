@@ -79,11 +79,17 @@ The `/api/oauth/usage` endpoint itself has rate limits. Minimum poll interval: 6
 
 ### Authentication
 
-Management API key stored in macOS Keychain (service: `"TokenPulse-ZenMuxAPIKey"`). The key is obtained from the ZenMux dashboard and entered in **Settings > Providers > ZenMux**.
+Two authentication methods are used:
 
-Note: this is a **Management API Key**, not a standard API key. The ZenMux dashboard labels these separately.
+1. **Management API key** (primary) — stored in macOS Keychain (service: `"TokenPulse-ZenMuxAPIKey"`). Obtained from the ZenMux dashboard and entered in **Settings > Providers > ZenMux**. Note: this is a **Management API Key**, not a standard API key. The ZenMux dashboard labels these separately.
 
-### API endpoint
+2. **Chrome session cookies** (supplementary) — extracted automatically from Chrome's encrypted cookie store via `ChromeCookieService`. Requires `ctoken`, `sessionId`, and `sessionId.sig` cookies for `zenmux.ai`. Used for the subscription summary endpoint which has no management API equivalent.
+
+### Endpoints
+
+#### 1. Subscription detail (Management API) — primary
+
+Official documented endpoint. Provides 5h/7d real-time usage and monthly caps.
 
 ```
 GET https://zenmux.ai/api/v1/management/subscription/detail
@@ -93,7 +99,7 @@ Headers:
   User-Agent: TokenPulse/1.0
 ```
 
-### Response
+Response:
 
 ```json
 {
@@ -135,12 +141,142 @@ Headers:
 }
 ```
 
-**Response field notes:**
+Field notes:
 - `usage_percentage`: Float 0.0–1.0 (multiply by 100 for display percentage)
 - `quota_5_hour` / `quota_7_day`: Rolling windows with full usage fields
-- `quota_monthly`: Fixed cycle — may only contain `max_flows` and `max_value_usd` (no `usage_percentage` or `resets_at`)
+- `quota_monthly`: Fixed cycle — only contains `max_flows` and `max_value_usd` (no `usage_percentage`, `used_flows`, or `resets_at`)
 - `resets_at`: ISO 8601; absent on `quota_monthly`
 - `account_status`: `"healthy"`, `"monitored"`, `"abusive"`, `"suspended"`, or `"banned"`
+- `plan.expires_at`: End of current billing cycle; used as monthly quota reset date
+
+#### 2. Subscription summary (Cookie API) — supplementary
+
+Discovered via Chrome DevTools inspection. Provides current billing cycle cost breakdown. Used to derive monthly utilization since the management API's `quota_monthly` lacks usage data.
+
+```
+GET https://zenmux.ai/api/dashboard/cost/query/subscription_summary?ctoken=<CTOKEN>
+
+Headers:
+  Cookie: ctoken=<CTOKEN>; sessionId=<SESSION_ID>; sessionId.sig=<SESSION_SIG>
+  User-Agent: TokenPulse/1.0
+```
+
+Response:
+
+```json
+{
+  "success": true,
+  "data": {
+    "totalCost": "37.7353571",
+    "inputCost": "27.4005191",
+    "outputCost": "8.382838",
+    "otherCost": "1.952",
+    "requestCounts": "615",
+    "requestAvgCost": "0.0613583042",
+    "totalTokens": "34818918",
+    "millionTokenAvgCost": "1.0837601875"
+  }
+}
+```
+
+Field notes:
+- All numeric values are returned as **strings**, not numbers
+- `totalCost`: Total USD spent in the current billing cycle
+- Monthly utilization is derived as: `totalCost / quota_monthly.max_value_usd × 100`
+- Date query parameters (`startDate`, `endDate`) are accepted but **ignored** — the endpoint always returns data for the current billing cycle
+- **Unverified assumption**: data resets at billing cycle boundary. To be confirmed after 2026-04-20
+
+#### 3. Current usage (Cookie API) — not used
+
+Legacy endpoint used in earlier versions of TokenPulse. Provides 5h and 7d window usage via cookies. Superseded by the management API which provides the same data with simpler authentication.
+
+```
+GET https://zenmux.ai/api/subscription/get_current_usage?ctoken=<CTOKEN>
+
+Headers:
+  Cookie: ctoken=<CTOKEN>; sessionId=<SESSION_ID>; sessionId.sig=<SESSION_SIG>
+```
+
+Response:
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "tierCode": "max",
+      "periodType": "week",
+      "periodDuration": "168",
+      "cycleStartTime": "2026-03-27T07:58:07.000Z",
+      "cycleEndTime": "2026-04-03T07:58:07.000Z",
+      "usedRate": 0.1036,
+      "quotaStatus": 0,
+      "status": 0,
+      "ext": "{\"gammaRate\":0.23,\"subscriptionAccountGammaRate\":1.0,\"subscriptionPlanGammaRate\":0.23}"
+    },
+    {
+      "tierCode": "max",
+      "periodType": "hour_5",
+      "periodDuration": "5",
+      "cycleStartTime": "2026-03-29T06:44:04.000Z",
+      "cycleEndTime": "2026-03-29T11:44:04.000Z",
+      "usedRate": 0.1755,
+      "quotaStatus": 0,
+      "status": 0,
+      "ext": "{}"
+    }
+  ]
+}
+```
+
+Field notes:
+- `usedRate`: Float 0.0–1.0 (equivalent to `usage_percentage` in management API)
+- Only `hour_5` and `week` period types are returned — **no monthly period**
+- `ext.gammaRate` on the `week` entry may relate to rate limiting weights
+
+#### 4. Current subscription (Cookie API) — not used
+
+Plan metadata endpoint. All information is available through the management API.
+
+```
+GET https://zenmux.ai/api/subscription/get_current?ctoken=<CTOKEN>
+
+Headers:
+  Cookie: ctoken=<CTOKEN>; sessionId=<SESSION_ID>; sessionId.sig=<SESSION_SIG>
+```
+
+Response:
+
+```json
+{
+  "success": true,
+  "data": {
+    "price": 100,
+    "startedAt": "2026-03-20T03:30:29.000Z",
+    "expiredAt": "2026-04-20T03:30:29.000Z",
+    "status": "ACTIVE",
+    "planKey": "max",
+    "alpha": 1,
+    "gamma": 1,
+    "period_quota": 300,
+    "leverage": 3.2624,
+    "flowPrice": 0.03283,
+    "weekMaxFlows": 2318.4,
+    "monthMaxFlows": 9936,
+    "nextBillingPlanKey": null,
+    "enable_extra_usage": 0,
+    "extra_api_key": null,
+    "name": "Max Plan",
+    "desc": "300 Flows/5h"
+  }
+}
+```
+
+Field notes:
+- `leverage`: Static plan value multiplier = `monthMaxFlows × flowPrice / price` (not usage-related)
+- `alpha`, `gamma`: Internal tuning parameters
+- `period_quota`: Same as `quota_5_hour.max_flows` in management API
+- Redundant with management API `plan.*` fields plus `quota_*.max_flows` fields
 
 ### Rate limiting
 

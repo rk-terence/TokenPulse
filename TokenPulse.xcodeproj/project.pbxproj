@@ -26,6 +26,7 @@
 		B10000010000000000000004 /* UsageExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000010000000000000004 /* UsageExporter.swift */; };
 		B10000010000000000000005 /* ConfigService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000010000000000000005 /* ConfigService.swift */; };
 		B10000010000000000000006 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000010000000000000006 /* NotificationService.swift */; };
+		B10000010000000000000007 /* ChromeCookieService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000010000000000000007 /* ChromeCookieService.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -52,6 +53,7 @@
 		B20000010000000000000004 /* UsageExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageExporter.swift; sourceTree = "<group>"; };
 		B20000010000000000000005 /* ConfigService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigService.swift; sourceTree = "<group>"; };
 		B20000010000000000000006 /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
+		B20000010000000000000007 /* ChromeCookieService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChromeCookieService.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -129,6 +131,7 @@
 				A2000001000000000000000C /* ProviderManager.swift */,
 				B20000010000000000000004 /* UsageExporter.swift */,
 				B20000010000000000000006 /* NotificationService.swift */,
+				B20000010000000000000007 /* ChromeCookieService.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -245,6 +248,7 @@
 				B10000010000000000000004 /* UsageExporter.swift in Sources */,
 				B10000010000000000000005 /* ConfigService.swift in Sources */,
 				B10000010000000000000006 /* NotificationService.swift in Sources */,
+				B10000010000000000000007 /* ChromeCookieService.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
