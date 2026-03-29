@@ -3,6 +3,14 @@
 ## Provider protocol
 
 ```swift
+/// Describes how a fetch failure should be treated by the system.
+enum FailureDisposition: Sendable {
+    case unconfigured       // Provider not configured — don't retry
+    case transient(String)  // Temporary problem — show stale data, retry on next poll
+    case auth(String)       // Auth/credential issue — show stale data, surface guidance
+    case persistent(String) // Permanent error — show error state
+}
+
 protocol UsageProvider: Sendable {
     var id: String { get }
     var displayName: String { get }
@@ -10,6 +18,7 @@ protocol UsageProvider: Sendable {
     var brandColor: Color { get }
     func fetchUsage() async throws -> UsageData
     func isConfigured() -> Bool
+    func classifyError(_ error: Error) -> FailureDisposition
 }
 
 struct UsageData: Codable, Sendable {

@@ -9,6 +9,8 @@ A macOS menu bar app that monitors your AI platform token usage at a glance. It 
 - **Menu bar gauge** — Battery-style horizontal bar showing remaining capacity, with color coding (green/amber/red)
 - **Multiple providers** — Right-click the icon to cycle between providers
 - **Click for details** — Left-click opens a popover with per-provider breakdown, 7-day usage, reset timers, and more
+- **Usage notifications** — macOS notifications when 5h usage crosses 50% or 80%, and when quotas reset
+- **Graceful degradation** — Shows stale data on transient errors, surfaces auth guidance on credential issues, dims icon when refreshing
 - **Configurable polling** — 60s, 2min, or 5min intervals
 - **Launch at login** — Optional auto-start via macOS Service Management
 - **No Dock icon** — Runs as a pure menu bar app
@@ -88,6 +90,19 @@ jq '.providers | to_entries[] | select(.value.status == "error")' ~/.tokenpulse/
 
 The file is atomically written, so readers always see a complete snapshot.
 
+## Notifications
+
+TokenPulse sends macOS notifications for important usage events:
+
+| Event | When |
+|-------|------|
+| **5h usage above 50%** | Utilization crosses the 50% threshold (entering amber zone) |
+| **5h usage above 80%** | Utilization crosses the 80% threshold (entering red zone) |
+| **5h quota reset** | The 5-hour rolling window resets |
+| **7d quota reset** | The 7-day rolling window resets |
+
+Notifications are sent per provider. Grant notification permission when prompted on first launch.
+
 ## Project structure
 
 ```
@@ -95,7 +110,7 @@ TokenPulse/
 ├── App/            # AppDelegate, StatusBarController, entry point
 ├── Models/         # UsageData, ProviderStatus, ProviderConfig
 ├── Providers/      # UsageProvider protocol + Claude, ZenMux implementations
-├── Services/       # KeychainService, ConfigService, PollingManager, ProviderManager
+├── Services/       # KeychainService, ConfigService, PollingManager, ProviderManager, NotificationService
 ├── Views/          # PopoverView, SettingsView (SwiftUI)
 └── Rendering/      # BarIconRenderer (Core Graphics)
 ```
@@ -103,8 +118,9 @@ TokenPulse/
 ## Adding a new provider
 
 1. Create a new file in `Providers/` implementing the `UsageProvider` protocol
-2. Register it in `AppDelegate.applicationDidFinishLaunching`
-3. Add any auth UI to `SettingsView` if needed
+2. Implement `classifyError(_:)` to map your provider's errors to `FailureDisposition` cases
+3. Register it in `AppDelegate.applicationDidFinishLaunching`
+4. Add any auth UI to `SettingsView` if needed
 
 ## License
 

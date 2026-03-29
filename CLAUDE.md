@@ -15,15 +15,16 @@ macOS menu bar app that monitors AI platform token usage (5-hour rolling window)
 ```
 TokenPulse/
 ├── App/                        # Entry point, AppDelegate, StatusBarController
-├── Models/                     # UsageData, ProviderStatus, WindowUsage
+├── Models/                     # UsageData, ProviderStatus (6-case enum), WindowUsage
 ├── Providers/                  # UsageProvider protocol + per-provider implementations
-│   ├── UsageProvider.swift     # Protocol: fetchUsage() async throws -> UsageData
+│   ├── UsageProvider.swift     # Protocol: fetchUsage(), classifyError() → FailureDisposition
 │   ├── ClaudeProvider.swift    # Keychain OAuth → /api/oauth/usage
 │   └── ZenMuxProvider.swift    # Management API key → /api/v1/management/subscription/detail
 ├── Services/
 │   ├── KeychainService.swift   # Security.framework wrapper
 │   ├── ConfigService.swift     # ~/.tokenpulse/config.json read/write
-│   └── PollingManager.swift    # Timer-based refresh
+│   ├── PollingManager.swift    # Timer-based refresh
+│   └── NotificationService.swift # UNUserNotification for threshold/reset alerts
 ├── Views/                      # SwiftUI: PopoverView, SettingsView
 └── Rendering/
     └── BarIconRenderer.swift   # Core Graphics battery bar icon
@@ -67,4 +68,7 @@ xcodebuild -scheme TokenPulse -configuration Debug test
 - Never hardcode API keys or credentials — all secrets come from Keychain at runtime
 - Minimum 60s polling interval for Claude /api/oauth/usage to avoid 429s
 - Always handle provider errors gracefully — dim icon + show stale data rather than crash
+- Each provider owns its error classification via `classifyError(_:) -> FailureDisposition`
+- ProviderStatus uses 6 cases: unconfigured, pendingFirstLoad, refreshing(lastData:), ready, stale(reason:), error
+- Notifications fire when 5h utilization crosses 50% or 80%, and when quota windows reset
 - Run `xcodebuild test` after any model or provider changes
