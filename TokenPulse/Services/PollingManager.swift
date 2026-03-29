@@ -31,7 +31,9 @@ final class PollingManager {
 
     private func scheduleTimer() {
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            self?.providerManager.requestRefresh(.automatic)
+            Task { @MainActor in
+                self?.providerManager.requestRefresh(.automatic)
+            }
         }
     }
 }

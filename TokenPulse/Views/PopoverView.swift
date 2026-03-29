@@ -13,14 +13,15 @@ struct PopoverView: View {
                 Spacer()
                 Button(action: { manager.requestRefresh() }) {
                     Image(systemName: "arrow.clockwise")
-                        .font(.caption)
+                        .font(.callout)
+                        .rotationEffect(.degrees(manager.isRefreshing ? 360 : 0))
+                        .animation(manager.isRefreshing ? .linear(duration: 1).repeatForever(autoreverses: false) : .default, value: manager.isRefreshing)
                 }
                 .buttonStyle(.plain)
-                .disabled(manager.isRefreshing)
 
                 Button(action: { onOpenSettings?() }) {
                     Image(systemName: "gear")
-                        .font(.caption)
+                        .font(.callout)
                 }
                 .buttonStyle(.plain)
             }
@@ -48,7 +49,7 @@ struct PopoverView: View {
             HStack {
                 if let lastUpdate = manager.lastUpdated {
                     Text("Last checked \(lastUpdate, style: .relative)")
-                        .font(.caption)
+                        .font(.callout)
                         .foregroundStyle(.tertiary)
                 }
                 Spacer()
@@ -56,7 +57,7 @@ struct PopoverView: View {
                     NSApplication.shared.terminate(nil)
                 }
                 .buttonStyle(.plain)
-                .font(.caption)
+                .font(.callout)
                 .foregroundStyle(.secondary)
             }
         }
@@ -92,14 +93,14 @@ private struct ProviderRow: View {
 
             if let detailText = entry.status.message {
                 Text(detailText)
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(detailColor)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
             if showsLastSuccessHint, let lastSuccessAt = entry.lastSuccessAt {
                 Text("Last success \(lastSuccessAt, style: .relative)")
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(.tertiary)
             }
         }
@@ -246,14 +247,14 @@ private struct QuotaGrid: View {
            let opus = Double(opusStr) {
             HStack(spacing: 4) {
                 Text("Opus")
-                    .font(.callout)
+                    .font(.body)
                     .foregroundStyle(.secondary)
                     .frame(width: 36, alignment: .trailing)
                 MiniBar(percentage: opus)
                 Text(String(format: "%.0f%%", opus))
-                    .font(.callout.monospacedDigit())
+                    .font(.body.monospacedDigit())
                     .foregroundStyle(.secondary)
-                    .frame(width: 36, alignment: .trailing)
+                    .frame(width: 42, alignment: .trailing)
             }
         }
     }
@@ -266,11 +267,11 @@ private struct QuotaGrid: View {
         if let maxUsd = data.extras["moMaxUsd"] {
             HStack(spacing: 4) {
                 Text("mo")
-                    .font(.callout)
+                    .font(.body)
                     .foregroundStyle(.secondary)
-                    .frame(width: 24, alignment: .trailing)
+                    .frame(width: 28, alignment: .trailing)
                 Text("cap $\(maxUsd)")
-                    .font(.callout.monospacedDigit())
+                    .font(.body.monospacedDigit())
                     .foregroundStyle(.tertiary)
             }
         }
@@ -305,31 +306,31 @@ private struct QuotaRow: View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 4) {
                 Text(label)
-                    .font(.callout)
+                    .font(.body)
                     .foregroundStyle(.secondary)
-                    .frame(width: 24, alignment: .trailing)
+                    .frame(width: 28, alignment: .trailing)
 
                 MiniBar(percentage: utilization)
 
                 Text(String(format: "%.0f%%", utilization))
-                    .font(.callout.monospacedDigit())
+                    .font(.body.monospacedDigit())
                     .foregroundStyle(.secondary)
-                    .frame(width: 36, alignment: .trailing)
+                    .frame(width: 42, alignment: .trailing)
 
                 Spacer(minLength: 0)
 
                 if let resetsAt {
                     Text(resetsAt, style: .relative)
-                        .font(.caption)
+                        .font(.callout)
                         .foregroundStyle(.tertiary)
                 }
             }
 
             if let detail {
                 Text(detail)
-                    .font(.caption.monospacedDigit())
+                    .font(.callout.monospacedDigit())
                     .foregroundStyle(.tertiary)
-                    .padding(.leading, 28)
+                    .padding(.leading, 32)
             }
         }
     }
@@ -350,7 +351,7 @@ private struct MiniBar: View {
                     .frame(width: max(0, geo.size.width * min(percentage, 100) / 100))
             }
         }
-        .frame(width: 60, height: 6)
+        .frame(width: 100, height: 6)
     }
 
     private var barColor: Color {
@@ -368,7 +369,7 @@ private struct TagView: View {
 
     var body: some View {
         Text(text)
-            .font(.caption2)
+            .font(.callout)
             .foregroundStyle(color)
             .padding(.horizontal, 4)
             .padding(.vertical, 1)

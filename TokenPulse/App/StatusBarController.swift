@@ -5,8 +5,8 @@ import SwiftUI
 final class StatusBarController {
     private let statusItem: NSStatusItem
     private let popover = NSPopover()
-    private var eventMonitor: Any?
-    private var localEventMonitor: Any?
+    nonisolated(unsafe) private var eventMonitor: Any?
+    nonisolated(unsafe) private var localEventMonitor: Any?
 
     var onRightClick: (() -> Void)?
 

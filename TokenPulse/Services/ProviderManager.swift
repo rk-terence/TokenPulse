@@ -60,6 +60,7 @@ final class ProviderManager {
     private var providers: [any UsageProvider] = []
     private var states: [String: ProviderState] = [:]
     private var inFlightRefreshes: [String: Task<Void, Never>] = [:]
+    private var inFlightTriggers: [String: RefreshTrigger] = [:]
     private var settingsWindow: NSWindow?
 
     var onIconUpdate: ((StatusBarIconModel) -> Void)?
@@ -125,8 +126,15 @@ final class ProviderManager {
             return
         }
 
-        // Don't stack refreshes for the same provider
-        if inFlightRefreshes[provider.id] != nil { return }
+        // Skip if already in-flight, unless this is a manual override of an automatic refresh
+        if let existing = inFlightRefreshes[provider.id] {
+            let existingTrigger = inFlightTriggers[provider.id]
+            guard trigger == .manual && existingTrigger == .automatic else { return }
+            state.refreshGeneration += 1
+            existing.cancel()
+            inFlightRefreshes[provider.id] = nil
+            inFlightTriggers[provider.id] = nil
+        }
 
         let lastData = state.status.displayData
         let attemptAt = Date()
@@ -143,6 +151,7 @@ final class ProviderManager {
         }
 
         inFlightRefreshes[provider.id] = task
+        inFlightTriggers[provider.id] = trigger
     }
 
     private func applyRefreshResult(
@@ -150,10 +159,11 @@ final class ProviderManager {
         for provider: any UsageProvider,
         generation: Int,
         attemptAt: Date
-    ) {
+    ) async {
         guard var state = states[provider.id], state.refreshGeneration == generation else { return }
 
         inFlightRefreshes[provider.id] = nil
+        inFlightTriggers[provider.id] = nil
 
         switch result {
         case .success(let data):
@@ -242,9 +252,9 @@ final class ProviderManager {
     // MARK: - State management
 
     private func rebuildEntries() {
-        providerEntries = providers.map { p in
+        providerEntries = providers.map { p -> ProviderEntry in
             let state = states[p.id]
-            ProviderEntry(
+            return ProviderEntry(
                 id: p.id,
                 displayName: p.displayName,
                 shortLabel: p.shortLabel,
@@ -267,7 +277,7 @@ final class ProviderManager {
     }
 
     private func syncActiveProviderSelection() {
-        let preferredIDs = providers.compactMap { provider in
+        let preferredIDs: [String] = providers.compactMap { provider in
             guard states[provider.id]?.status.canDrivePrimaryUI == true else { return nil }
             return provider.id
         }
