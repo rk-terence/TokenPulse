@@ -44,4 +44,29 @@ enum KeychainService {
             throw KeychainError.unexpectedStatus(status)
         }
     }
+
+    /// Save (or update) a generic password in the Keychain by service name.
+    static func saveGenericPassword(_ data: Data, service: String) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+        ]
+
+        let existing = SecItemCopyMatching(query as CFDictionary, nil)
+
+        if existing == errSecSuccess {
+            let update: [String: Any] = [kSecValueData as String: data]
+            let status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
+            guard status == errSecSuccess else {
+                throw KeychainError.unexpectedStatus(status)
+            }
+        } else {
+            var attrs = query
+            attrs[kSecValueData as String] = data
+            let status = SecItemAdd(attrs as CFDictionary, nil)
+            guard status == errSecSuccess else {
+                throw KeychainError.unexpectedStatus(status)
+            }
+        }
+    }
 }

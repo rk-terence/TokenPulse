@@ -18,16 +18,16 @@ A macOS menu bar app that monitors your AI platform token usage at a glance. It 
 | Provider | Auth method | What it shows |
 |----------|-------------|---------------|
 | **Claude** (Anthropic) | Keychain (Claude Code OAuth token) | 5h window, 7-day quota, Opus quota |
-| **ZenMux** | Chrome cookie auto-detect or manual paste | 5h window, 7-day quota, tier info |
+| **ZenMux** | Management API key (from ZenMux dashboard) | 5h window, 7-day quota, monthly quota, tier, account status |
 
 ## Why TokenPulse?
 
 [CodexBar](https://github.com/steipete/CodexBar) is an excellent menu bar usage tracker with 15+ providers and an active community. TokenPulse exists because it makes different trade-offs:
 
-- **ZenMux support** — TokenPulse supports ZenMux out of the box (via Chrome cookie decryption or manual paste). ZenMux is a niche provider that CodexBar doesn't cover, and likely too niche for them to want to maintain.
+- **ZenMux support** — TokenPulse supports ZenMux out of the box via their official Management API. ZenMux is a niche provider that CodexBar doesn't cover, and likely too niche for them to want to maintain.
 - **One gauge, one glance** — CodexBar shows two stacked bars per provider with multiple display modes. TokenPulse shows a single battery gauge with the remaining percentage right in the icon — you get your answer without interpreting bar heights or switching modes.
 - **Minimal by design** — TokenPulse is ~20 source files with a simple `UsageProvider` protocol. No SwiftSyntax macros, no helper processes, no multi-strategy fallback chains. The entire codebase is easy to audit, fork, and modify in an afternoon.
-- **Machine-readable output** — Every poll cycle writes raw provider data to `~/.tokenpulse/raw_usage.json`, so shell scripts and other tools can consume it without scraping or IPC.
+- **Machine-readable output** — Every poll cycle writes raw provider data to `~/.tokenpulse/raw_usage.json`, so shell scripts and other tools can consume it without scraping or IPC. Settings are stored in `~/.tokenpulse/config.json`.
 
 If you use many AI providers and want comprehensive coverage, use CodexBar. If you use Claude and/or ZenMux and want something small and direct, TokenPulse is for you.
 
@@ -59,7 +59,9 @@ TokenPulse reads your Claude Code OAuth credentials from the macOS Keychain auto
 
 ### ZenMux provider
 
-TokenPulse auto-detects ZenMux session cookies from Chrome. If auto-detect doesn't work (e.g., you use a different browser), you can manually paste cookie values in **Settings > Providers > ZenMux > Manual cookie override**.
+1. Get a **Management API Key** from your [ZenMux dashboard](https://zenmux.ai)
+2. Open **Settings > Providers > ZenMux** and paste the key
+3. Click **Save** — the key is stored securely in your macOS Keychain
 
 ## Usage
 
@@ -93,7 +95,7 @@ TokenPulse/
 ├── App/            # AppDelegate, StatusBarController, entry point
 ├── Models/         # UsageData, ProviderStatus, ProviderConfig
 ├── Providers/      # UsageProvider protocol + Claude, ZenMux implementations
-├── Services/       # KeychainService, ChromeCookieService, PollingManager
+├── Services/       # KeychainService, ConfigService, PollingManager, ProviderManager
 ├── Views/          # PopoverView, SettingsView (SwiftUI)
 └── Rendering/      # BarIconRenderer (Core Graphics)
 ```

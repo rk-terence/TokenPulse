@@ -102,42 +102,17 @@ The `/api/oauth/usage` endpoint itself has rate limits. Minimum poll interval: 6
 
 ### Authentication
 
-1. Locate Chrome Cookies DB: `~/Library/Application Support/Google/Chrome/Default/Cookies`
-2. Read "Chrome Safe Storage" key from Keychain:
-   ```swift
-   let query: [String: Any] = [
-       kSecClass as String: kSecClassGenericPassword,
-       kSecAttrService as String: "Chrome Safe Storage",
-       kSecReturnData as String: true,
-       kSecMatchLimit as String: kSecMatchLimitOne
-   ]
-   ```
-3. Derive decryption key: PBKDF2 with the Keychain password, salt = `"saltysalt"`, 1003 iterations, 16-byte key length
-4. Open SQLite DB (copy to temp first to avoid WAL lock), query for ZenMux cookies:
-   ```sql
-   SELECT name, encrypted_value FROM cookies
-   WHERE host_key LIKE '%zenmux%'
-   AND name IN ('ctoken', 'sessionId', 'sessionId.sig')
-   ```
-5. Decrypt: AES-128-CBC, IV = 16 bytes of 0x20 (space), strip PKCS7 padding
-   - v10/v11 prefix: strip first 3 bytes before decryption
-6. Attach all three decrypted cookies to HTTP requests
+Management API key stored in macOS Keychain (service: `"TokenPulse-ZenMuxAPIKey"`). The key is obtained from the ZenMux dashboard and entered in **Settings > Providers > ZenMux**.
 
-### Required cookies
-
-| Cookie name     | Domain     | Purpose                     |
-|-----------------|------------|-----------------------------|
-| `ctoken`        | zenmux.ai  | Primary authentication token |
-| `sessionId`     | zenmux.ai  | Session identifier           |
-| `sessionId.sig` | zenmux.ai  | Session signature (HMAC)     |
+Note: this is a **Management API Key**, not a standard API key. The ZenMux dashboard labels these separately.
 
 ### API endpoint
 
 ```
-GET https://zenmux.ai/api/subscription/get_current_usage?ctoken=<CTOKEN_VALUE>
+GET https://zenmux.ai/api/v1/management/subscription/detail
 
 Headers:
-  Cookie: ctoken=<value>; sessionId=<value>; sessionId.sig=<value>
+  Authorization: Bearer <ZENMUX_MANAGEMENT_API_KEY>
   User-Agent: TokenPulse/1.0
 ```
 
@@ -145,42 +120,75 @@ Headers:
 
 ```json
 {
-  "ts": 1774513459,
-  "data": [
-    {
-      "tierCode": "max",
-      "periodType": "hour_5",
-      "periodDuration": "5",
-      "cycleStartTime": "2026-03-26T10:47:05.000Z",
-      "cycleEndTime": "2026-03-26T15:47:05.000Z",
-      "usedRate": 0.376,
-      "quotaStatus": 0,
-      "status": 0,
-      "ext": "{\"gammaRate\":0.23}"
+  "success": true,
+  "data": {
+    "plan": {
+      "tier": "max",
+      "amount_usd": 100,
+      "interval": "month",
+      "expires_at": "2026-04-20T03:30:29.000Z"
     },
-    {
-      "tierCode": "max",
-      "periodType": "week",
-      "periodDuration": "168",
-      "cycleStartTime": "2026-03-20T03:47:05.000Z",
-      "cycleEndTime": "2026-03-27T03:47:05.000Z",
-      "usedRate": 0.12,
-      "quotaStatus": 0,
-      "status": 0,
-      "ext": "{}"
+    "currency": "usd",
+    "base_usd_per_flow": 0.03283,
+    "effective_usd_per_flow": 0.03283,
+    "account_status": "healthy",
+    "quota_5_hour": {
+      "usage_percentage": 0.4204,
+      "resets_at": "2026-03-29T06:43:05.000Z",
+      "max_flows": 300,
+      "used_flows": 126.11,
+      "remaining_flows": 173.89,
+      "used_value_usd": 4.14,
+      "max_value_usd": 9.85
+    },
+    "quota_7_day": {
+      "usage_percentage": 0.0544,
+      "resets_at": "2026-04-03T07:58:07.000Z",
+      "max_flows": 2318,
+      "used_flows": 126.17,
+      "remaining_flows": 2191.83,
+      "used_value_usd": 4.14,
+      "max_value_usd": 76.11
+    },
+    "quota_monthly": {
+      "max_flows": 9936,
+      "max_value_usd": 326.24
     }
-  ]
+  }
 }
 ```
 
 **Response field notes:**
-- `usedRate`: Float 0.0–1.0 (multiply by 100 for percentage)
-- `periodType`: `"hour_5"` (5-hour window) or `"week"` (7-day)
-- `quotaStatus`: 0 = normal, 1 = exhausted
-- `cycleEndTime`: ISO 8601 — maps to `resetsAt`
+- `usage_percentage`: Float 0.0–1.0 (multiply by 100 for display percentage)
+- `quota_5_hour` / `quota_7_day`: Rolling windows with full usage fields
+- `quota_monthly`: Fixed cycle — may only contain `max_flows` and `max_value_usd` (no `usage_percentage` or `resets_at`)
+- `resets_at`: ISO 8601 — maps to `WindowUsage.resetsAt`; absent on `quota_monthly`
+- `account_status`: `"healthy"`, `"monitored"`, `"abusive"`, `"suspended"`, or `"banned"`
 
-### Notes
+### Mapping to UsageData
 
-- Chrome DB must be copied to temp before reading (SQLite WAL lock with running Chrome)
-- Cookie names and endpoint URL may change — manual cookie paste available in Settings as fallback
-- Alternative: user can manually paste cookie values in Settings to bypass Chrome DB reading
+| API field | UsageData field |
+|---|---|
+| `quota_5_hour.usage_percentage * 100` | `fiveHour.utilization` |
+| `quota_5_hour.resets_at` | `fiveHour.resetsAt` |
+| `quota_7_day.usage_percentage * 100` | `sevenDay.utilization` |
+| `quota_7_day.resets_at` | `sevenDay.resetsAt` |
+| `plan.tier` | `extras["tier"]` |
+| `account_status` | `extras["accountStatus"]` |
+| `quota_5_hour.used_value_usd` | `extras["5hUsedUsd"]` |
+| `quota_5_hour.max_value_usd` | `extras["5hMaxUsd"]` |
+| `quota_5_hour.used_flows` | `extras["5hUsedFlows"]` |
+| `quota_5_hour.remaining_flows` | `extras["5hRemainingFlows"]` |
+| `quota_5_hour.max_flows` | `extras["5hMaxFlows"]` |
+| `quota_7_day.used_value_usd` | `extras["7dUsedUsd"]` |
+| `quota_7_day.max_value_usd` | `extras["7dMaxUsd"]` |
+| `quota_7_day.used_flows` | `extras["7dUsedFlows"]` |
+| `quota_7_day.remaining_flows` | `extras["7dRemainingFlows"]` |
+| `quota_7_day.max_flows` | `extras["7dMaxFlows"]` |
+| `quota_monthly.max_value_usd` | `extras["moMaxUsd"]` |
+| `quota_monthly.max_flows` | `extras["moMaxFlows"]` |
+| `effective_usd_per_flow` | `extras["effectiveUsdPerFlow"]` |
+
+### Rate limiting
+
+Independent rate limit per endpoint; exceeding returns HTTP `422`. No specific minimum interval documented — we use the same configurable polling interval as other providers.

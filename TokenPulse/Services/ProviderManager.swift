@@ -35,7 +35,7 @@ final class ProviderManager {
             window.orderFrontRegardless()
             return
         }
-        let view = SettingsView(manager: self)
+        let view = SettingsView(manager: self, config: ConfigService.shared)
         let hostingController = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: hostingController)
         window.title = "TokenPulse Settings"

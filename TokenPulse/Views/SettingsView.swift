@@ -3,13 +3,11 @@ import ServiceManagement
 
 struct SettingsView: View {
     let manager: ProviderManager
-
-    @AppStorage("launchAtLogin") private var launchAtLogin = false
-    @AppStorage("pollInterval") private var pollInterval: Double = ProviderConfig.defaultPollInterval
+    let config: ConfigService
 
     var body: some View {
         TabView {
-            GeneralTab(launchAtLogin: $launchAtLogin, pollInterval: $pollInterval)
+            GeneralTab(config: config)
                 .tabItem { Label("General", systemImage: "gear") }
 
             ProvidersTab(manager: manager)
@@ -17,10 +15,10 @@ struct SettingsView: View {
         }
         .padding(20)
         .frame(minWidth: 400, minHeight: 280)
-        .onChange(of: launchAtLogin) { _, newValue in
+        .onChange(of: config.launchAtLogin) { _, newValue in
             setLaunchAtLogin(newValue)
         }
-        .onChange(of: pollInterval) { _, newValue in
+        .onChange(of: config.pollInterval) { _, newValue in
             manager.onPollIntervalChanged?(newValue)
         }
     }
@@ -33,7 +31,7 @@ struct SettingsView: View {
                 try SMAppService.mainApp.unregister()
             }
         } catch {
-            launchAtLogin = !enabled // revert on failure
+            config.launchAtLogin = !enabled // revert on failure
         }
     }
 }
@@ -41,14 +39,13 @@ struct SettingsView: View {
 // MARK: - General Tab
 
 private struct GeneralTab: View {
-    @Binding var launchAtLogin: Bool
-    @Binding var pollInterval: Double
+    @Bindable var config: ConfigService
 
     var body: some View {
         Form {
-            Toggle("Launch at login", isOn: $launchAtLogin)
+            Toggle("Launch at login", isOn: $config.launchAtLogin)
 
-            Picker("Polling interval", selection: $pollInterval) {
+            Picker("Polling interval", selection: $config.pollInterval) {
                 Text("60 seconds").tag(60.0)
                 Text("2 minutes").tag(120.0)
                 Text("5 minutes").tag(300.0)
@@ -64,9 +61,8 @@ private struct GeneralTab: View {
 private struct ProvidersTab: View {
     let manager: ProviderManager
 
-    @AppStorage("manualZenMuxCtoken") private var manualCtoken = ""
-    @AppStorage("manualZenMuxSessionId") private var manualSessionId = ""
-    @AppStorage("manualZenMuxSessionIdSig") private var manualSessionIdSig = ""
+    @State private var zenMuxAPIKey = ""
+    @State private var zenMuxKeySaved = false
 
     var body: some View {
         Form {
@@ -81,22 +77,28 @@ private struct ProvidersTab: View {
 
             Section("ZenMux") {
                 HStack {
-                    Text("Auto-detect (Chrome)")
+                    Text("API key status")
                     Spacer()
-                    Text(zenMuxAutoStatus)
-                        .foregroundStyle(zenMuxAutoConfigured ? .green : .secondary)
+                    Text(zenMuxConfigured ? "Configured" : "Not set")
+                        .foregroundStyle(zenMuxConfigured ? .green : .secondary)
                 }
 
-                DisclosureGroup("Manual cookie override") {
-                    TextField("ctoken", text: $manualCtoken)
-                        .textFieldStyle(.roundedBorder)
-                    TextField("sessionId", text: $manualSessionId)
-                        .textFieldStyle(.roundedBorder)
-                    TextField("sessionId.sig", text: $manualSessionIdSig)
-                        .textFieldStyle(.roundedBorder)
-                    Text("Paste cookie values from browser DevTools if auto-detect fails.")
+                SecureField("Management API Key", text: $zenMuxAPIKey)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { saveZenMuxAPIKey() }
+
+                HStack {
+                    Text("Get your key from the ZenMux dashboard.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    Spacer()
+                    if zenMuxKeySaved {
+                        Text("Saved")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    }
+                    Button("Save") { saveZenMuxAPIKey() }
+                        .disabled(zenMuxAPIKey.isEmpty)
                 }
             }
         }
@@ -111,11 +113,19 @@ private struct ProvidersTab: View {
         claudeConfigured ? "Connected" : "Not found"
     }
 
-    private var zenMuxAutoConfigured: Bool {
-        (try? ChromeCookieService.extractZenMuxCookies()) != nil
+    private var zenMuxConfigured: Bool {
+        (try? KeychainService.readGenericPassword(service: ZenMuxProvider.keychainService)) != nil
     }
 
-    private var zenMuxAutoStatus: String {
-        zenMuxAutoConfigured ? "Connected" : "Not found"
+    private func saveZenMuxAPIKey() {
+        guard !zenMuxAPIKey.isEmpty,
+              let data = zenMuxAPIKey.data(using: .utf8) else { return }
+        do {
+            try KeychainService.saveGenericPassword(data, service: ZenMuxProvider.keychainService)
+            zenMuxKeySaved = true
+            zenMuxAPIKey = ""
+        } catch {
+            zenMuxKeySaved = false
+        }
     }
 }

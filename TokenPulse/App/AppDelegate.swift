@@ -29,8 +29,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.pollingManager?.updateInterval(interval)
         }
 
-        // Start polling
-        pollingManager = PollingManager(providerManager: providerManager)
+        // Start polling with saved interval
+        pollingManager = PollingManager(providerManager: providerManager, interval: ConfigService.shared.pollInterval)
         pollingManager?.start()
     }
 }

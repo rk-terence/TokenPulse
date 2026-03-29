@@ -9,28 +9,21 @@ struct ZenMuxProvider: UsageProvider {
 
     private let session: URLSession
 
-    /// Optional manually-pasted cookies (from Settings fallback).
-    var manualCookies: ZenMuxCookies?
-
-    init(session: URLSession = .shared, manualCookies: ZenMuxCookies? = nil) {
+    init(session: URLSession = .shared) {
         self.session = session
-        self.manualCookies = manualCookies
     }
 
     func isConfigured() -> Bool {
-        if manualCookies != nil { return true }
-        return (try? ChromeCookieService.extractZenMuxCookies()) != nil
+        (try? KeychainService.readGenericPassword(service: Self.keychainService)) != nil
     }
 
     func fetchUsage() async throws -> UsageData {
-        let cookies: ZenMuxCookies
-        if let manual = manualCookies {
-            cookies = manual
-        } else {
-            cookies = try ChromeCookieService.extractZenMuxCookies()
+        let keyData = try KeychainService.readGenericPassword(service: Self.keychainService)
+        guard let apiKey = String(data: keyData, encoding: .utf8) else {
+            throw ZenMuxProviderError.missingAPIKey
         }
 
-        let request = buildRequest(cookies: cookies)
+        let request = buildRequest(apiKey: apiKey)
         let (data, response) = try await session.data(for: request)
 
         guard let http = response as? HTTPURLResponse,
@@ -42,54 +35,55 @@ struct ZenMuxProvider: UsageProvider {
         return try parseResponse(data)
     }
 
-    // MARK: - Private
+    // MARK: - Internal
 
-    private static let baseURL = "https://zenmux.ai/api/subscription/get_current_usage"
+    static let keychainService = "TokenPulse-ZenMuxAPIKey"
 
-    private func buildRequest(cookies: ZenMuxCookies) -> URLRequest {
-        var components = URLComponents(string: Self.baseURL)!
-        components.queryItems = [URLQueryItem(name: "ctoken", value: cookies.ctoken)]
+    private static let endpoint = "https://zenmux.ai/api/v1/management/subscription/detail"
 
-        var req = URLRequest(url: components.url!)
+    private func buildRequest(apiKey: String) -> URLRequest {
+        var req = URLRequest(url: URL(string: Self.endpoint)!)
         req.httpMethod = "GET"
-        let cookieHeader = "ctoken=\(cookies.ctoken); sessionId=\(cookies.sessionId); sessionId.sig=\(cookies.sessionIdSig)"
-        req.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         req.setValue("TokenPulse/1.0", forHTTPHeaderField: "User-Agent")
         return req
     }
 
     private func parseResponse(_ data: Data) throws -> UsageData {
         let raw = try JSONDecoder().decode(ZenMuxResponse.self, from: data)
+        let d = raw.data
 
-        var fiveHour: WindowUsage?
-        var sevenDay: WindowUsage?
-        var extras: [String: String] = [:]
-
-        let isoFormatter = ISO8601DateFormatter()
-        isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-
-        for entry in raw.data {
-            let utilization = entry.usedRate * 100.0
-            let resetsAt = isoFormatter.date(from: entry.cycleEndTime)
-
-            let window = WindowUsage(utilization: utilization, resetsAt: resetsAt)
-
-            switch entry.periodType {
-            case "hour_5":
-                fiveHour = window
-            case "week":
-                sevenDay = window
-            default:
-                break
-            }
-
-            if entry.quotaStatus != 0 {
-                extras["quotaExhausted_\(entry.periodType)"] = "true"
-            }
+        let fiveHour = d.quota5Hour.map { q in
+            WindowUsage(utilization: (q.usagePercentage ?? 0) * 100.0, resetsAt: parseISO8601(q.resetsAt))
+        }
+        let sevenDay = d.quota7Day.map { q in
+            WindowUsage(utilization: (q.usagePercentage ?? 0) * 100.0, resetsAt: parseISO8601(q.resetsAt))
         }
 
-        if let tierCode = raw.data.first?.tierCode {
-            extras["tier"] = tierCode
+        var extras: [String: String] = [:]
+        extras["tier"] = d.plan.tier
+        extras["accountStatus"] = d.accountStatus
+        extras["effectiveUsdPerFlow"] = String(format: "%.5f", d.effectiveUsdPerFlow)
+        if let q = d.quota5Hour {
+            if let v = q.usedFlows { extras["5hUsedFlows"] = String(format: "%.2f", v) }
+            if let v = q.remainingFlows { extras["5hRemainingFlows"] = String(format: "%.2f", v) }
+            if let v = q.maxFlows { extras["5hMaxFlows"] = String(format: "%.0f", v) }
+            if let v = q.usedValueUsd { extras["5hUsedUsd"] = String(format: "%.2f", v) }
+            if let v = q.maxValueUsd { extras["5hMaxUsd"] = String(format: "%.2f", v) }
+        }
+        if let q = d.quota7Day {
+            if let v = q.usedFlows { extras["7dUsedFlows"] = String(format: "%.2f", v) }
+            if let v = q.remainingFlows { extras["7dRemainingFlows"] = String(format: "%.2f", v) }
+            if let v = q.maxFlows { extras["7dMaxFlows"] = String(format: "%.0f", v) }
+            if let v = q.usedValueUsd { extras["7dUsedUsd"] = String(format: "%.2f", v) }
+            if let v = q.maxValueUsd { extras["7dMaxUsd"] = String(format: "%.2f", v) }
+        }
+        if let q = d.quotaMonthly {
+            if let v = q.usedFlows { extras["moUsedFlows"] = String(format: "%.2f", v) }
+            if let v = q.remainingFlows { extras["moRemainingFlows"] = String(format: "%.2f", v) }
+            if let v = q.maxFlows { extras["moMaxFlows"] = String(format: "%.0f", v) }
+            if let v = q.usedValueUsd { extras["moUsedUsd"] = String(format: "%.2f", v) }
+            if let v = q.maxValueUsd { extras["moMaxUsd"] = String(format: "%.2f", v) }
         }
 
         return UsageData(
@@ -99,32 +93,81 @@ struct ZenMuxProvider: UsageProvider {
             fetchedAt: .now
         )
     }
+
+    private func parseISO8601(_ string: String?) -> Date? {
+        guard let string else { return nil }
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f.date(from: string)
+    }
 }
 
 // MARK: - Response models
 
 private struct ZenMuxResponse: Decodable {
-    let data: [ZenMuxUsageEntry]
+    let data: ZenMuxData
 }
 
-private struct ZenMuxUsageEntry: Decodable {
-    let tierCode: String
-    let periodType: String
-    let periodDuration: String
-    let cycleStartTime: String
-    let cycleEndTime: String
-    let usedRate: Double
-    let quotaStatus: Int
-    let status: Int
+private struct ZenMuxData: Decodable {
+    let plan: ZenMuxPlan
+    let accountStatus: String
+    let effectiveUsdPerFlow: Double
+    let quota5Hour: ZenMuxQuota?
+    let quota7Day: ZenMuxQuota?
+    let quotaMonthly: ZenMuxQuota?
+
+    enum CodingKeys: String, CodingKey {
+        case plan
+        case accountStatus = "account_status"
+        case effectiveUsdPerFlow = "effective_usd_per_flow"
+        case quota5Hour = "quota_5_hour"
+        case quota7Day = "quota_7_day"
+        case quotaMonthly = "quota_monthly"
+    }
+}
+
+private struct ZenMuxPlan: Decodable {
+    let tier: String
+    let amountUsd: Double?
+    let expiresAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case tier
+        case amountUsd = "amount_usd"
+        case expiresAt = "expires_at"
+    }
+}
+
+private struct ZenMuxQuota: Decodable {
+    let usagePercentage: Double?
+    let resetsAt: String?
+    let maxFlows: Double?
+    let usedFlows: Double?
+    let remainingFlows: Double?
+    let usedValueUsd: Double?
+    let maxValueUsd: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case usagePercentage = "usage_percentage"
+        case resetsAt = "resets_at"
+        case maxFlows = "max_flows"
+        case usedFlows = "used_flows"
+        case remainingFlows = "remaining_flows"
+        case usedValueUsd = "used_value_usd"
+        case maxValueUsd = "max_value_usd"
+    }
 }
 
 // MARK: - Errors
 
 enum ZenMuxProviderError: LocalizedError {
+    case missingAPIKey
     case httpError(Int)
 
     var errorDescription: String? {
         switch self {
+        case .missingAPIKey:
+            return String(localized: "ZenMux Management API key not configured")
         case .httpError(let code):
             return String(localized: "ZenMux API returned HTTP \(code)")
         }

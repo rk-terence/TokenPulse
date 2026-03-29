@@ -8,7 +8,6 @@ macOS menu bar app that monitors AI platform token usage (5-hour rolling window)
 - macOS 14+ (Sonoma), universal binary (arm64 + x86_64)
 - Core Graphics for menu bar icon rendering
 - Security.framework for Keychain access
-- SQLite3 + CommonCrypto for Chrome cookie decryption
 - Sparkle for auto-update
 
 ## Architecture
@@ -20,10 +19,10 @@ TokenPulse/
 ├── Providers/                  # UsageProvider protocol + per-provider implementations
 │   ├── UsageProvider.swift     # Protocol: fetchUsage() async throws -> UsageData
 │   ├── ClaudeProvider.swift    # Keychain OAuth → /api/oauth/usage
-│   └── ZenMuxProvider.swift    # Chrome cookie → ZenMux subscription API
+│   └── ZenMuxProvider.swift    # Management API key → /api/v1/management/subscription/detail
 ├── Services/
 │   ├── KeychainService.swift   # Security.framework wrapper
-│   ├── ChromeCookieService.swift  # SQLite + AES-128-CBC decryption
+│   ├── ConfigService.swift     # ~/.tokenpulse/config.json read/write
 │   └── PollingManager.swift    # Timer-based refresh
 ├── Views/                      # SwiftUI: PopoverView, SettingsView
 └── Rendering/
@@ -66,7 +65,6 @@ xcodebuild -scheme TokenPulse -configuration Debug test
 ## Important rules
 
 - Never hardcode API keys or credentials — all secrets come from Keychain at runtime
-- Chrome cookie decrypted values must stay in memory only, never persisted to disk
 - Minimum 60s polling interval for Claude /api/oauth/usage to avoid 429s
 - Always handle provider errors gracefully — dim icon + show stale data rather than crash
 - Run `xcodebuild test` after any model or provider changes
