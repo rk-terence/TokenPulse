@@ -27,6 +27,7 @@ A macOS menu bar app that monitors your AI platform token usage at a glance. It 
 - **ZenMux support** — TokenPulse supports ZenMux out of the box (via Chrome cookie decryption or manual paste). ZenMux is a niche provider that CodexBar doesn't cover, and likely too niche for them to want to maintain.
 - **One gauge, one glance** — CodexBar shows two stacked bars per provider with multiple display modes. TokenPulse shows a single battery gauge with the remaining percentage right in the icon — you get your answer without interpreting bar heights or switching modes.
 - **Minimal by design** — TokenPulse is ~20 source files with a simple `UsageProvider` protocol. No SwiftSyntax macros, no helper processes, no multi-strategy fallback chains. The entire codebase is easy to audit, fork, and modify in an afternoon.
+- **Machine-readable output** — Every poll cycle writes raw provider data to `~/.tokenpulse/raw_usage.json`, so shell scripts and other tools can consume it without scraping or IPC.
 
 If you use many AI providers and want comprehensive coverage, use CodexBar. If you use Claude and/or ZenMux and want something small and direct, TokenPulse is for you.
 
@@ -70,6 +71,20 @@ The menu bar gauge shows remaining capacity for the active provider's 5-hour win
 - **Green** — more than 50% remaining
 - **Amber** — 20–50% remaining
 - **Red** — less than 20% remaining
+
+## Data export
+
+TokenPulse writes raw provider data to `~/.tokenpulse/raw_usage.json` after every poll. Example:
+
+```bash
+# Get Claude 5-hour utilization
+jq '.providers.claude.fiveHour.utilization' ~/.tokenpulse/raw_usage.json
+
+# Check if any provider is in error state
+jq '.providers | to_entries[] | select(.value.status == "error")' ~/.tokenpulse/raw_usage.json
+```
+
+The file is atomically written, so readers always see a complete snapshot.
 
 ## Project structure
 

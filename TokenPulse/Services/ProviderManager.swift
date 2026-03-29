@@ -79,6 +79,7 @@ final class ProviderManager {
         lastUpdated = .now
         isRefreshing = false
         rebuildEntries()
+        UsageExporter.write(entries: providerEntries)
         notifyIconUpdate()
     }
 

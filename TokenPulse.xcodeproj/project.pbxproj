@@ -24,6 +24,7 @@
 		B10000010000000000000001 /* ChromeCookieService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000010000000000000001 /* ChromeCookieService.swift */; };
 		B10000010000000000000002 /* ZenMuxProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000010000000000000002 /* ZenMuxProvider.swift */; };
 		B10000010000000000000003 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000010000000000000003 /* SettingsView.swift */; };
+		B10000010000000000000004 /* UsageExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000010000000000000004 /* UsageExporter.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -48,6 +49,7 @@
 		B20000010000000000000001 /* ChromeCookieService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChromeCookieService.swift; sourceTree = "<group>"; };
 		B20000010000000000000002 /* ZenMuxProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZenMuxProvider.swift; sourceTree = "<group>"; };
 		B20000010000000000000003 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		B20000010000000000000004 /* UsageExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageExporter.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -123,6 +125,7 @@
 				B20000010000000000000001 /* ChromeCookieService.swift */,
 				A2000001000000000000000B /* PollingManager.swift */,
 				A2000001000000000000000C /* ProviderManager.swift */,
+				B20000010000000000000004 /* UsageExporter.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -237,6 +240,7 @@
 				B10000010000000000000001 /* ChromeCookieService.swift in Sources */,
 				B10000010000000000000002 /* ZenMuxProvider.swift in Sources */,
 				B10000010000000000000003 /* SettingsView.swift in Sources */,
+				B10000010000000000000004 /* UsageExporter.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
