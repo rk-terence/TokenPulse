@@ -2,6 +2,15 @@
 
 Product description and user-facing docs are in README.md. Provider API specs are in docs/providers.md. This file is for agents working in the codebase.
 
+## Code Review Workflow
+When I ask for a review or code changes, follow this process:
+
+1. Use the codex tool to initiate a review request, sending the git diff as context
+2. Analyze the review feedback from Codex and identify what needs to be changed
+3. Make the code changes yourself
+4. After changes are made, use codex-reply (with the same threadId) to send the updated diff back to Codex for re-review
+5. If Codex still has feedback, continue iterating — up to a maximum of 3 rounds
+
 ## Build & run
 
 ```bash

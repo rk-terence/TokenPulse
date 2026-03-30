@@ -5,8 +5,8 @@ struct SettingsView: View {
     let manager: ProviderManager
     let config: ConfigService
 
-    /// Guards against re-entrant onChange when reverting launchAtLogin on failure.
-    @State private var isRevertingLaunchAtLogin = false
+    /// Tracks the last value we programmatically set to suppress the resulting onChange.
+    @State private var launchAtLoginRevertTarget: Bool?
     @State private var launchAtLoginError: String?
 
     var body: some View {
@@ -20,7 +20,10 @@ struct SettingsView: View {
         .padding(20)
         .frame(minWidth: 400, minHeight: 280)
         .onChange(of: config.launchAtLogin) { _, newValue in
-            guard !isRevertingLaunchAtLogin else { return }
+            if let target = launchAtLoginRevertTarget, target == newValue {
+                launchAtLoginRevertTarget = nil
+                return
+            }
             setLaunchAtLogin(newValue)
         }
         .onChange(of: config.pollInterval) { _, newValue in
@@ -37,10 +40,10 @@ struct SettingsView: View {
             }
             launchAtLoginError = nil
         } catch {
-            isRevertingLaunchAtLogin = true
-            config.launchAtLogin = !enabled
-            isRevertingLaunchAtLogin = false
-            launchAtLoginError = error.localizedDescription
+            let reverted = !enabled
+            launchAtLoginRevertTarget = reverted
+            config.launchAtLogin = reverted
+            launchAtLoginError = String(localized: "Failed to update launch at login: \(error.localizedDescription)")
         }
     }
 }
@@ -78,6 +81,7 @@ private struct ProvidersTab: View {
 
     @State private var zenMuxAPIKey = ""
     @State private var zenMuxKeySaved = false
+    @State private var zenMuxRemoveError: String?
 
     var body: some View {
         Form {
@@ -113,10 +117,15 @@ private struct ProvidersTab: View {
                             .foregroundStyle(.green)
                     }
                     if zenMuxConfigured {
-                        Button("Remove") { removeZenMuxAPIKey() }
+                        Button(String(localized: "Remove")) { removeZenMuxAPIKey() }
                     }
                     Button("Save") { saveZenMuxAPIKey() }
                         .disabled(zenMuxAPIKey.isEmpty)
+                }
+                if let zenMuxRemoveError {
+                    Text(zenMuxRemoveError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
             }
         }
@@ -142,6 +151,7 @@ private struct ProvidersTab: View {
             try KeychainService.saveGenericPassword(data, service: ZenMuxProvider.keychainService)
             zenMuxKeySaved = true
             zenMuxAPIKey = ""
+            zenMuxRemoveError = nil
             manager.requestRefresh()
         } catch {
             zenMuxKeySaved = false
@@ -149,9 +159,15 @@ private struct ProvidersTab: View {
     }
 
     private func removeZenMuxAPIKey() {
-        try? KeychainService.deleteGenericPassword(service: ZenMuxProvider.keychainService)
-        zenMuxKeySaved = false
-        zenMuxAPIKey = ""
-        manager.requestRefresh()
+        do {
+            try KeychainService.deleteGenericPassword(service: ZenMuxProvider.keychainService)
+            zenMuxKeySaved = false
+            zenMuxAPIKey = ""
+            zenMuxRemoveError = nil
+            manager.requestRefresh()
+        } catch {
+            zenMuxKeySaved = false
+            zenMuxRemoveError = String(localized: "Failed to remove API key: \(error.localizedDescription)")
+        }
     }
 }
