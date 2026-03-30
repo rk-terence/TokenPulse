@@ -137,11 +137,12 @@ final class ProviderManager {
         }
 
         let lastData = state.status.displayData
+        let lastMessage = state.status.message
         let attemptAt = Date()
         state.refreshGeneration += 1
         let generation = state.refreshGeneration
         state.lastAttemptAt = attemptAt
-        state.status = .refreshing(lastData: lastData)
+        state.status = .refreshing(lastData: lastData, lastMessage: lastMessage)
         states[provider.id] = state
         updateRefreshingFlag()
 

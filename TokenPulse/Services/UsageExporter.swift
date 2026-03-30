@@ -57,7 +57,7 @@ enum UsageExporter {
                     lastAttemptAt: entry.lastAttemptAt,
                     lastSuccessAt: entry.lastSuccessAt
                 )
-            case .refreshing(let lastData):
+            case .refreshing(let lastData, _):
                 payload = ProviderPayload(
                     displayName: entry.displayName,
                     status: "refreshing",

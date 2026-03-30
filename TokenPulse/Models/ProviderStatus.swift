@@ -8,14 +8,14 @@ enum StaleReason: Sendable {
 enum ProviderStatus: Sendable {
     case unconfigured
     case pendingFirstLoad
-    case refreshing(lastData: UsageData?)
+    case refreshing(lastData: UsageData?, lastMessage: String? = nil)
     case ready(UsageData)
     case stale(UsageData, reason: StaleReason, message: String)
     case error(String)
 
     var displayData: UsageData? {
         switch self {
-        case .refreshing(let lastData):
+        case .refreshing(let lastData, _):
             return lastData
         case .ready(let data):
             return data
@@ -51,10 +51,11 @@ enum ProviderStatus: Sendable {
             return String(localized: "Not configured")
         case .pendingFirstLoad:
             return String(localized: "Waiting for first refresh")
-        case .refreshing(let lastData):
-            return lastData == nil
-                ? String(localized: "Refreshing...")
-                : nil
+        case .refreshing(let lastData, let lastMessage):
+            if lastData == nil {
+                return String(localized: "Refreshing...")
+            }
+            return lastMessage
         case .ready:
             return nil
         case .stale(_, _, let message), .error(let message):
