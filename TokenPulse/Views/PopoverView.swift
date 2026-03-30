@@ -163,8 +163,8 @@ private struct ProviderRow: View {
 
     private var showsLastSuccessHint: Bool {
         switch entry.status {
-        case .refreshing(let lastData):
-            return lastData != nil
+        case .refreshing:
+            return false
         case .stale:
             return true
         case .unconfigured, .pendingFirstLoad, .ready, .error:

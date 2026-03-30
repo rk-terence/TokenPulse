@@ -54,7 +54,7 @@ enum ProviderStatus: Sendable {
         case .refreshing(let lastData):
             return lastData == nil
                 ? String(localized: "Refreshing...")
-                : String(localized: "Refreshing... showing last successful data")
+                : nil
         case .ready:
             return nil
         case .stale(_, _, let message), .error(let message):
