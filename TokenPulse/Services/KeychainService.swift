@@ -45,6 +45,18 @@ enum KeychainService {
         }
     }
 
+    /// Delete a generic password from the Keychain by service name.
+    static func deleteGenericPassword(service: String) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeychainError.unexpectedStatus(status)
+        }
+    }
+
     /// Save (or update) a generic password in the Keychain by service name.
     static func saveGenericPassword(_ data: Data, service: String) throws {
         let query: [String: Any] = [

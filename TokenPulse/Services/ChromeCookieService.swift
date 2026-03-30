@@ -161,10 +161,14 @@ enum ChromeCookieService {
             sqlite3_finalize(metaStmt)
         }
 
+        // Use exact host matching to avoid picking cookies from unrelated domains.
+        // ORDER BY host_key DESC gives 'zenmux.ai' priority over '.zenmux.ai',
+        // and creation_utc DESC picks the freshest row when duplicates exist.
         let query = """
             SELECT name, encrypted_value FROM cookies
-            WHERE host_key LIKE '%zenmux%'
+            WHERE host_key IN ('zenmux.ai', '.zenmux.ai')
             AND name IN ('ctoken', 'sessionId', 'sessionId.sig')
+            ORDER BY host_key DESC, creation_utc DESC
             """
 
         var stmt: OpaquePointer?
@@ -174,15 +178,19 @@ enum ChromeCookieService {
         }
         defer { sqlite3_finalize(stmt) }
 
+        // Keep only the first (highest-priority) row per cookie name.
+        var seen: Set<String> = []
         var results: [(String, Data)] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             guard let namePtr = sqlite3_column_text(stmt, 0) else { continue }
             let name = String(cString: namePtr)
+            guard !seen.contains(name) else { continue }
 
             let blobLen = sqlite3_column_bytes(stmt, 1)
             guard blobLen > 0, let blobPtr = sqlite3_column_blob(stmt, 1) else { continue }
             let data = Data(bytes: blobPtr, count: Int(blobLen))
 
+            seen.insert(name)
             results.append((name, data))
         }
 

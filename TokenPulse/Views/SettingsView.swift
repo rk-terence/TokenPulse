@@ -5,9 +5,13 @@ struct SettingsView: View {
     let manager: ProviderManager
     let config: ConfigService
 
+    /// Guards against re-entrant onChange when reverting launchAtLogin on failure.
+    @State private var isRevertingLaunchAtLogin = false
+    @State private var launchAtLoginError: String?
+
     var body: some View {
         TabView {
-            GeneralTab(config: config)
+            GeneralTab(config: config, launchAtLoginError: launchAtLoginError)
                 .tabItem { Label("General", systemImage: "gear") }
 
             ProvidersTab(manager: manager)
@@ -16,6 +20,7 @@ struct SettingsView: View {
         .padding(20)
         .frame(minWidth: 400, minHeight: 280)
         .onChange(of: config.launchAtLogin) { _, newValue in
+            guard !isRevertingLaunchAtLogin else { return }
             setLaunchAtLogin(newValue)
         }
         .onChange(of: config.pollInterval) { _, newValue in
@@ -30,8 +35,12 @@ struct SettingsView: View {
             } else {
                 try SMAppService.mainApp.unregister()
             }
+            launchAtLoginError = nil
         } catch {
-            config.launchAtLogin = !enabled // revert on failure
+            isRevertingLaunchAtLogin = true
+            config.launchAtLogin = !enabled
+            isRevertingLaunchAtLogin = false
+            launchAtLoginError = error.localizedDescription
         }
     }
 }
@@ -40,10 +49,16 @@ struct SettingsView: View {
 
 private struct GeneralTab: View {
     @Bindable var config: ConfigService
+    var launchAtLoginError: String?
 
     var body: some View {
         Form {
             Toggle("Launch at login", isOn: $config.launchAtLogin)
+            if let launchAtLoginError {
+                Text(launchAtLoginError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
 
             Picker("Polling interval", selection: $config.pollInterval) {
                 Text("60 seconds").tag(60.0)
@@ -97,6 +112,9 @@ private struct ProvidersTab: View {
                             .font(.caption)
                             .foregroundStyle(.green)
                     }
+                    if zenMuxConfigured {
+                        Button("Remove") { removeZenMuxAPIKey() }
+                    }
                     Button("Save") { saveZenMuxAPIKey() }
                         .disabled(zenMuxAPIKey.isEmpty)
                 }
@@ -124,8 +142,16 @@ private struct ProvidersTab: View {
             try KeychainService.saveGenericPassword(data, service: ZenMuxProvider.keychainService)
             zenMuxKeySaved = true
             zenMuxAPIKey = ""
+            manager.requestRefresh()
         } catch {
             zenMuxKeySaved = false
         }
+    }
+
+    private func removeZenMuxAPIKey() {
+        try? KeychainService.deleteGenericPassword(service: ZenMuxProvider.keychainService)
+        zenMuxKeySaved = false
+        zenMuxAPIKey = ""
+        manager.requestRefresh()
     }
 }
