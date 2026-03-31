@@ -24,15 +24,24 @@ struct ZenMuxProvider: UsageProvider {
         }
 
         // Fetch management API (primary) and subscription summary (optional) concurrently
-        let cookies = try? ChromeCookieService.extractZenMuxCookies()
+        let cookies: ZenMuxCookies?
+        let cookieError: String?
+        do {
+            cookies = try ChromeCookieService.extractZenMuxCookies()
+            cookieError = nil
+        } catch {
+            cookies = nil
+            cookieError = error.localizedDescription
+        }
 
         async let primaryFetch = fetchManagementAPI(apiKey: apiKey)
         async let summaryFetch = fetchSubscriptionSummary(cookies: cookies)
 
         let primaryData = try await primaryFetch
-        let summaryData = await summaryFetch
+        let (summaryData, summaryError) = await summaryFetch
 
-        return buildUsageData(primary: primaryData, summary: summaryData)
+        let summaryIssue = summaryData == nil ? (cookieError ?? summaryError) : nil
+        return buildUsageData(primary: primaryData, summary: summaryData, summaryIssue: summaryIssue)
     }
 
     func classifyError(_ error: Error) -> FailureDisposition {
@@ -93,8 +102,8 @@ struct ZenMuxProvider: UsageProvider {
 
     // MARK: - Subscription summary (optional, cookie-based)
 
-    private func fetchSubscriptionSummary(cookies: ZenMuxCookies?) async -> ZenMuxSummaryData? {
-        guard let cookies else { return nil }
+    private func fetchSubscriptionSummary(cookies: ZenMuxCookies?) async -> (ZenMuxSummaryData?, String?) {
+        guard let cookies else { return (nil, nil) }
 
         var components = URLComponents(string: Self.summaryEndpoint)!
         components.queryItems = [URLQueryItem(name: "ctoken", value: cookies.ctoken)]
@@ -108,16 +117,20 @@ struct ZenMuxProvider: UsageProvider {
         do {
             let (data, response) = try await session.data(for: req)
             guard let http = response as? HTTPURLResponse,
-                  (200..<300).contains(http.statusCode) else { return nil }
-            return try JSONDecoder().decode(ZenMuxSummaryResponse.self, from: data).data
+                  (200..<300).contains(http.statusCode) else {
+                let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+                return (nil, String(localized: "Summary API HTTP \(code)"))
+            }
+            let decoded = try JSONDecoder().decode(ZenMuxSummaryResponse.self, from: data).data
+            return (decoded, nil)
         } catch {
-            return nil
+            return (nil, error.localizedDescription)
         }
     }
 
     // MARK: - Build UsageData
 
-    private func buildUsageData(primary d: ZenMuxData, summary: ZenMuxSummaryData?) -> UsageData {
+    private func buildUsageData(primary d: ZenMuxData, summary: ZenMuxSummaryData?, summaryIssue: String? = nil) -> UsageData {
         let fiveHour = d.quota5Hour.map { q in
             WindowUsage(utilization: (q.usagePercentage ?? 0) * 100.0, resetsAt: parseISO8601(q.resetsAt))
         }
@@ -156,6 +169,10 @@ struct ZenMuxProvider: UsageProvider {
             extras["moUsedUsd"] = String(format: "%.2f", totalCost)
             extras["moRequestCounts"] = summary.requestCounts
             extras["moTotalTokens"] = summary.totalTokens
+        }
+
+        if let summaryIssue {
+            extras["moSummaryIssue"] = summaryIssue
         }
 
         // Monthly resets at (plan expiry)

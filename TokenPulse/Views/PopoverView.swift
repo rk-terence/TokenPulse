@@ -273,14 +273,22 @@ private struct QuotaGrid: View {
                 detail: usdDetail(used: "moUsedUsd", max: "moMaxUsd")
             )
         } else if let maxUsd = data.extras["moMaxUsd"] {
-            HStack(spacing: 4) {
-                Text("mo")
-                    .font(.body)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 28, alignment: .trailing)
-                Text("cap $\(maxUsd)")
-                    .font(.body.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    Text("mo")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, alignment: .trailing)
+                    Text("cap $\(maxUsd)")
+                        .font(.body.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+                if let issue = data.extras["moSummaryIssue"] {
+                    Text(issue)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .padding(.leading, 32)
+                }
             }
         }
 

@@ -49,7 +49,11 @@ enum ChromeCookieService {
     static func extractZenMuxCookies() throws -> ZenMuxCookies {
         // 1. Copy DB to temp to avoid WAL lock
         let tempDB = try copyDBToTemp()
-        defer { try? FileManager.default.removeItem(atPath: tempDB) }
+        defer {
+            for suffix in ["", "-wal", "-shm"] {
+                try? FileManager.default.removeItem(atPath: tempDB + suffix)
+            }
+        }
 
         // 2. Get Chrome Safe Storage key from Keychain
         let chromeKey = try readChromeSafeStorageKey()
@@ -93,6 +97,19 @@ enum ChromeCookieService {
         } catch {
             throw ChromeCookieError.dbCopyFailed
         }
+
+        // Copy WAL and SHM files so recent cookies (still in WAL) are visible.
+        for suffix in ["-wal", "-shm"] {
+            let src = cookiesDBPath + suffix
+            if FileManager.default.fileExists(atPath: src) {
+                do {
+                    try FileManager.default.copyItem(atPath: src, toPath: dest + suffix)
+                } catch {
+                    throw ChromeCookieError.dbCopyFailed
+                }
+            }
+        }
+
         return dest
     }
 
