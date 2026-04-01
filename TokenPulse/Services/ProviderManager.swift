@@ -253,7 +253,7 @@ final class ProviderManager {
     // MARK: - State management
 
     private func rebuildEntries() {
-        providerEntries = providers.map { p -> ProviderEntry in
+        let entries = providers.map { p -> ProviderEntry in
             let state = states[p.id]
             return ProviderEntry(
                 id: p.id,
@@ -263,6 +263,12 @@ final class ProviderManager {
                 lastAttemptAt: state?.lastAttemptAt,
                 lastSuccessAt: state?.lastSuccessAt
             )
+        }
+        // Active provider shown first in popover
+        if let activeID = activeProviderID {
+            providerEntries = entries.sorted { a, _ in a.id == activeID }
+        } else {
+            providerEntries = entries
         }
     }
 
@@ -309,6 +315,7 @@ final class ProviderManager {
 
         let currentIndex = activeProviderID.flatMap { configuredIDs.firstIndex(of: $0) } ?? -1
         activeProviderID = configuredIDs[(currentIndex + 1) % configuredIDs.count]
+        rebuildEntries()
         notifyIconUpdate()
     }
 
