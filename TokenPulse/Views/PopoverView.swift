@@ -28,8 +28,13 @@ struct PopoverView: View {
 
             Divider()
 
-            if manager.configuredProviderCount == 0 {
-                Text("No providers configured. Open Settings to connect Claude or ZenMux.")
+            if manager.enabledProviderCount == 0 {
+                Text("No providers enabled. Open Settings to enable a provider.")
+                    .foregroundStyle(.secondary)
+                    .font(.callout)
+                Divider()
+            } else if manager.configuredProviderCount == 0 {
+                Text("No providers configured. Open Settings to connect your accounts.")
                     .foregroundStyle(.secondary)
                     .font(.callout)
                 Divider()

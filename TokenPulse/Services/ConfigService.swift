@@ -5,6 +5,12 @@ import Foundation
 final class ConfigService {
     static let shared = ConfigService()
 
+    /// Current on-disk schema version. Bump when adding fields that need migration.
+    private static let currentConfigVersion = 1
+
+    /// Factory defaults for provider enablement (Claude off, ZenMux on).
+    static let factoryEnabledProviders: [String: Bool] = ["claude": false, "zenmux": true]
+
     var launchAtLogin: Bool {
         didSet { save() }
     }
@@ -13,10 +19,28 @@ final class ConfigService {
         didSet { save() }
     }
 
+    private(set) var enabledProviders: [String: Bool] {
+        didSet { save() }
+    }
+
+    func isProviderEnabled(_ id: String) -> Bool {
+        enabledProviders[id] ?? false
+    }
+
+    func setProviderEnabled(_ id: String, _ enabled: Bool) {
+        enabledProviders[id] = enabled
+    }
+
     private init() {
-        let config = Self.load()
-        self.launchAtLogin = config.launchAtLogin
-        self.pollInterval = config.pollInterval
+        let loaded = Self.load()
+        self.launchAtLogin = loaded.config.launchAtLogin
+        self.pollInterval = loaded.config.pollInterval
+        self.enabledProviders = loaded.config.enabledProviders
+
+        // Persist migrated config if the on-disk version was outdated.
+        if loaded.migrated {
+            save()
+        }
     }
 
     // MARK: - Persistence
@@ -29,20 +53,57 @@ final class ConfigService {
     private static let fileURL = directory.appendingPathComponent("config.json")
 
     private struct ConfigFile: Codable {
+        var configVersion: Int?
         var launchAtLogin: Bool = false
         var pollInterval: TimeInterval = ProviderConfig.defaultPollInterval
+        var enabledProviders: [String: Bool]?
     }
 
-    private static func load() -> ConfigFile {
+    private struct LoadResult {
+        let config: ResolvedConfig
+        let migrated: Bool
+    }
+
+    private struct ResolvedConfig {
+        var launchAtLogin: Bool
+        var pollInterval: TimeInterval
+        var enabledProviders: [String: Bool]
+    }
+
+    private static func load() -> LoadResult {
         guard let data = try? Data(contentsOf: fileURL),
-              let config = try? JSONDecoder().decode(ConfigFile.self, from: data) else {
-            return ConfigFile()
+              let file = try? JSONDecoder().decode(ConfigFile.self, from: data) else {
+            // No file or unreadable — return factory defaults.
+            return LoadResult(
+                config: ResolvedConfig(
+                    launchAtLogin: false,
+                    pollInterval: ProviderConfig.defaultPollInterval,
+                    enabledProviders: factoryEnabledProviders
+                ),
+                migrated: true
+            )
         }
-        return config
+
+        let needsMigration = (file.configVersion ?? 0) < currentConfigVersion
+        let resolvedProviders = file.enabledProviders ?? factoryEnabledProviders
+
+        return LoadResult(
+            config: ResolvedConfig(
+                launchAtLogin: file.launchAtLogin,
+                pollInterval: file.pollInterval,
+                enabledProviders: resolvedProviders
+            ),
+            migrated: needsMigration
+        )
     }
 
     private func save() {
-        let config = ConfigFile(launchAtLogin: launchAtLogin, pollInterval: pollInterval)
+        let config = ConfigFile(
+            configVersion: Self.currentConfigVersion,
+            launchAtLogin: launchAtLogin,
+            pollInterval: pollInterval,
+            enabledProviders: enabledProviders
+        )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         do {

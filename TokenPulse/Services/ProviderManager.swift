@@ -70,6 +70,10 @@ final class ProviderManager {
         providerEntries.filter { $0.status.isConfigured }.count
     }
 
+    var enabledProviderCount: Int {
+        providers.filter { ConfigService.shared.isProviderEnabled($0.id) }.count
+    }
+
     func openSettings() {
         NSApp.activate(ignoringOtherApps: true)
 
@@ -91,8 +95,9 @@ final class ProviderManager {
 
     func register(_ provider: any UsageProvider) {
         providers.append(provider)
+        let enabled = ConfigService.shared.isProviderEnabled(provider.id)
         states[provider.id] = ProviderState(
-            status: provider.isConfigured() ? .pendingFirstLoad : .unconfigured
+            status: enabled && provider.isConfigured() ? .pendingFirstLoad : .unconfigured
         )
         rebuildEntries()
         syncActiveProviderSelection()
@@ -108,10 +113,51 @@ final class ProviderManager {
         notifyIconUpdate()
     }
 
+    /// Called after a provider enable/disable toggle changes.
+    func providerEnabledChanged() {
+        for provider in providers {
+            let enabled = ConfigService.shared.isProviderEnabled(provider.id)
+            if enabled {
+                // Re-evaluate configured status for newly enabled providers.
+                if let state = states[provider.id], !state.status.isConfigured {
+                    states[provider.id]?.status = provider.isConfigured() ? .pendingFirstLoad : .unconfigured
+                }
+                refresh(provider, trigger: .manual)
+            } else {
+                // Cancel in-flight work and mark unconfigured.
+                if let task = inFlightRefreshes[provider.id] {
+                    states[provider.id]?.refreshGeneration += 1
+                    task.cancel()
+                    inFlightRefreshes[provider.id] = nil
+                    inFlightTriggers[provider.id] = nil
+                }
+                states[provider.id]?.status = .unconfigured
+            }
+        }
+
+        updateRefreshingFlag()
+        rebuildEntries()
+        syncActiveProviderSelection()
+        notifyIconUpdate()
+    }
+
     // MARK: - Per-provider refresh
 
     private func refresh(_ provider: any UsageProvider, trigger: RefreshTrigger) {
         guard var state = states[provider.id] else { return }
+
+        guard ConfigService.shared.isProviderEnabled(provider.id) else {
+            if let existing = inFlightRefreshes[provider.id] {
+                state.refreshGeneration += 1
+                existing.cancel()
+                inFlightRefreshes[provider.id] = nil
+            }
+
+            state.status = .unconfigured
+            states[provider.id] = state
+            updateRefreshingFlag()
+            return
+        }
 
         guard provider.isConfigured() else {
             if let existing = inFlightRefreshes[provider.id] {
@@ -253,7 +299,8 @@ final class ProviderManager {
     // MARK: - State management
 
     private func rebuildEntries() {
-        let entries = providers.map { p -> ProviderEntry in
+        let entries = providers.compactMap { p -> ProviderEntry? in
+            guard ConfigService.shared.isProviderEnabled(p.id) else { return nil }
             let state = states[p.id]
             return ProviderEntry(
                 id: p.id,
@@ -278,7 +325,8 @@ final class ProviderManager {
 
     private func configuredProviderIDs() -> [String] {
         providers.compactMap { provider in
-            guard states[provider.id]?.status.isConfigured == true else { return nil }
+            guard ConfigService.shared.isProviderEnabled(provider.id),
+                  states[provider.id]?.status.isConfigured == true else { return nil }
             return provider.id
         }
     }

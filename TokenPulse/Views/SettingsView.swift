@@ -14,7 +14,7 @@ struct SettingsView: View {
             GeneralTab(config: config, launchAtLoginError: launchAtLoginError)
                 .tabItem { Label("General", systemImage: "gear") }
 
-            ProvidersTab(manager: manager)
+            ProvidersTab(manager: manager, config: config)
                 .tabItem { Label("Providers", systemImage: "server.rack") }
         }
         .padding(20)
@@ -78,6 +78,7 @@ private struct GeneralTab: View {
 
 private struct ProvidersTab: View {
     let manager: ProviderManager
+    @Bindable var config: ConfigService
 
     @State private var zenMuxAPIKey = ""
     @State private var zenMuxKeySaved = false
@@ -86,51 +87,83 @@ private struct ProvidersTab: View {
     var body: some View {
         Form {
             Section("Claude") {
-                HStack {
-                    Text("Credential status")
-                    Spacer()
-                    Text(claudeStatus)
-                        .foregroundStyle(claudeConfigured ? .green : .secondary)
+                Toggle(String(localized: "Enable Claude"), isOn: claudeEnabledBinding)
+
+                if config.isProviderEnabled("claude") {
+                    HStack {
+                        Text("Credential status")
+                        Spacer()
+                        Text(claudeStatus)
+                            .foregroundStyle(claudeConfigured ? .green : .secondary)
+                    }
                 }
             }
 
             Section("ZenMux") {
-                HStack {
-                    Text("API key status")
-                    Spacer()
-                    Text(zenMuxConfigured ? "Configured" : "Not set")
-                        .foregroundStyle(zenMuxConfigured ? .green : .secondary)
-                }
+                Toggle(String(localized: "Enable ZenMux"), isOn: zenMuxEnabledBinding)
 
-                SecureField("Management API Key", text: $zenMuxAPIKey)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { saveZenMuxAPIKey() }
+                if config.isProviderEnabled("zenmux") {
+                    HStack {
+                        Text("API key status")
+                        Spacer()
+                        Text(zenMuxConfigured ? "Configured" : "Not set")
+                            .foregroundStyle(zenMuxConfigured ? .green : .secondary)
+                    }
 
-                HStack {
-                    Text("Get your key from the ZenMux dashboard.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    if zenMuxKeySaved {
-                        Text("Saved")
+                    SecureField("Management API Key", text: $zenMuxAPIKey)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { saveZenMuxAPIKey() }
+
+                    HStack {
+                        Text("Get your key from the ZenMux dashboard.")
                             .font(.caption)
-                            .foregroundStyle(.green)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        if zenMuxKeySaved {
+                            Text("Saved")
+                                .font(.caption)
+                                .foregroundStyle(.green)
+                        }
+                        if zenMuxConfigured {
+                            Button(String(localized: "Remove")) { removeZenMuxAPIKey() }
+                        }
+                        Button("Save") { saveZenMuxAPIKey() }
+                            .disabled(zenMuxAPIKey.isEmpty)
                     }
-                    if zenMuxConfigured {
-                        Button(String(localized: "Remove")) { removeZenMuxAPIKey() }
+                    if let zenMuxRemoveError {
+                        Text(zenMuxRemoveError)
+                            .font(.caption)
+                            .foregroundStyle(.red)
                     }
-                    Button("Save") { saveZenMuxAPIKey() }
-                        .disabled(zenMuxAPIKey.isEmpty)
-                }
-                if let zenMuxRemoveError {
-                    Text(zenMuxRemoveError)
-                        .font(.caption)
-                        .foregroundStyle(.red)
                 }
             }
         }
         .formStyle(.grouped)
     }
+
+    // MARK: - Enabled bindings
+
+    private var claudeEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { config.isProviderEnabled("claude") },
+            set: { newValue in
+                config.setProviderEnabled("claude", newValue)
+                manager.providerEnabledChanged()
+            }
+        )
+    }
+
+    private var zenMuxEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { config.isProviderEnabled("zenmux") },
+            set: { newValue in
+                config.setProviderEnabled("zenmux", newValue)
+                manager.providerEnabledChanged()
+            }
+        )
+    }
+
+    // MARK: - Credential status
 
     private var claudeConfigured: Bool {
         ClaudeProvider().isConfigured()
