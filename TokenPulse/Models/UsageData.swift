@@ -6,8 +6,16 @@ struct WindowUsage: Codable, Sendable {
 }
 
 struct UsageData: Codable, Sendable {
-    let fiveHour: WindowUsage?           // 5-hour rolling window
-    let sevenDay: WindowUsage?           // Weekly quota
+    let fiveHour: WindowUsage?           // Primary quota window
+    let sevenDay: WindowUsage?           // Secondary quota window
     let extras: [String: String]         // Provider-specific (Opus quota, Flows, etc.)
     let fetchedAt: Date
+
+    var primaryWindowLabel: String {
+        extras["primaryWindowLabel"] ?? "5h"
+    }
+
+    var secondaryWindowLabel: String {
+        extras["secondaryWindowLabel"] ?? "7d"
+    }
 }

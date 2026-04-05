@@ -1,5 +1,83 @@
 # Provider specifications
 
+## Codex subscription provider
+
+### Authentication
+
+TokenPulse reads the local Codex CLI auth file:
+
+1. Resolve `$CODEX_HOME/auth.json` if `CODEX_HOME` is set (authoritative — no fallback)
+2. Otherwise check `~/.codex/auth.json`
+3. Require `auth_mode == "chatgpt"`
+4. Parse `tokens.access_token` and `tokens.account_id`
+
+Observed auth file shape:
+
+```json
+{
+  "auth_mode": "chatgpt",
+  "last_refresh": "2026-04-04T15:41:07.445471Z",
+  "tokens": {
+    "access_token": "...",
+    "refresh_token": "...",
+    "id_token": "...",
+    "account_id": "..."
+  }
+}
+```
+
+Notes:
+- TokenPulse currently uses the existing access token as-is
+- If the file is missing, unreadable, in API key mode, or missing token data, the provider is treated as unconfigured/auth-stale
+- A future enhancement is to replicate Codex CLI token refresh against `https://auth.openai.com/oauth/token`
+
+### API endpoint
+
+```
+GET https://chatgpt.com/backend-api/wham/usage
+
+Headers:
+  Authorization: Bearer <access_token>
+  ChatGPT-Account-Id: <account_id>   # when available
+  Accept: application/json
+  User-Agent: TokenPulse/1.0
+```
+
+### Response
+
+Observed response family:
+
+```json
+{
+  "plan_type": "plus",
+  "rate_limit": {
+    "primary_window": {
+      "used_percent": 12.5,
+      "reset_after_seconds": 5400
+    },
+    "secondary_window": {
+      "used_percent": 4.2,
+      "reset_after_seconds": 68400
+    }
+  }
+}
+```
+
+Field notes:
+- `primary_window` is mapped to TokenPulse's primary slot and shown as **5h**
+- `secondary_window` is mapped to TokenPulse's secondary slot and shown as **7d** / weekly
+- `used_percent` is a 0–100 percentage and used as-is (no normalization)
+- A 200 response missing both rate-limit windows is treated as an invalid response
+- `reset_after_seconds` is converted to an absolute reset date relative to fetch time
+- `plan_type` is surfaced in the popover as a tag when present
+
+### Known issues
+
+- This is not a public API surface; response fields may drift without notice
+- TokenPulse does not currently refresh expired Codex tokens itself
+
+---
+
 ## Claude subscription provider
 
 ### Authentication

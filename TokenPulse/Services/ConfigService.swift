@@ -8,8 +8,8 @@ final class ConfigService {
     /// Current on-disk schema version. Bump when adding fields that need migration.
     private static let currentConfigVersion = 1
 
-    /// Factory defaults for provider enablement (Claude off, ZenMux on).
-    static let factoryEnabledProviders: [String: Bool] = ["claude": false, "zenmux": true]
+    /// Factory defaults for provider enablement.
+    static let factoryEnabledProviders: [String: Bool] = ["claude": false, "codex": false, "zenmux": true]
 
     var launchAtLogin: Bool {
         didSet { save() }

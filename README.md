@@ -8,8 +8,8 @@ A macOS menu bar app that monitors your AI platform token usage at a glance. It 
 
 - **Menu bar gauge** — Battery-style horizontal bar showing remaining capacity, with color coding (green/amber/red)
 - **Multiple providers** — Right-click the icon to cycle between providers
-- **Click for details** — Left-click opens a popover with per-provider breakdown, 7-day usage, reset timers, and more
-- **Usage notifications** — macOS notifications when 5h usage crosses 50% or 80%, and when quotas reset
+- **Click for details** — Left-click opens a popover with per-provider breakdown, quota windows, reset timers, and more
+- **Usage notifications** — macOS notifications when a provider's primary window crosses 50% or 80%, and when quota windows reset
 - **Graceful degradation** — Shows stale data on transient errors, surfaces auth guidance on credential issues, dims icon when refreshing
 - **Configurable polling** — 60s, 2min, or 5min intervals
 - **Launch at login** — Optional auto-start via macOS Service Management
@@ -19,6 +19,7 @@ A macOS menu bar app that monitors your AI platform token usage at a glance. It 
 
 | Provider | Auth method | What it shows |
 |----------|-------------|---------------|
+| **Codex** | Local Codex ChatGPT login (`~/.codex/auth.json`) | 5h window, weekly window, plan tier |
 | **Claude** (Anthropic) | Keychain (Claude Code OAuth token) | 5h window, 7-day quota, Opus quota |
 | **ZenMux** | Management API key + Chrome cookies (auto-extracted) | 5h window, 7-day quota, monthly utilization*, tier, account status |
 
@@ -31,7 +32,7 @@ A macOS menu bar app that monitors your AI platform token usage at a glance. It 
 - **Minimal by design** — TokenPulse is ~20 source files with a simple `UsageProvider` protocol. No SwiftSyntax macros, no helper processes, no multi-strategy fallback chains. The entire codebase is easy to audit, fork, and modify in an afternoon.
 - **Machine-readable output** — Every poll cycle writes raw provider data to `~/.tokenpulse/raw_usage.json`, so shell scripts and other tools can consume it without scraping or IPC. Settings are stored in `~/.tokenpulse/config.json`.
 
-If you use many AI providers and want comprehensive coverage, use CodexBar. If you use Claude and/or ZenMux and want something small and direct, TokenPulse is for you.
+If you use many AI providers and want comprehensive coverage, use CodexBar. If you use Codex, Claude, and/or ZenMux and want something small and direct, TokenPulse is for you.
 
 ## Install
 
@@ -59,6 +60,16 @@ xcodebuild -scheme TokenPulse -configuration Debug build
 
 TokenPulse reads your Claude Code OAuth credentials from the macOS Keychain automatically. If you're signed into [Claude Code](https://claude.ai/claude-code), it should work out of the box — no configuration needed.
 
+### Codex provider
+
+TokenPulse reads your existing Codex ChatGPT login from `~/.codex/auth.json`. To set it up:
+
+1. Install the Codex CLI and sign in with ChatGPT via `codex login`
+2. Open **Settings > Providers** and enable **Codex**
+3. Refresh TokenPulse
+
+If your Codex CLI is currently using API key billing, run `codex login` to switch to your ChatGPT subscription.
+
 ### ZenMux provider
 
 1. Get a **Management API Key** from your [ZenMux dashboard](https://zenmux.ai)
@@ -73,7 +84,7 @@ TokenPulse reads your Claude Code OAuth credentials from the macOS Keychain auto
 - **Right-click** to switch between providers
 - Click the **gear icon** in the popover to open Settings
 
-The menu bar gauge shows remaining capacity for the active provider's 5-hour window:
+The menu bar gauge shows remaining capacity for the active provider's primary window:
 - **Green** — more than 50% remaining
 - **Amber** — 20–50% remaining
 - **Red** — less than 20% remaining
@@ -98,10 +109,10 @@ TokenPulse sends macOS notifications for important usage events:
 
 | Event | When |
 |-------|------|
-| **5h usage above 50%** | Utilization crosses the 50% threshold (entering amber zone) |
-| **5h usage above 80%** | Utilization crosses the 80% threshold (entering red zone) |
-| **5h quota reset** | The 5-hour rolling window resets |
-| **7d quota reset** | The 7-day rolling window resets |
+| **Primary window above 50%** | Utilization crosses the 50% threshold (entering amber zone) |
+| **Primary window above 80%** | Utilization crosses the 80% threshold (entering red zone) |
+| **Primary quota reset** | The provider's primary quota window resets |
+| **Secondary quota reset** | The provider's secondary quota window resets |
 
 Notifications are sent per provider. Grant notification permission when prompted on first launch.
 
@@ -111,7 +122,7 @@ Notifications are sent per provider. Grant notification permission when prompted
 TokenPulse/
 ├── App/            # AppDelegate, StatusBarController, entry point
 ├── Models/         # UsageData, ProviderStatus, ProviderConfig
-├── Providers/      # UsageProvider protocol + Claude, ZenMux implementations
+├── Providers/      # UsageProvider protocol + Codex, Claude, ZenMux implementations
 ├── Services/       # KeychainService, ChromeCookieService, ConfigService, PollingManager, ProviderManager, NotificationService
 ├── Views/          # PopoverView, SettingsView (SwiftUI)
 └── Rendering/      # BarIconRenderer (Core Graphics)

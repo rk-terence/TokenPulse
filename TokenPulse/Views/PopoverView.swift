@@ -213,7 +213,7 @@ private struct QuotaGrid: View {
             // 5-hour row
             if let fiveHour = data.fiveHour {
                 QuotaRow(
-                    label: "5h",
+                    label: data.primaryWindowLabel,
                     utilization: fiveHour.utilization,
                     resetsAt: fiveHour.resetsAt,
                     detail: usdDetail(used: "5hUsedUsd", max: "5hMaxUsd")
@@ -223,7 +223,7 @@ private struct QuotaGrid: View {
             // 7-day row
             if let sevenDay = data.sevenDay {
                 QuotaRow(
-                    label: "7d",
+                    label: data.secondaryWindowLabel,
                     utilization: sevenDay.utilization,
                     resetsAt: sevenDay.resetsAt,
                     detail: usdDetail(used: "7dUsedUsd", max: "7dMaxUsd")
@@ -234,6 +234,8 @@ private struct QuotaGrid: View {
             switch entry.id {
             case "claude":
                 claudeExtras
+            case "codex":
+                codexExtras
             case "zenmux":
                 zenMuxExtras
             default:
@@ -265,6 +267,15 @@ private struct QuotaGrid: View {
     }
 
     // MARK: - ZenMux extras
+
+    @ViewBuilder
+    private var codexExtras: some View {
+        HStack(spacing: 8) {
+            if let planType = data.extras["planType"] {
+                TagView(text: formattedPlanType(planType))
+            }
+        }
+    }
 
     @ViewBuilder
     private var zenMuxExtras: some View {
@@ -312,6 +323,13 @@ private struct QuotaGrid: View {
         guard let used = data.extras[usedKey],
               let max = data.extras[maxKey] else { return nil }
         return "$\(used)/$\(max)"
+    }
+
+    private func formattedPlanType(_ value: String) -> String {
+        value
+            .split(separator: "_")
+            .map { $0.capitalized }
+            .joined(separator: " ")
     }
 }
 

@@ -99,6 +99,23 @@ private struct ProvidersTab: View {
                 }
             }
 
+            Section("Codex") {
+                Toggle(String(localized: "Enable Codex"), isOn: codexEnabledBinding)
+
+                if config.isProviderEnabled("codex") {
+                    HStack {
+                        Text("Login status")
+                        Spacer()
+                        Text(codexStatus.description)
+                            .foregroundStyle(codexStatus.isConfigured ? .green : .secondary)
+                    }
+
+                    Text(codexHelpText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Section("ZenMux") {
                 Toggle(String(localized: "Enable ZenMux"), isOn: zenMuxEnabledBinding)
 
@@ -163,6 +180,16 @@ private struct ProvidersTab: View {
         )
     }
 
+    private var codexEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { config.isProviderEnabled("codex") },
+            set: { newValue in
+                config.setProviderEnabled("codex", newValue)
+                manager.providerEnabledChanged()
+            }
+        )
+    }
+
     // MARK: - Credential status
 
     private var claudeConfigured: Bool {
@@ -175,6 +202,21 @@ private struct ProvidersTab: View {
 
     private var zenMuxConfigured: Bool {
         (try? KeychainService.readGenericPassword(service: ZenMuxProvider.keychainService)) != nil
+    }
+
+    private var codexStatus: CodexConfigurationStatus {
+        CodexProvider.configurationStatus()
+    }
+
+    private var codexHelpText: String {
+        switch codexStatus {
+        case .connected:
+            return String(localized: "TokenPulse reads your existing Codex ChatGPT login from ~/.codex/auth.json.")
+        case .apiKeyOnly:
+            return String(localized: "Run `codex login` to switch from API key billing to your ChatGPT subscription.")
+        case .missingLogin, .invalidAuthFile, .missingToken:
+            return String(localized: "Sign in with `codex login`, then refresh TokenPulse.")
+        }
     }
 
     private func saveZenMuxAPIKey() {

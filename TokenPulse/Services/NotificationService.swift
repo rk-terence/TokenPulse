@@ -38,7 +38,7 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
 
             if let previous {
                 checkThresholds(provider: entry.displayName, previous: previous, current: current, data: data)
-                checkResets(provider: entry.displayName, previous: previous, current: current)
+                checkResets(provider: entry.displayName, previous: previous, current: current, data: data)
             }
 
             snapshots[entry.id] = current
@@ -60,8 +60,9 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
             send(
                 id: "\(provider)-5h-80",
                 title: String(
-                    format: NSLocalizedString("notification.threshold80.title", value: "%@ 5h usage above 80%%", comment: ""),
-                    provider
+                    format: NSLocalizedString("notification.threshold80.title", value: "%@ %@ usage above 80%%", comment: ""),
+                    provider,
+                    data.primaryWindowLabel
                 ),
                 body: body
             )
@@ -74,8 +75,9 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
             send(
                 id: "\(provider)-5h-50",
                 title: String(
-                    format: NSLocalizedString("notification.threshold50.title", value: "%@ 5h usage above 50%%", comment: ""),
-                    provider
+                    format: NSLocalizedString("notification.threshold50.title", value: "%@ %@ usage above 50%%", comment: ""),
+                    provider,
+                    data.primaryWindowLabel
                 ),
                 body: body
             )
@@ -84,7 +86,7 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
 
     // MARK: - Reset checks
 
-    private func checkResets(provider: String, previous: ProviderSnapshot, current: ProviderSnapshot) {
+    private func checkResets(provider: String, previous: ProviderSnapshot, current: ProviderSnapshot, data: UsageData) {
         // A real 5h reset jumps resetsAt forward by hours; ignore jitter under 1h
         if let prevReset = previous.fiveHourResetsAt,
            let curReset = current.fiveHourResetsAt,
@@ -92,8 +94,9 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
             send(
                 id: "\(provider)-5h-reset",
                 title: String(
-                    format: NSLocalizedString("notification.5hReset.title", value: "%@ 5h quota reset", comment: ""),
-                    provider
+                    format: NSLocalizedString("notification.5hReset.title", value: "%@ %@ quota reset", comment: ""),
+                    provider,
+                    data.primaryWindowLabel
                 ),
                 body: NSLocalizedString("notification.5hReset.body", value: "Usage back to 0% — full quota available", comment: "")
             )
@@ -106,10 +109,11 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
             send(
                 id: "\(provider)-7d-reset",
                 title: String(
-                    format: NSLocalizedString("notification.7dReset.title", value: "%@ 7d quota reset", comment: ""),
-                    provider
+                    format: NSLocalizedString("notification.7dReset.title", value: "%@ %@ quota reset", comment: ""),
+                    provider,
+                    data.secondaryWindowLabel
                 ),
-                body: NSLocalizedString("notification.7dReset.body", value: "Weekly quota has been refreshed", comment: "")
+                body: NSLocalizedString("notification.7dReset.body", value: "Quota window has been refreshed", comment: "")
             )
         }
     }

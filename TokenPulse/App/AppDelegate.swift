@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Register providers
         providerManager.register(ClaudeProvider())
+        providerManager.register(CodexProvider())
         providerManager.register(ZenMuxProvider())
 
         // Set up status bar
