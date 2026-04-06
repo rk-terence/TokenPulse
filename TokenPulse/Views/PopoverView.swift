@@ -14,8 +14,7 @@ struct PopoverView: View {
                 Button(action: { manager.requestRefresh() }) {
                     Image(systemName: "arrow.clockwise")
                         .font(.callout)
-                        .rotationEffect(.degrees(manager.isRefreshing ? 360 : 0))
-                        .animation(manager.isRefreshing ? .linear(duration: 1).repeatForever(autoreverses: false) : .default, value: manager.isRefreshing)
+                        .symbolEffect(.pulse, isActive: manager.isRefreshing)
                 }
                 .buttonStyle(.plain)
 
@@ -56,6 +55,8 @@ struct PopoverView: View {
                     Text("Last checked \(lastUpdate, style: .relative)")
                         .font(.callout)
                         .foregroundStyle(.tertiary)
+                        .contentTransition(.numericText())
+                        .animation(nil, value: lastUpdate)
                 }
                 Spacer()
                 Button("Quit") {
@@ -107,6 +108,8 @@ private struct ProviderRow: View {
                 Text("Last success \(lastSuccessAt, style: .relative)")
                     .font(.callout)
                     .foregroundStyle(.tertiary)
+                    .contentTransition(.numericText())
+                    .animation(nil, value: lastSuccessAt)
             }
         }
     }
@@ -362,6 +365,8 @@ private struct QuotaRow: View {
                     Text(resetsAt, style: .relative)
                         .font(.callout)
                         .foregroundStyle(.tertiary)
+                        .contentTransition(.numericText())
+                        .animation(nil, value: resetsAt)
                 }
             }
 
