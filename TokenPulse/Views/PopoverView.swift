@@ -11,18 +11,18 @@ struct PopoverView: View {
                 Text("TokenPulse")
                     .font(.headline)
                 Spacer()
-                Button(action: { manager.requestRefresh() }) {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.callout)
-                        .symbolEffect(.pulse, isActive: manager.isRefreshing)
-                }
-                .buttonStyle(.plain)
+                HeaderActionButton(
+                    title: manager.isRefreshing
+                        ? String(localized: "Refreshing…")
+                        : String(localized: "Refresh"),
+                    isEmphasized: manager.isRefreshing,
+                    action: { manager.requestRefresh() }
+                )
 
-                Button(action: { onOpenSettings?() }) {
-                    Image(systemName: "gear")
-                        .font(.callout)
-                }
-                .buttonStyle(.plain)
+                HeaderActionButton(
+                    title: String(localized: "Settings"),
+                    action: { onOpenSettings?() }
+                )
             }
 
             Divider()
@@ -71,6 +71,58 @@ struct PopoverView: View {
         .frame(width: 320)
     }
 
+}
+
+private struct HeaderActionButton: View {
+    let title: String
+    var isEmphasized = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(title, action: action)
+            .buttonStyle(HeaderActionButtonStyle(isEmphasized: isEmphasized))
+    }
+}
+
+private struct HeaderActionButtonStyle: ButtonStyle {
+    var isEmphasized: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.callout.weight(.semibold))
+            .foregroundStyle(foregroundColor(isPressed: configuration.isPressed))
+            .padding(.horizontal, 11)
+            .padding(.vertical, 6)
+            .background(backgroundColor(isPressed: configuration.isPressed), in: Capsule())
+            .overlay {
+                Capsule()
+                    .strokeBorder(borderColor(isPressed: configuration.isPressed), lineWidth: 1)
+            }
+            .scaleEffect(configuration.isPressed ? 0.97 : 1.0)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+            .contentShape(Capsule())
+    }
+
+    private func foregroundColor(isPressed: Bool) -> Color {
+        if isEmphasized || isPressed {
+            return .primary
+        }
+        return .secondary
+    }
+
+    private func backgroundColor(isPressed: Bool) -> Color {
+        if isEmphasized {
+            return isPressed ? Color.secondary.opacity(0.24) : Color.secondary.opacity(0.16)
+        }
+        return isPressed ? Color.secondary.opacity(0.16) : Color.secondary.opacity(0.08)
+    }
+
+    private func borderColor(isPressed: Bool) -> Color {
+        if isEmphasized {
+            return isPressed ? Color.secondary.opacity(0.42) : Color.secondary.opacity(0.28)
+        }
+        return isPressed ? Color.secondary.opacity(0.3) : Color.secondary.opacity(0.18)
+    }
 }
 
 // MARK: - Provider Row
