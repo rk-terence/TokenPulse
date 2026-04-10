@@ -56,23 +56,6 @@ TokenPulse/
     └── BarIconRenderer.swift   # Core Graphics battery bar icon
 ```
 
-## Team roles
-
-Unless explicitly stated otherwise, the main Claude session is the **leader**.
-
-- **Leader** (main Claude session): owns phasing, architecture decisions, and user approval gates. Spawns the developer for scoped tasks, then sends output to the reviewer via `/codex:rescue`. Iterates the developer ↔ reviewer loop until clean before presenting to the user.
-- **Developer** (Claude subagent, `.claude/agents/developer.md`): implements scoped tasks from the leader, builds and verifies. Does not make architecture decisions or advance phases.
-- **Reviewer** (Codex, via `/codex:rescue`): reviews developer output for correctness, concurrency safety, and code style. Returns findings to the leader.
-
-Workflow per phase:
-
-1. Leader spawns developer with scoped task
-2. Leader sends result to Codex (`/codex:rescue`) for review
-3. If issues found, leader sends developer back to fix
-4. Repeat 2–3 until clean
-5. Leader presents final result to user for approval
-6. User approves → leader starts next phase
-
 ## Sources of truth
 
 - Product features, install, usage → README.md

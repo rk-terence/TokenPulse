@@ -590,15 +590,14 @@ Checklist:
 
 ## Claude subagent setup for this work
 
-Since Claude Code supports custom subagents and `CLAUDE.md` remains part of project memory, the clean setup is:
+Since Claude Code supports custom subagents and skills, the setup is:
 
-- shared repo rules in `CLAUDE.md`
-- role-specific behavior in subagent definitions
-- leader in main Claude session
-- developer as Claude subagent
-- reviewer as Codex or a second reviewer agent
+- shared repo rules in `AGENTS.md` (via `CLAUDE.md`): build commands, code style, constraints, architecture
+- orchestration via `/lead` skill (`.claude/skills/lead.md`): activated on demand in any session
+- developer implementation via subagent (`.claude/agents/developer.md`): scoped tasks only
+- code review via `/codex:rescue`: correctness, concurrency, and style
 
-Claude subagents have isolated context and are meant for specialized delegated work, while `CLAUDE.md` continues to provide persistent project guidance.
+The orchestration workflow is decoupled from the main session. Any session can do regular work or activate leader mode by invoking `/lead`. Subagents do not see the orchestration layer — they only see their own task scope and the shared `AGENTS.md` constraints.
 
 * * *
 
