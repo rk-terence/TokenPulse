@@ -4,6 +4,7 @@ import ServiceManagement
 struct SettingsView: View {
     let manager: ProviderManager
     let config: ConfigService
+    var proxyController: LocalProxyController?
 
     /// Tracks the last value we programmatically set to suppress the resulting onChange.
     @State private var launchAtLoginRevertTarget: Bool?
@@ -16,6 +17,9 @@ struct SettingsView: View {
 
             ProvidersTab(manager: manager, config: config)
                 .tabItem { Label("Providers", systemImage: "server.rack") }
+
+            ProxyTab(config: config, proxyController: proxyController)
+                .tabItem { Label(String(localized: "Proxy"), systemImage: "network") }
         }
         .padding(20)
         .frame(minWidth: 400, minHeight: 280)
@@ -243,6 +247,61 @@ private struct ProvidersTab: View {
         } catch {
             zenMuxKeySaved = false
             zenMuxRemoveError = String(localized: "Failed to remove API key: \(error.localizedDescription)")
+        }
+    }
+}
+
+// MARK: - Proxy Tab
+
+private struct ProxyTab: View {
+    @Bindable var config: ConfigService
+    var proxyController: LocalProxyController?
+
+    @State private var portText: String = ""
+
+    private var proxyEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { config.proxyEnabled },
+            set: { newValue in
+                config.proxyEnabled = newValue
+                if newValue {
+                    proxyController?.start(
+                        port: config.proxyPort,
+                        upstreamURL: config.proxyUpstreamURL
+                    )
+                } else {
+                    proxyController?.stop()
+                }
+            }
+        )
+    }
+
+    var body: some View {
+        Form {
+            Section(String(localized: "Local Proxy")) {
+                Toggle(String(localized: "Enable local proxy"), isOn: proxyEnabledBinding)
+                if config.proxyEnabled {
+                    TextField(String(localized: "Upstream URL"), text: $config.proxyUpstreamURL)
+                        .textFieldStyle(.roundedBorder)
+                    TextField(String(localized: "Port"), text: $portText)
+                        .textFieldStyle(.roundedBorder)
+                    Text(String(localized: "Restart the proxy to apply changes."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .onAppear {
+            portText = String(config.proxyPort)
+        }
+        .onChange(of: portText) { _, newValue in
+            if let port = Int(newValue.trimmingCharacters(in: .whitespaces)),
+               (1...65535).contains(port) {
+                config.proxyPort = port
+            } else {
+                portText = String(config.proxyPort)
+            }
         }
     }
 }

@@ -63,6 +63,8 @@ final class ProviderManager {
     private var inFlightTriggers: [String: RefreshTrigger] = [:]
     private var settingsWindow: NSWindow?
 
+    var proxyController: LocalProxyController?
+
     var onIconUpdate: ((StatusBarIconModel) -> Void)?
     var onPollIntervalChanged: ((_ interval: TimeInterval) -> Void)?
 
@@ -81,7 +83,7 @@ final class ProviderManager {
             window.orderFrontRegardless()
             return
         }
-        let view = SettingsView(manager: self, config: ConfigService.shared)
+        let view = SettingsView(manager: self, config: ConfigService.shared, proxyController: proxyController)
         let hostingController = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: hostingController)
         window.title = "TokenPulse Settings"

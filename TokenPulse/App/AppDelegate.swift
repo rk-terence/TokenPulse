@@ -40,6 +40,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Start proxy if enabled
         proxyController = LocalProxyController()
+        providerManager.proxyController = proxyController
         if ConfigService.shared.proxyEnabled {
             proxyController?.start(
                 port: ConfigService.shared.proxyPort,
