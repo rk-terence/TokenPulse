@@ -34,6 +34,26 @@ struct ProxyHTTPRequest: Sendable {
     }
 }
 
+// MARK: - Keepalive request builder
+
+/// Transforms a stored request body into a keepalive variant by changing only
+/// `max_tokens` to 1 and `stream` to false, preserving all cache-identity-relevant
+/// fields (system, messages, tools, tool_choice, cache_control, thinking config).
+enum KeepaliveRequestBuilder {
+
+    /// Build a keepalive request body from a stored real request body.
+    /// Changes only `max_tokens` to 1 and `stream` to false.
+    /// Returns nil if the body cannot be parsed as JSON.
+    static func build(from originalBody: Data) -> Data? {
+        guard var json = try? JSONSerialization.jsonObject(with: originalBody) as? [String: Any] else {
+            return nil
+        }
+        json["max_tokens"] = 1
+        json["stream"] = false
+        return try? JSONSerialization.data(withJSONObject: json)
+    }
+}
+
 /// Protocol for writing HTTP responses back through the connection.
 /// Implementations must be `Sendable` because they are shared across
 /// the server dispatch queue and async forwarding code.

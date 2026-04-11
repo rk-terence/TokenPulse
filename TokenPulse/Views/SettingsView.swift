@@ -258,6 +258,8 @@ private struct ProxyTab: View {
     var proxyController: LocalProxyController?
 
     @State private var portText: String = ""
+    @State private var keepaliveIntervalText: String = ""
+    @State private var inactivityTimeoutText: String = ""
 
     private var proxyEnabledBinding: Binding<Bool> {
         Binding(
@@ -288,12 +290,42 @@ private struct ProxyTab: View {
                     Text(String(localized: "Restart the proxy to apply changes."))
                         .font(.caption)
                         .foregroundStyle(.secondary)
+
+                    Divider()
+
+                    Toggle(String(localized: "Enable keepalive"), isOn: $config.keepaliveEnabled)
+
+                    if config.keepaliveEnabled {
+                        HStack {
+                            Text(String(localized: "Keepalive interval (seconds)"))
+                            Spacer()
+                            TextField("", text: $keepaliveIntervalText)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 80)
+                                .multilineTextAlignment(.trailing)
+                        }
+
+                        HStack {
+                            Text(String(localized: "Inactivity timeout (seconds)"))
+                            Spacer()
+                            TextField("", text: $inactivityTimeoutText)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 80)
+                                .multilineTextAlignment(.trailing)
+                        }
+
+                        Text(String(localized: "Sends periodic cache-warming requests to keep the prompt cache alive during long generations."))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
         }
         .formStyle(.grouped)
         .onAppear {
             portText = String(config.proxyPort)
+            keepaliveIntervalText = String(config.keepaliveIntervalSeconds)
+            inactivityTimeoutText = String(config.proxyInactivityTimeoutSeconds)
         }
         .onChange(of: portText) { _, newValue in
             if let port = Int(newValue.trimmingCharacters(in: .whitespaces)),
@@ -301,6 +333,22 @@ private struct ProxyTab: View {
                 config.proxyPort = port
             } else {
                 portText = String(config.proxyPort)
+            }
+        }
+        .onChange(of: keepaliveIntervalText) { _, newValue in
+            if let interval = Int(newValue.trimmingCharacters(in: .whitespaces)),
+               (60...300).contains(interval) {
+                config.keepaliveIntervalSeconds = interval
+            } else {
+                keepaliveIntervalText = String(config.keepaliveIntervalSeconds)
+            }
+        }
+        .onChange(of: inactivityTimeoutText) { _, newValue in
+            if let timeout = Int(newValue.trimmingCharacters(in: .whitespaces)),
+               (300...3600).contains(timeout) {
+                config.proxyInactivityTimeoutSeconds = timeout
+            } else {
+                inactivityTimeoutText = String(config.proxyInactivityTimeoutSeconds)
             }
         }
     }

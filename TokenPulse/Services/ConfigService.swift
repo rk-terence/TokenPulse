@@ -6,7 +6,7 @@ final class ConfigService {
     static let shared = ConfigService()
 
     /// Current on-disk schema version. Bump when adding fields that need migration.
-    private static let currentConfigVersion = 2
+    private static let currentConfigVersion = 3
     private static let defaultProxyUpstreamURL = "https://zenmux.ai/api/anthropic"
 
     /// Factory defaults for provider enablement.
@@ -36,6 +36,18 @@ final class ConfigService {
         didSet { save() }
     }
 
+    var keepaliveEnabled: Bool {
+        didSet { save() }
+    }
+
+    var keepaliveIntervalSeconds: Int {
+        didSet { save() }
+    }
+
+    var proxyInactivityTimeoutSeconds: Int {
+        didSet { save() }
+    }
+
     func isProviderEnabled(_ id: String) -> Bool {
         enabledProviders[id] ?? false
     }
@@ -52,6 +64,9 @@ final class ConfigService {
         self.proxyEnabled = loaded.config.proxyEnabled
         self.proxyUpstreamURL = loaded.config.proxyUpstreamURL
         self.proxyPort = loaded.config.proxyPort
+        self.keepaliveEnabled = loaded.config.keepaliveEnabled
+        self.keepaliveIntervalSeconds = loaded.config.keepaliveIntervalSeconds
+        self.proxyInactivityTimeoutSeconds = loaded.config.proxyInactivityTimeoutSeconds
 
         // Persist migrated config if the on-disk version was outdated.
         if loaded.migrated {
@@ -76,6 +91,9 @@ final class ConfigService {
         var proxyEnabled: Bool?
         var proxyUpstreamURL: String?
         var proxyPort: Int?
+        var keepaliveEnabled: Bool?
+        var keepaliveIntervalSeconds: Int?
+        var proxyInactivityTimeoutSeconds: Int?
     }
 
     private struct LoadResult {
@@ -90,6 +108,9 @@ final class ConfigService {
         var proxyEnabled: Bool
         var proxyUpstreamURL: String
         var proxyPort: Int
+        var keepaliveEnabled: Bool
+        var keepaliveIntervalSeconds: Int
+        var proxyInactivityTimeoutSeconds: Int
     }
 
     private static func load() -> LoadResult {
@@ -103,7 +124,10 @@ final class ConfigService {
                     enabledProviders: factoryEnabledProviders,
                     proxyEnabled: false,
                     proxyUpstreamURL: defaultProxyUpstreamURL,
-                    proxyPort: 8080
+                    proxyPort: 8080,
+                    keepaliveEnabled: false,
+                    keepaliveIntervalSeconds: 240,
+                    proxyInactivityTimeoutSeconds: 900
                 ),
                 migrated: true
             )
@@ -119,7 +143,10 @@ final class ConfigService {
                 enabledProviders: resolvedProviders,
                 proxyEnabled: file.proxyEnabled ?? false,
                 proxyUpstreamURL: file.proxyUpstreamURL ?? defaultProxyUpstreamURL,
-                proxyPort: file.proxyPort ?? 8080
+                proxyPort: file.proxyPort ?? 8080,
+                keepaliveEnabled: file.keepaliveEnabled ?? false,
+                keepaliveIntervalSeconds: file.keepaliveIntervalSeconds ?? 240,
+                proxyInactivityTimeoutSeconds: file.proxyInactivityTimeoutSeconds ?? 900
             ),
             migrated: needsMigration
         )
@@ -133,7 +160,10 @@ final class ConfigService {
             enabledProviders: enabledProviders,
             proxyEnabled: proxyEnabled,
             proxyUpstreamURL: proxyUpstreamURL,
-            proxyPort: proxyPort
+            proxyPort: proxyPort,
+            keepaliveEnabled: keepaliveEnabled,
+            keepaliveIntervalSeconds: keepaliveIntervalSeconds,
+            proxyInactivityTimeoutSeconds: proxyInactivityTimeoutSeconds
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

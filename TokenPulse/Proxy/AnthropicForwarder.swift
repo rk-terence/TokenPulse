@@ -23,12 +23,17 @@ final class AnthropicForwarder: Sendable {
     func forward(
         request: ProxyHTTPRequest,
         sessionStore: ProxySessionStore,
-        metrics: ProxyMetricsStore
+        metrics: ProxyMetricsStore,
+        keepaliveManager: KeepaliveManager?
     ) async {
         // 1. Extract session ID and update session store.
         let sessionID = request.headerValue(for: "X-Claude-Code-Session-Id") ?? "unknown"
         await sessionStore.touch(sessionID)
         await sessionStore.incrementInFlight(sessionID)
+
+        // Store request body and model for keepalive use.
+        let model = extractModel(from: request.body)
+        await sessionStore.storeRequestBody(request.body, model: model, for: sessionID)
 
         defer {
             Task {
@@ -69,6 +74,9 @@ final class AnthropicForwarder: Sendable {
         } else {
             await forwardNonStreaming(urlRequest: urlRequest, writer: request.writer, metrics: metrics)
         }
+
+        // 5. Notify keepalive manager after forwarding completes.
+        await keepaliveManager?.startOrReset(sessionID: sessionID, headers: request.headers)
     }
 
     // MARK: - Streaming forwarding
@@ -205,6 +213,14 @@ final class AnthropicForwarder: Sendable {
         ])
         writer.writeChunk(body)
         writer.end()
+    }
+
+    /// Extract the model name from a JSON request body.
+    private func extractModel(from body: Data) -> String? {
+        guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+            return nil
+        }
+        return json["model"] as? String
     }
 }
 
