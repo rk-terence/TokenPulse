@@ -437,17 +437,17 @@ private struct QuotaRow: View {
 private struct MiniBar: View {
     let percentage: Double
 
+    private static let barWidth: Double = 100
+
     var body: some View {
-        GeometryReader { geo in
-            ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(.quaternary)
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(barColor)
-                    .frame(width: max(0, geo.size.width * min(percentage, 100) / 100))
-            }
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(.quaternary)
+            RoundedRectangle(cornerRadius: 2)
+                .fill(barColor)
+                .frame(width: max(0, Self.barWidth * min(percentage, 100) / 100))
         }
-        .frame(width: 100, height: 6)
+        .frame(width: Self.barWidth, height: 6)
     }
 
     private var barColor: Color {
