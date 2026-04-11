@@ -10,14 +10,14 @@ final class StatusBarController {
 
     var onRightClick: (() -> Void)?
 
-    init(providerManager: ProviderManager) {
+    init(providerManager: ProviderManager, proxyController: LocalProxyController? = nil) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         // Placeholder icon
         updateIcon(StatusBarIconModel(label: "?", utilization: nil, state: .unconfigured))
 
         // Popover content
-        let view = PopoverView(manager: providerManager) { [weak self] in
+        let view = PopoverView(manager: providerManager, proxyController: proxyController) { [weak self] in
             self?.popover.performClose(nil)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                 providerManager.openSettings()

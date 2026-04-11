@@ -63,6 +63,15 @@ actor ProxySessionStore {
         Array(sessions.values)
     }
 
+    /// Count of sessions that have been seen recently (within the given interval)
+    /// or still have in-flight requests.
+    func recentSessionCount(within interval: TimeInterval) -> Int {
+        let cutoff = Date().addingTimeInterval(-interval)
+        return sessions.values.filter { session in
+            session.inFlightRequestCount > 0 || session.lastSeenAt >= cutoff
+        }.count
+    }
+
     /// Look up a single session by ID.
     func session(for sessionID: String) -> Session? {
         sessions[sessionID]

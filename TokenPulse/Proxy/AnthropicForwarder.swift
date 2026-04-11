@@ -9,9 +9,13 @@ final class AnthropicForwarder: Sendable {
     let upstreamBaseURL: String
     /// Shared session used for non-streaming requests only.
     private let session: URLSession
+    private let eventLogger: ProxyEventLogger?
+    private let proxyPort: Int
 
-    init(upstreamBaseURL: String) {
+    init(upstreamBaseURL: String, eventLogger: ProxyEventLogger? = nil, proxyPort: Int = 0) {
         self.upstreamBaseURL = upstreamBaseURL
+        self.eventLogger = eventLogger
+        self.proxyPort = proxyPort
 
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 300  // Long timeout for streaming
@@ -35,6 +39,8 @@ final class AnthropicForwarder: Sendable {
         let model = extractModel(from: request.body)
         await sessionStore.storeRequestBody(request.body, model: model, for: sessionID)
 
+        await eventLogger?.logRequestStarted(session: sessionID, model: model)
+
         defer {
             Task {
                 await sessionStore.decrementInFlight(sessionID)
@@ -46,6 +52,7 @@ final class AnthropicForwarder: Sendable {
             + request.path
         guard let url = URL(string: urlString) else {
             await metrics.recordFailed()
+            await eventLogger?.logRequestFailed(session: sessionID, error: "invalid upstream URL")
             sendErrorToClient(writer: request.writer, status: 502,
                               message: String(localized: "Bad Gateway: invalid upstream URL"))
             return
@@ -70,10 +77,17 @@ final class AnthropicForwarder: Sendable {
         let wantsStreaming = ProxyRequestBody.isStreaming(from: request.body)
 
         if wantsStreaming {
-            await forwardStreaming(urlRequest: urlRequest, writer: request.writer, metrics: metrics)
+            await forwardStreaming(urlRequest: urlRequest, writer: request.writer, metrics: metrics, sessionID: sessionID, model: model)
         } else {
-            await forwardNonStreaming(urlRequest: urlRequest, writer: request.writer, metrics: metrics)
+            await forwardNonStreaming(urlRequest: urlRequest, writer: request.writer, metrics: metrics, sessionID: sessionID, model: model)
         }
+
+        // Write status snapshot after each request.
+        await writeStatusSnapshot(
+            sessionStore: sessionStore,
+            metrics: metrics,
+            keepaliveManager: keepaliveManager
+        )
 
         // 5. Notify keepalive manager after forwarding completes.
         await keepaliveManager?.startOrReset(sessionID: sessionID, headers: request.headers)
@@ -84,7 +98,9 @@ final class AnthropicForwarder: Sendable {
     private func forwardStreaming(
         urlRequest: URLRequest,
         writer: ResponseWriter,
-        metrics: ProxyMetricsStore
+        metrics: ProxyMetricsStore,
+        sessionID: String,
+        model: String?
     ) async {
         do {
             // Create a per-request streaming delegate and session so we receive
@@ -103,12 +119,16 @@ final class AnthropicForwarder: Sendable {
 
             dataTask.resume()
 
+            // Track the upstream status code for event logging.
+            var upstreamStatusCode = 0
+
             // Wrap the entire streaming operation — including header wait — in a
             // cancellation handler so the upstream task is cancelled if the client
             // disconnects at any point (during header wait OR chunk streaming).
             try await withTaskCancellationHandler {
                 // Await the HTTP response headers.
                 let httpResponse = try await streamingDelegate.awaitResponse()
+                upstreamStatusCode = httpResponse.statusCode
 
                 // Write the head with upstream status and headers.
                 var responseHeaders = buildResponseHeaders(from: httpResponse, streaming: true)
@@ -135,12 +155,19 @@ final class AnthropicForwarder: Sendable {
 
             writer.end()
             await metrics.recordForwarded()
+            // For streaming, we don't parse the body for cache metrics.
+            await eventLogger?.logRequestCompleted(
+                session: sessionID, model: model, statusCode: upstreamStatusCode,
+                cacheReadTokens: nil, cacheCreationTokens: nil
+            )
 
         } catch is CancellationError {
             // Client disconnected — no error response needed.
             ProxyLogger.log("Streaming request cancelled (client disconnect)")
+            await eventLogger?.logRequestFailed(session: sessionID, error: "client disconnected")
         } catch {
             await metrics.recordFailed()
+            await eventLogger?.logRequestFailed(session: sessionID, error: error.localizedDescription)
             sendErrorToClient(writer: writer, status: 502,
                               message: String(localized: "Bad Gateway: upstream error: \(error.localizedDescription)"))
         }
@@ -151,13 +178,16 @@ final class AnthropicForwarder: Sendable {
     private func forwardNonStreaming(
         urlRequest: URLRequest,
         writer: ResponseWriter,
-        metrics: ProxyMetricsStore
+        metrics: ProxyMetricsStore,
+        sessionID: String,
+        model: String?
     ) async {
         do {
             let (data, response) = try await session.data(for: urlRequest)
 
             guard let httpResponse = response as? HTTPURLResponse else {
                 await metrics.recordFailed()
+                await eventLogger?.logRequestFailed(session: sessionID, error: "non-HTTP response from upstream")
                 sendErrorToClient(writer: writer, status: 502,
                                   message: String(localized: "Bad Gateway: non-HTTP response from upstream"))
                 return
@@ -173,8 +203,16 @@ final class AnthropicForwarder: Sendable {
             writer.end()
             await metrics.recordForwarded()
 
+            // For non-streaming, parse cache metrics from the response body.
+            let (cacheRead, cacheCreation) = Self.parseCacheMetrics(from: data)
+            await eventLogger?.logRequestCompleted(
+                session: sessionID, model: model, statusCode: httpResponse.statusCode,
+                cacheReadTokens: cacheRead, cacheCreationTokens: cacheCreation
+            )
+
         } catch {
             await metrics.recordFailed()
+            await eventLogger?.logRequestFailed(session: sessionID, error: error.localizedDescription)
             sendErrorToClient(writer: writer, status: 502,
                               message: String(localized: "Bad Gateway: upstream error: \(error.localizedDescription)"))
         }
@@ -221,6 +259,37 @@ final class AnthropicForwarder: Sendable {
             return nil
         }
         return json["model"] as? String
+    }
+
+    /// Parse `cache_read_input_tokens` and `cache_creation_input_tokens` from
+    /// the upstream JSON response's `usage` object.
+    private static func parseCacheMetrics(from data: Data) -> (cacheReadTokens: Int?, cacheCreationTokens: Int?) {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let usage = json["usage"] as? [String: Any] else {
+            return (nil, nil)
+        }
+        let cacheRead = usage["cache_read_input_tokens"] as? Int
+        let cacheCreation = usage["cache_creation_input_tokens"] as? Int
+        return (cacheRead, cacheCreation)
+    }
+
+    /// Write an atomic status snapshot via the event logger.
+    private func writeStatusSnapshot(
+        sessionStore: ProxySessionStore,
+        metrics: ProxyMetricsStore,
+        keepaliveManager: KeepaliveManager?
+    ) async {
+        guard let logger = eventLogger else { return }
+        let activeSessions = await sessionStore.activeSessions().count
+        let activeKeepalives = await keepaliveManager?.activeCount() ?? 0
+        let snapshot = await metrics.snapshot()
+        await logger.writeStatusSnapshot(
+            enabled: true,
+            port: proxyPort,
+            activeSessions: activeSessions,
+            activeKeepalives: activeKeepalives,
+            metrics: snapshot
+        )
     }
 }
 

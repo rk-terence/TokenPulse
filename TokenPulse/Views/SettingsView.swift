@@ -318,6 +318,39 @@ private struct ProxyTab: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+
+                    Divider()
+
+                    Toggle(String(localized: "Save event log"), isOn: $config.saveProxyEventLog)
+                }
+            }
+
+            if let controller = proxyController, controller.isRunning {
+                Section(String(localized: "Status")) {
+                    LabeledContent(String(localized: "Port")) {
+                        Text("\(controller.listeningPort)")
+                            .monospacedDigit()
+                    }
+                    LabeledContent(String(localized: "Active sessions")) {
+                        Text("\(controller.proxyStatus.activeSessions)")
+                            .monospacedDigit()
+                    }
+                    LabeledContent(String(localized: "Keepalive loops")) {
+                        Text("\(controller.proxyStatus.activeKeepalives)")
+                            .monospacedDigit()
+                    }
+                    LabeledContent(String(localized: "Requests forwarded")) {
+                        Text("\(controller.proxyStatus.totalRequestsForwarded)")
+                            .monospacedDigit()
+                    }
+                    LabeledContent(String(localized: "Cache reads")) {
+                        Text("\(controller.proxyStatus.cacheReads)")
+                            .monospacedDigit()
+                    }
+                    LabeledContent(String(localized: "Cache writes")) {
+                        Text("\(controller.proxyStatus.cacheWrites)")
+                            .monospacedDigit()
+                    }
                 }
             }
         }

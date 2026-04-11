@@ -35,6 +35,7 @@
 		C30000010000000000000005 /* AnthropicForwarder.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000005 /* AnthropicForwarder.swift */; };
 		C30000010000000000000006 /* LocalProxyController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000006 /* LocalProxyController.swift */; };
 		C30000010000000000000007 /* KeepaliveManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000007 /* KeepaliveManager.swift */; };
+		C30000010000000000000008 /* ProxyEventLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000008 /* ProxyEventLogger.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -70,6 +71,7 @@
 		C20000010000000000000005 /* AnthropicForwarder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnthropicForwarder.swift; sourceTree = "<group>"; };
 		C20000010000000000000006 /* LocalProxyController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalProxyController.swift; sourceTree = "<group>"; };
 		C20000010000000000000007 /* KeepaliveManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeepaliveManager.swift; sourceTree = "<group>"; };
+		C20000010000000000000008 /* ProxyEventLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyEventLogger.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -181,6 +183,7 @@
 				C20000010000000000000005 /* AnthropicForwarder.swift */,
 				C20000010000000000000006 /* LocalProxyController.swift */,
 				C20000010000000000000007 /* KeepaliveManager.swift */,
+				C20000010000000000000008 /* ProxyEventLogger.swift */,
 			);
 			path = Proxy;
 			sourceTree = "<group>";
@@ -289,6 +292,7 @@
 				C30000010000000000000005 /* AnthropicForwarder.swift in Sources */,
 				C30000010000000000000006 /* LocalProxyController.swift in Sources */,
 				C30000010000000000000007 /* KeepaliveManager.swift in Sources */,
+				C30000010000000000000008 /* ProxyEventLogger.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct PopoverView: View {
     let manager: ProviderManager
+    var proxyController: LocalProxyController?
     var onOpenSettings: (() -> Void)?
 
     var body: some View {
@@ -48,6 +49,12 @@ struct PopoverView: View {
             }
 
             Divider()
+
+            // Proxy status (compact)
+            if let proxy = proxyController, proxy.isRunning {
+                ProxyStatusRow(proxy: proxy)
+                Divider()
+            }
 
             // Footer
             HStack {
@@ -470,5 +477,56 @@ private struct TagView: View {
             .padding(.horizontal, 4)
             .padding(.vertical, 1)
             .background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 3))
+    }
+}
+
+// MARK: - Proxy Status Row
+
+private struct ProxyStatusRow: View {
+    let proxy: LocalProxyController
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Circle()
+                    .fill(.green)
+                    .frame(width: 8, height: 8)
+                Text(String(localized: "Proxy"))
+                    .font(.body.weight(.medium))
+                Spacer()
+                Text(":\(proxy.listeningPort)")
+                    .font(.body.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            // Compact metrics grid
+            HStack(spacing: 12) {
+                ProxyMetricLabel(label: String(localized: "sessions"), value: "\(proxy.proxyStatus.activeSessions)")
+                ProxyMetricLabel(label: String(localized: "keepalive"), value: "\(proxy.proxyStatus.activeKeepalives)")
+                ProxyMetricLabel(label: String(localized: "fwd"), value: "\(proxy.proxyStatus.totalRequestsForwarded)")
+            }
+
+            // Cache metrics
+            HStack(spacing: 12) {
+                ProxyMetricLabel(label: String(localized: "cache rd"), value: "\(proxy.proxyStatus.cacheReads)")
+                ProxyMetricLabel(label: String(localized: "cache wr"), value: "\(proxy.proxyStatus.cacheWrites)")
+            }
+        }
+    }
+}
+
+private struct ProxyMetricLabel: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Text(label)
+                .font(.callout)
+                .foregroundStyle(.tertiary)
+            Text(value)
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
     }
 }

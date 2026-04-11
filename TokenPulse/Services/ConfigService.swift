@@ -48,6 +48,10 @@ final class ConfigService {
         didSet { save() }
     }
 
+    var saveProxyEventLog: Bool {
+        didSet { save() }
+    }
+
     func isProviderEnabled(_ id: String) -> Bool {
         enabledProviders[id] ?? false
     }
@@ -67,6 +71,7 @@ final class ConfigService {
         self.keepaliveEnabled = loaded.config.keepaliveEnabled
         self.keepaliveIntervalSeconds = loaded.config.keepaliveIntervalSeconds
         self.proxyInactivityTimeoutSeconds = loaded.config.proxyInactivityTimeoutSeconds
+        self.saveProxyEventLog = loaded.config.saveProxyEventLog
 
         // Persist migrated config if the on-disk version was outdated.
         if loaded.migrated {
@@ -94,6 +99,7 @@ final class ConfigService {
         var keepaliveEnabled: Bool?
         var keepaliveIntervalSeconds: Int?
         var proxyInactivityTimeoutSeconds: Int?
+        var saveProxyEventLog: Bool?
     }
 
     private struct LoadResult {
@@ -111,6 +117,7 @@ final class ConfigService {
         var keepaliveEnabled: Bool
         var keepaliveIntervalSeconds: Int
         var proxyInactivityTimeoutSeconds: Int
+        var saveProxyEventLog: Bool
     }
 
     private static func load() -> LoadResult {
@@ -127,7 +134,8 @@ final class ConfigService {
                     proxyPort: 8080,
                     keepaliveEnabled: false,
                     keepaliveIntervalSeconds: 240,
-                    proxyInactivityTimeoutSeconds: 900
+                    proxyInactivityTimeoutSeconds: 900,
+                    saveProxyEventLog: true
                 ),
                 migrated: true
             )
@@ -146,7 +154,8 @@ final class ConfigService {
                 proxyPort: file.proxyPort ?? 8080,
                 keepaliveEnabled: file.keepaliveEnabled ?? false,
                 keepaliveIntervalSeconds: file.keepaliveIntervalSeconds ?? 240,
-                proxyInactivityTimeoutSeconds: file.proxyInactivityTimeoutSeconds ?? 900
+                proxyInactivityTimeoutSeconds: file.proxyInactivityTimeoutSeconds ?? 900,
+                saveProxyEventLog: file.saveProxyEventLog ?? true
             ),
             migrated: needsMigration
         )
@@ -163,7 +172,8 @@ final class ConfigService {
             proxyPort: proxyPort,
             keepaliveEnabled: keepaliveEnabled,
             keepaliveIntervalSeconds: keepaliveIntervalSeconds,
-            proxyInactivityTimeoutSeconds: proxyInactivityTimeoutSeconds
+            proxyInactivityTimeoutSeconds: proxyInactivityTimeoutSeconds,
+            saveProxyEventLog: saveProxyEventLog
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

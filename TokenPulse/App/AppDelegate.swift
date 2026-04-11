@@ -16,8 +16,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         providerManager.register(CodexProvider())
         providerManager.register(ZenMuxProvider())
 
+        // Start proxy if enabled (before status bar so popover can show status)
+        proxyController = LocalProxyController()
+        providerManager.proxyController = proxyController
+
         // Set up status bar
-        statusBarController = StatusBarController(providerManager: providerManager)
+        statusBarController = StatusBarController(providerManager: providerManager, proxyController: proxyController)
 
         // Wire icon updates
         providerManager.onIconUpdate = { [weak self] model in
@@ -38,9 +42,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pollingManager = PollingManager(providerManager: providerManager, interval: ConfigService.shared.pollInterval)
         pollingManager?.start()
 
-        // Start proxy if enabled
-        proxyController = LocalProxyController()
-        providerManager.proxyController = proxyController
         if ConfigService.shared.proxyEnabled {
             proxyController?.start(
                 port: ConfigService.shared.proxyPort,
