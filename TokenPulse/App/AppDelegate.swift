@@ -4,6 +4,7 @@ import AppKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusBarController: StatusBarController?
     private var pollingManager: PollingManager?
+    private var proxyController: LocalProxyController?
     let providerManager = ProviderManager()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -36,5 +37,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Start polling with saved interval
         pollingManager = PollingManager(providerManager: providerManager, interval: ConfigService.shared.pollInterval)
         pollingManager?.start()
+
+        // Start proxy if enabled
+        proxyController = LocalProxyController()
+        if ConfigService.shared.proxyEnabled {
+            proxyController?.start(
+                port: ConfigService.shared.proxyPort,
+                upstreamURL: ConfigService.shared.proxyUpstreamURL
+            )
+        }
     }
 }

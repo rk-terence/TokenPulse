@@ -115,7 +115,7 @@ Responsible for upstream request execution.
 
 Responsibilities:
 
-- forward the incoming request to the configured upstream URL (default: `https://zenmux.ai`; or another Anthropic-compatible gateway)
+- forward the incoming request to the configured upstream URL (default: `https://zenmux.ai/api/anthropic`; or another Anthropic-compatible gateway)
 - preserve all incoming headers, including `Authorization`, `anthropic-version`, and `anthropic-beta`
 - do not assume the upstream is Anthropic directly — the gateway may add or transform headers
 - stream upstream chunks back to Claude Code
@@ -281,7 +281,7 @@ var saveProxyEventLog: Bool
 Recommended defaults:
 
 - `proxyEnabled = false`
-- `proxyUpstreamURL = "https://zenmux.ai"`
+- `proxyUpstreamURL = "https://zenmux.ai/api/anthropic"`
 - `proxyPort = 8080`
 - `keepaliveIntervalSeconds = 240`
 - `proxyInactivityTimeoutSeconds = 900`

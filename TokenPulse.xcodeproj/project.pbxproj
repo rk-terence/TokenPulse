@@ -28,6 +28,12 @@
 		B10000010000000000000006 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000010000000000000006 /* NotificationService.swift */; };
 		B10000010000000000000007 /* ChromeCookieService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000010000000000000007 /* ChromeCookieService.swift */; };
 		B10000010000000000000008 /* CodexProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000010000000000000008 /* CodexProvider.swift */; };
+		C30000010000000000000001 /* ProxyModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000001 /* ProxyModels.swift */; };
+		C30000010000000000000002 /* ProxySessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000002 /* ProxySessionStore.swift */; };
+		C30000010000000000000003 /* ProxyMetricsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000003 /* ProxyMetricsStore.swift */; };
+		C30000010000000000000004 /* ProxyHTTPServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000004 /* ProxyHTTPServer.swift */; };
+		C30000010000000000000005 /* AnthropicForwarder.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000005 /* AnthropicForwarder.swift */; };
+		C30000010000000000000006 /* LocalProxyController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000006 /* LocalProxyController.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -56,6 +62,12 @@
 		B20000010000000000000006 /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
 		B20000010000000000000007 /* ChromeCookieService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChromeCookieService.swift; sourceTree = "<group>"; };
 		B20000010000000000000008 /* CodexProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexProvider.swift; sourceTree = "<group>"; };
+		C20000010000000000000001 /* ProxyModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyModels.swift; sourceTree = "<group>"; };
+		C20000010000000000000002 /* ProxySessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxySessionStore.swift; sourceTree = "<group>"; };
+		C20000010000000000000003 /* ProxyMetricsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyMetricsStore.swift; sourceTree = "<group>"; };
+		C20000010000000000000004 /* ProxyHTTPServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyHTTPServer.swift; sourceTree = "<group>"; };
+		C20000010000000000000005 /* AnthropicForwarder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnthropicForwarder.swift; sourceTree = "<group>"; };
+		C20000010000000000000006 /* LocalProxyController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalProxyController.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -85,6 +97,7 @@
 				A40000010000000000000004 /* Models */,
 				A40000010000000000000005 /* Providers */,
 				A40000010000000000000006 /* Services */,
+				C40000010000000000000001 /* Proxy */,
 				A40000010000000000000007 /* Views */,
 				A40000010000000000000008 /* Rendering */,
 				A2000001000000000000000E /* Assets.xcassets */,
@@ -154,6 +167,19 @@
 				A20000010000000000000009 /* BarIconRenderer.swift */,
 			);
 			path = Rendering;
+			sourceTree = "<group>";
+		};
+		C40000010000000000000001 /* Proxy */ = {
+			isa = PBXGroup;
+			children = (
+				C20000010000000000000001 /* ProxyModels.swift */,
+				C20000010000000000000002 /* ProxySessionStore.swift */,
+				C20000010000000000000003 /* ProxyMetricsStore.swift */,
+				C20000010000000000000004 /* ProxyHTTPServer.swift */,
+				C20000010000000000000005 /* AnthropicForwarder.swift */,
+				C20000010000000000000006 /* LocalProxyController.swift */,
+			);
+			path = Proxy;
 			sourceTree = "<group>";
 		};
 		A40000010000000000000099 /* Products */ = {
@@ -253,6 +279,12 @@
 				B10000010000000000000005 /* ConfigService.swift in Sources */,
 				B10000010000000000000006 /* NotificationService.swift in Sources */,
 				B10000010000000000000007 /* ChromeCookieService.swift in Sources */,
+				C30000010000000000000001 /* ProxyModels.swift in Sources */,
+				C30000010000000000000002 /* ProxySessionStore.swift in Sources */,
+				C30000010000000000000003 /* ProxyMetricsStore.swift in Sources */,
+				C30000010000000000000004 /* ProxyHTTPServer.swift in Sources */,
+				C30000010000000000000005 /* AnthropicForwarder.swift in Sources */,
+				C30000010000000000000006 /* LocalProxyController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

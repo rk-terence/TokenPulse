@@ -6,7 +6,8 @@ final class ConfigService {
     static let shared = ConfigService()
 
     /// Current on-disk schema version. Bump when adding fields that need migration.
-    private static let currentConfigVersion = 1
+    private static let currentConfigVersion = 2
+    private static let defaultProxyUpstreamURL = "https://zenmux.ai/api/anthropic"
 
     /// Factory defaults for provider enablement.
     static let factoryEnabledProviders: [String: Bool] = ["claude": false, "codex": false, "zenmux": true]
@@ -23,6 +24,18 @@ final class ConfigService {
         didSet { save() }
     }
 
+    var proxyEnabled: Bool {
+        didSet { save() }
+    }
+
+    var proxyUpstreamURL: String {
+        didSet { save() }
+    }
+
+    var proxyPort: Int {
+        didSet { save() }
+    }
+
     func isProviderEnabled(_ id: String) -> Bool {
         enabledProviders[id] ?? false
     }
@@ -36,6 +49,9 @@ final class ConfigService {
         self.launchAtLogin = loaded.config.launchAtLogin
         self.pollInterval = loaded.config.pollInterval
         self.enabledProviders = loaded.config.enabledProviders
+        self.proxyEnabled = loaded.config.proxyEnabled
+        self.proxyUpstreamURL = loaded.config.proxyUpstreamURL
+        self.proxyPort = loaded.config.proxyPort
 
         // Persist migrated config if the on-disk version was outdated.
         if loaded.migrated {
@@ -57,6 +73,9 @@ final class ConfigService {
         var launchAtLogin: Bool = false
         var pollInterval: TimeInterval = ProviderConfig.defaultPollInterval
         var enabledProviders: [String: Bool]?
+        var proxyEnabled: Bool?
+        var proxyUpstreamURL: String?
+        var proxyPort: Int?
     }
 
     private struct LoadResult {
@@ -68,6 +87,9 @@ final class ConfigService {
         var launchAtLogin: Bool
         var pollInterval: TimeInterval
         var enabledProviders: [String: Bool]
+        var proxyEnabled: Bool
+        var proxyUpstreamURL: String
+        var proxyPort: Int
     }
 
     private static func load() -> LoadResult {
@@ -78,7 +100,10 @@ final class ConfigService {
                 config: ResolvedConfig(
                     launchAtLogin: false,
                     pollInterval: ProviderConfig.defaultPollInterval,
-                    enabledProviders: factoryEnabledProviders
+                    enabledProviders: factoryEnabledProviders,
+                    proxyEnabled: false,
+                    proxyUpstreamURL: defaultProxyUpstreamURL,
+                    proxyPort: 8080
                 ),
                 migrated: true
             )
@@ -91,7 +116,10 @@ final class ConfigService {
             config: ResolvedConfig(
                 launchAtLogin: file.launchAtLogin,
                 pollInterval: file.pollInterval,
-                enabledProviders: resolvedProviders
+                enabledProviders: resolvedProviders,
+                proxyEnabled: file.proxyEnabled ?? false,
+                proxyUpstreamURL: file.proxyUpstreamURL ?? defaultProxyUpstreamURL,
+                proxyPort: file.proxyPort ?? 8080
             ),
             migrated: needsMigration
         )
@@ -102,7 +130,10 @@ final class ConfigService {
             configVersion: Self.currentConfigVersion,
             launchAtLogin: launchAtLogin,
             pollInterval: pollInterval,
-            enabledProviders: enabledProviders
+            enabledProviders: enabledProviders,
+            proxyEnabled: proxyEnabled,
+            proxyUpstreamURL: proxyUpstreamURL,
+            proxyPort: proxyPort
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

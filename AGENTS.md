@@ -14,6 +14,10 @@ xcodebuild -scheme TokenPulse -configuration Debug build
 xcodebuild -scheme TokenPulse -configuration Debug test
 ```
 
+## Git commits
+
+Use conventional commit format: `type: short description` (e.g. `feat: add proxy subsystem`, `fix: correct upstream URL default`). Common types: `feat`, `fix`, `chore`, `refactor`, `docs`, `test`.
+
 ## Code style
 
 - Swift strict concurrency checking enabled — resolve all warnings, not just errors
