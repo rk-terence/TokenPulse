@@ -506,10 +506,16 @@ private struct ProxyStatusRow: View {
                 ProxyMetricLabel(label: String(localized: "fwd"), value: "\(proxy.proxyStatus.totalRequestsForwarded)")
             }
 
-            // Cache metrics
+            // Cache metrics + savings
             HStack(spacing: 12) {
                 ProxyMetricLabel(label: String(localized: "cache rd"), value: "\(proxy.proxyStatus.cacheReads)")
                 ProxyMetricLabel(label: String(localized: "cache wr"), value: "\(proxy.proxyStatus.cacheWrites)")
+                if proxy.proxyStatus.estimatedSavings > 0 {
+                    ProxyMetricLabel(
+                        label: String(localized: "saved"),
+                        value: String(format: "~%.1fx", proxy.proxyStatus.estimatedSavings)
+                    )
+                }
             }
         }
     }

@@ -11,11 +11,13 @@ final class AnthropicForwarder: Sendable {
     private let session: URLSession
     private let eventLogger: ProxyEventLogger?
     private let proxyPort: Int
+    private let payloadCapture: ProxyPayloadCapture?
 
-    init(upstreamBaseURL: String, eventLogger: ProxyEventLogger? = nil, proxyPort: Int = 0) {
+    init(upstreamBaseURL: String, eventLogger: ProxyEventLogger? = nil, proxyPort: Int = 0, payloadCapture: ProxyPayloadCapture? = nil) {
         self.upstreamBaseURL = upstreamBaseURL
         self.eventLogger = eventLogger
         self.proxyPort = proxyPort
+        self.payloadCapture = payloadCapture
 
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 300  // Long timeout for streaming
@@ -38,6 +40,13 @@ final class AnthropicForwarder: Sendable {
         // Store request body and model for keepalive use.
         let model = extractModel(from: request.body)
         await sessionStore.storeRequestBody(request.body, model: model, for: sessionID)
+
+        // Fire-and-forget payload capture (only when enabled).
+        if let capture = payloadCapture {
+            let body = request.body
+            let sid = sessionID
+            Task { await capture.capture(requestBody: body, sessionID: sid) }
+        }
 
         await eventLogger?.logRequestStarted(session: sessionID, model: model)
 

@@ -45,6 +45,22 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
+    /// Notify the user that keepalive has been disabled for a proxy session.
+    func sendProxyKeepaliveDisabled(sessionID: String) {
+        send(
+            id: "proxy-keepalive-disabled-\(sessionID)",
+            title: String(localized: "Proxy keepalive disabled"),
+            body: String(
+                format: NSLocalizedString(
+                    "notification.proxy.keepaliveDisabled.body",
+                    value: "Keepalive stopped for session %@ after repeated failures.",
+                    comment: ""
+                ),
+                sessionID
+            )
+        )
+    }
+
     // MARK: - Threshold checks
 
     private func checkThresholds(provider: String, previous: ProviderSnapshot, current: ProviderSnapshot, data: UsageData) {

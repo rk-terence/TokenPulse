@@ -10,6 +10,7 @@ actor ProxyMetricsStore {
         let totalKeepalivesFailed: Int
         let totalCacheReads: Int
         let totalCacheWrites: Int
+        let estimatedSavingsMultiple: Double
     }
 
     private(set) var totalRequestsForwarded: Int = 0
@@ -43,14 +44,18 @@ actor ProxyMetricsStore {
         totalCacheWrites += 1
     }
 
+    /// Note: `totalCacheReads` is only incremented from keepalive results (not real
+    /// requests), so it serves as a proxy for "avoided cache writes" in the savings formula.
     func snapshot() -> Snapshot {
-        Snapshot(
+        let savings = max(0, Double(totalCacheReads) * 1.15 - Double(totalKeepalivesSent) * 0.10)
+        return Snapshot(
             totalRequestsForwarded: totalRequestsForwarded,
             totalRequestsFailed: totalRequestsFailed,
             totalKeepalivesSent: totalKeepalivesSent,
             totalKeepalivesFailed: totalKeepalivesFailed,
             totalCacheReads: totalCacheReads,
-            totalCacheWrites: totalCacheWrites
+            totalCacheWrites: totalCacheWrites,
+            estimatedSavingsMultiple: savings
         )
     }
 }

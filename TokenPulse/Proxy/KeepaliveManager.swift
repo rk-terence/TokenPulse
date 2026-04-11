@@ -23,8 +23,8 @@ actor KeepaliveManager {
     /// Generation counter per session to avoid stale task cleanup.
     private var sessionGenerations: [String: UInt64] = [:]
 
-    /// Maximum consecutive failures before stopping a session's keepalive.
-    private static let maxConsecutiveFailures = 3
+    /// Maximum cumulative failures before stopping a session's keepalive.
+    private static let maxCumulativeFailures = 5
 
     init(
         intervalSeconds: Int,
@@ -51,7 +51,15 @@ actor KeepaliveManager {
 
     /// Start or reset the keepalive loop for a session.
     /// If a loop is already running, cancel it and start a new one.
-    func startOrReset(sessionID: String, headers: [(name: String, value: String)]) {
+    /// Skips sessions whose keepalive has been disabled due to cumulative failures.
+    func startOrReset(sessionID: String, headers: [(name: String, value: String)]) async {
+        // Don't restart keepalive for sessions that have been disabled due to failures.
+        let disabled = await sessionStore.isKeepaliveDisabled(for: sessionID)
+        if disabled {
+            ProxyLogger.log("Keepalive: session \(sessionID) is disabled, skipping startOrReset")
+            return
+        }
+
         // Store the latest headers for this session.
         sessionHeaders[sessionID] = headers
 
@@ -163,9 +171,15 @@ actor KeepaliveManager {
                     shouldExit = true
                 }
 
-                // 4. Check consecutive failures (before any network call).
-                if !shouldExit && sessionData.keepaliveFailureCount >= maxConsecutiveFailures {
-                    ProxyLogger.log("Keepalive: session \(sessionID) exceeded \(maxConsecutiveFailures) consecutive failures, stopping")
+                // 4. Check cumulative failures (before any network call).
+                if !shouldExit && sessionData.keepaliveFailureCount >= maxCumulativeFailures {
+                    ProxyLogger.log("Keepalive: session \(sessionID) exceeded \(maxCumulativeFailures) cumulative failures, stopping")
+                    let shortSessionID = String(sessionID.prefix(8))
+                    await eventLogger?.logKeepaliveDisabled(session: sessionID, reason: "cumulative_failures", failureCount: sessionData.keepaliveFailureCount)
+                    await sessionStore.disableKeepalive(for: sessionID)
+                    await MainActor.run {
+                        NotificationService.shared.sendProxyKeepaliveDisabled(sessionID: shortSessionID)
+                    }
                     shouldExit = true
                 }
             }
@@ -245,19 +259,22 @@ actor KeepaliveManager {
                             await recordFailure(
                                 sessionID: sessionID,
                                 sessionStore: sessionStore,
-                                metricsStore: metricsStore,
-                                countAsConsecutive: true
+                                metricsStore: metricsStore
                             )
                             shouldExit = true
 
-                        // Handle rate limiting and server errors -- skip, don't count as consecutive failure.
+                        // Handle rate limiting and server errors -- count toward cumulative failures.
                         } else if statusCode == 429 || statusCode >= 500 {
-                            ProxyLogger.log("Keepalive: status \(statusCode) for session \(sessionID), skipping attempt")
+                            ProxyLogger.log("Keepalive: status \(statusCode) for session \(sessionID), counting failure")
                             await eventLogger?.logKeepaliveResult(
                                 session: sessionID, success: false,
                                 cacheReadTokens: nil, cacheCreationTokens: nil, statusCode: statusCode
                             )
-                            await metricsStore.recordKeepaliveFailed()
+                            await recordFailure(
+                                sessionID: sessionID,
+                                sessionStore: sessionStore,
+                                metricsStore: metricsStore
+                            )
 
                         // Handle other non-success status codes.
                         } else if statusCode < 200 || statusCode >= 300 {
@@ -269,8 +286,7 @@ actor KeepaliveManager {
                             await recordFailure(
                                 sessionID: sessionID,
                                 sessionStore: sessionStore,
-                                metricsStore: metricsStore,
-                                countAsConsecutive: true
+                                metricsStore: metricsStore
                             )
 
                         } else {
@@ -311,8 +327,7 @@ actor KeepaliveManager {
                         await recordFailure(
                             sessionID: sessionID,
                             sessionStore: sessionStore,
-                            metricsStore: metricsStore,
-                            countAsConsecutive: true
+                            metricsStore: metricsStore
                         )
                     }
 
@@ -327,8 +342,7 @@ actor KeepaliveManager {
                     await recordFailure(
                         sessionID: sessionID,
                         sessionStore: sessionStore,
-                        metricsStore: metricsStore,
-                        countAsConsecutive: true
+                        metricsStore: metricsStore
                     )
                 }
             }
@@ -361,18 +375,15 @@ actor KeepaliveManager {
     private static func recordFailure(
         sessionID: String,
         sessionStore: ProxySessionStore,
-        metricsStore: ProxyMetricsStore,
-        countAsConsecutive: Bool
+        metricsStore: ProxyMetricsStore
     ) async {
         await metricsStore.recordKeepaliveFailed()
-        if countAsConsecutive {
-            await sessionStore.recordKeepaliveResult(
-                for: sessionID,
-                success: false,
-                cacheReadTokens: nil,
-                cacheCreationTokens: nil
-            )
-        }
+        await sessionStore.recordKeepaliveResult(
+            for: sessionID,
+            success: false,
+            cacheReadTokens: nil,
+            cacheCreationTokens: nil
+        )
     }
 
     /// Parse `cache_read_input_tokens` and `cache_creation_input_tokens` from

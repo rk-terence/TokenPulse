@@ -314,7 +314,7 @@ private struct ProxyTab: View {
                                 .multilineTextAlignment(.trailing)
                         }
 
-                        Text(String(localized: "Sends periodic cache-warming requests to keep the prompt cache alive during long generations."))
+                        Text(String(localized: "Sends periodic cache-warming requests to keep the prompt cache alive during long generations. Each keepalive costs 0.10x base input; avoiding a cache write saves 1.15x."))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -322,6 +322,13 @@ private struct ProxyTab: View {
                     Divider()
 
                     Toggle(String(localized: "Save event log"), isOn: $config.saveProxyEventLog)
+
+                    Toggle(String(localized: "Save request payloads"), isOn: $config.saveProxyPayloads)
+                    if config.saveProxyPayloads {
+                        Text(String(localized: "Saves compressed copies of proxied request bodies to ~/.tokenpulse/proxy_payloads/. These contain your prompts and conversation content. Restart the proxy to apply."))
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
                 }
             }
 
@@ -350,6 +357,12 @@ private struct ProxyTab: View {
                     LabeledContent(String(localized: "Cache writes")) {
                         Text("\(controller.proxyStatus.cacheWrites)")
                             .monospacedDigit()
+                    }
+                    if controller.proxyStatus.estimatedSavings > 0 {
+                        LabeledContent(String(localized: "Est. savings")) {
+                            Text(String(format: NSLocalizedString("proxy.savings.format", value: "~%.1fx base input", comment: "Estimated savings in base-input-price multiples"), controller.proxyStatus.estimatedSavings))
+                                .monospacedDigit()
+                        }
                     }
                 }
             }

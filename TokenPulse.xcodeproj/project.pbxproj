@@ -36,6 +36,7 @@
 		C30000010000000000000006 /* LocalProxyController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000006 /* LocalProxyController.swift */; };
 		C30000010000000000000007 /* KeepaliveManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000007 /* KeepaliveManager.swift */; };
 		C30000010000000000000008 /* ProxyEventLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000008 /* ProxyEventLogger.swift */; };
+		C30000010000000000000009 /* ProxyPayloadCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000009 /* ProxyPayloadCapture.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -72,6 +73,7 @@
 		C20000010000000000000006 /* LocalProxyController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalProxyController.swift; sourceTree = "<group>"; };
 		C20000010000000000000007 /* KeepaliveManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeepaliveManager.swift; sourceTree = "<group>"; };
 		C20000010000000000000008 /* ProxyEventLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyEventLogger.swift; sourceTree = "<group>"; };
+		C20000010000000000000009 /* ProxyPayloadCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyPayloadCapture.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -184,6 +186,7 @@
 				C20000010000000000000006 /* LocalProxyController.swift */,
 				C20000010000000000000007 /* KeepaliveManager.swift */,
 				C20000010000000000000008 /* ProxyEventLogger.swift */,
+				C20000010000000000000009 /* ProxyPayloadCapture.swift */,
 			);
 			path = Proxy;
 			sourceTree = "<group>";
@@ -293,6 +296,7 @@
 				C30000010000000000000006 /* LocalProxyController.swift in Sources */,
 				C30000010000000000000007 /* KeepaliveManager.swift in Sources */,
 				C30000010000000000000008 /* ProxyEventLogger.swift in Sources */,
+				C30000010000000000000009 /* ProxyPayloadCapture.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

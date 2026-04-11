@@ -15,6 +15,7 @@ actor ProxySessionStore {
         var keepaliveFailureCount: Int
         var lastCacheReadTokens: Int?
         var lastCacheCreationTokens: Int?
+        var isKeepaliveDisabled: Bool
     }
 
     private var sessions: [String: Session] = [:]
@@ -38,7 +39,8 @@ actor ProxySessionStore {
                 keepaliveSuccessCount: 0,
                 keepaliveFailureCount: 0,
                 lastCacheReadTokens: nil,
-                lastCacheCreationTokens: nil
+                lastCacheCreationTokens: nil,
+                isKeepaliveDisabled: false
             )
             sessions[sessionID] = session
             return session
@@ -77,6 +79,19 @@ actor ProxySessionStore {
         sessions[sessionID]
     }
 
+    /// Mark a session's keepalive as permanently disabled (e.g. after cumulative failures).
+    func disableKeepalive(for sessionID: String) {
+        if var session = sessions[sessionID] {
+            session.isKeepaliveDisabled = true
+            sessions[sessionID] = session
+        }
+    }
+
+    /// Whether keepalive has been disabled for a session.
+    func isKeepaliveDisabled(for sessionID: String) -> Bool {
+        sessions[sessionID]?.isKeepaliveDisabled ?? false
+    }
+
     // MARK: - Phase 2 keepalive support
 
     /// Store the most recent request body and model for a session.
@@ -104,7 +119,6 @@ actor ProxySessionStore {
             session.lastKeepaliveAt = Date()
             if success {
                 session.keepaliveSuccessCount += 1
-                session.keepaliveFailureCount = 0
             } else {
                 session.keepaliveFailureCount += 1
             }

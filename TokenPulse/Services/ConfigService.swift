@@ -6,7 +6,7 @@ final class ConfigService {
     static let shared = ConfigService()
 
     /// Current on-disk schema version. Bump when adding fields that need migration.
-    private static let currentConfigVersion = 3
+    private static let currentConfigVersion = 4
     private static let defaultProxyUpstreamURL = "https://zenmux.ai/api/anthropic"
 
     /// Factory defaults for provider enablement.
@@ -52,6 +52,10 @@ final class ConfigService {
         didSet { save() }
     }
 
+    var saveProxyPayloads: Bool {
+        didSet { save() }
+    }
+
     func isProviderEnabled(_ id: String) -> Bool {
         enabledProviders[id] ?? false
     }
@@ -72,6 +76,7 @@ final class ConfigService {
         self.keepaliveIntervalSeconds = loaded.config.keepaliveIntervalSeconds
         self.proxyInactivityTimeoutSeconds = loaded.config.proxyInactivityTimeoutSeconds
         self.saveProxyEventLog = loaded.config.saveProxyEventLog
+        self.saveProxyPayloads = loaded.config.saveProxyPayloads
 
         // Persist migrated config if the on-disk version was outdated.
         if loaded.migrated {
@@ -100,6 +105,7 @@ final class ConfigService {
         var keepaliveIntervalSeconds: Int?
         var proxyInactivityTimeoutSeconds: Int?
         var saveProxyEventLog: Bool?
+        var saveProxyPayloads: Bool?
     }
 
     private struct LoadResult {
@@ -118,6 +124,7 @@ final class ConfigService {
         var keepaliveIntervalSeconds: Int
         var proxyInactivityTimeoutSeconds: Int
         var saveProxyEventLog: Bool
+        var saveProxyPayloads: Bool
     }
 
     private static func load() -> LoadResult {
@@ -135,7 +142,8 @@ final class ConfigService {
                     keepaliveEnabled: false,
                     keepaliveIntervalSeconds: 240,
                     proxyInactivityTimeoutSeconds: 900,
-                    saveProxyEventLog: true
+                    saveProxyEventLog: true,
+                    saveProxyPayloads: false
                 ),
                 migrated: true
             )
@@ -155,7 +163,8 @@ final class ConfigService {
                 keepaliveEnabled: file.keepaliveEnabled ?? false,
                 keepaliveIntervalSeconds: file.keepaliveIntervalSeconds ?? 240,
                 proxyInactivityTimeoutSeconds: file.proxyInactivityTimeoutSeconds ?? 900,
-                saveProxyEventLog: file.saveProxyEventLog ?? true
+                saveProxyEventLog: file.saveProxyEventLog ?? true,
+                saveProxyPayloads: file.saveProxyPayloads ?? false
             ),
             migrated: needsMigration
         )
@@ -173,7 +182,8 @@ final class ConfigService {
             keepaliveEnabled: keepaliveEnabled,
             keepaliveIntervalSeconds: keepaliveIntervalSeconds,
             proxyInactivityTimeoutSeconds: proxyInactivityTimeoutSeconds,
-            saveProxyEventLog: saveProxyEventLog
+            saveProxyEventLog: saveProxyEventLog,
+            saveProxyPayloads: saveProxyPayloads
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

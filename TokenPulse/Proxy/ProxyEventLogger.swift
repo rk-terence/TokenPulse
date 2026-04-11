@@ -102,6 +102,15 @@ actor ProxyEventLogger {
         ])
     }
 
+    func logKeepaliveDisabled(session: String, reason: String, failureCount: Int) {
+        appendEvent([
+            "type": "keepalive_disabled",
+            "session": session,
+            "reason": reason,
+            "failureCount": failureCount,
+        ])
+    }
+
     // MARK: - Status snapshot
 
     func writeStatusSnapshot(

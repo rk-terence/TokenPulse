@@ -16,11 +16,13 @@ final class LocalProxyController {
         let totalKeepalivesFailed: Int
         let cacheReads: Int
         let cacheWrites: Int
+        let estimatedSavings: Double
 
         static let empty = ProxyStatus(
             activeSessions: 0, activeKeepalives: 0,
             totalRequestsForwarded: 0, totalKeepalivesSent: 0,
-            totalKeepalivesFailed: 0, cacheReads: 0, cacheWrites: 0
+            totalKeepalivesFailed: 0, cacheReads: 0, cacheWrites: 0,
+            estimatedSavings: 0
         )
     }
 
@@ -34,6 +36,7 @@ final class LocalProxyController {
     private var forwarder: AnthropicForwarder?
     private var keepaliveManager: KeepaliveManager?
     private var eventLogger: ProxyEventLogger?
+    private var payloadCapture: ProxyPayloadCapture?
     private var refreshTask: Task<Void, Never>?
 
     /// Start the proxy server on the given port, forwarding to the upstream URL.
@@ -46,7 +49,10 @@ final class LocalProxyController {
         let logger = ProxyEventLogger(enabled: config.saveProxyEventLog)
         self.eventLogger = logger
 
-        let fwd = AnthropicForwarder(upstreamBaseURL: upstreamURL, eventLogger: logger, proxyPort: port)
+        let capture: ProxyPayloadCapture? = config.saveProxyPayloads ? ProxyPayloadCapture() : nil
+        self.payloadCapture = capture
+
+        let fwd = AnthropicForwarder(upstreamBaseURL: upstreamURL, eventLogger: logger, proxyPort: port, payloadCapture: capture)
         self.forwarder = fwd
 
         var kaManager: KeepaliveManager?
@@ -106,7 +112,8 @@ final class LocalProxyController {
                             totalKeepalivesSent: snapshot.totalKeepalivesSent,
                             totalKeepalivesFailed: snapshot.totalKeepalivesFailed,
                             cacheReads: snapshot.totalCacheReads,
-                            cacheWrites: snapshot.totalCacheWrites
+                            cacheWrites: snapshot.totalCacheWrites,
+                            estimatedSavings: snapshot.estimatedSavingsMultiple
                         )
                     }
                 }
@@ -124,6 +131,7 @@ final class LocalProxyController {
         server?.stop()
         server = nil
         forwarder = nil
+        payloadCapture = nil
 
         if let km = keepaliveManager {
             let manager = km
