@@ -11,6 +11,10 @@ actor ProxyMetricsStore {
         let totalCacheReads: Int
         let totalCacheWrites: Int
         let estimatedSavingsMultiple: Double
+        let totalInputTokens: Int
+        let totalOutputTokens: Int
+        let totalCacheReadInputTokens: Int
+        let totalCacheCreationInputTokens: Int
     }
 
     private(set) var totalRequestsForwarded: Int = 0
@@ -19,6 +23,10 @@ actor ProxyMetricsStore {
     private(set) var totalKeepalivesFailed: Int = 0
     private(set) var totalCacheReads: Int = 0
     private(set) var totalCacheWrites: Int = 0
+    private(set) var totalInputTokens: Int = 0
+    private(set) var totalOutputTokens: Int = 0
+    private(set) var totalCacheReadInputTokens: Int = 0
+    private(set) var totalCacheCreationInputTokens: Int = 0
 
     func recordForwarded() {
         totalRequestsForwarded += 1
@@ -44,6 +52,13 @@ actor ProxyMetricsStore {
         totalCacheWrites += 1
     }
 
+    func recordTokenUsage(_ usage: TokenUsage) {
+        if let v = usage.inputTokens { totalInputTokens += v }
+        if let v = usage.outputTokens { totalOutputTokens += v }
+        if let v = usage.cacheReadInputTokens { totalCacheReadInputTokens += v }
+        if let v = usage.cacheCreationInputTokens { totalCacheCreationInputTokens += v }
+    }
+
     /// Note: `totalCacheReads` is only incremented from keepalive results (not real
     /// requests), so it serves as a proxy for "avoided cache writes" in the savings formula.
     func snapshot() -> Snapshot {
@@ -55,7 +70,11 @@ actor ProxyMetricsStore {
             totalKeepalivesFailed: totalKeepalivesFailed,
             totalCacheReads: totalCacheReads,
             totalCacheWrites: totalCacheWrites,
-            estimatedSavingsMultiple: savings
+            estimatedSavingsMultiple: savings,
+            totalInputTokens: totalInputTokens,
+            totalOutputTokens: totalOutputTokens,
+            totalCacheReadInputTokens: totalCacheReadInputTokens,
+            totalCacheCreationInputTokens: totalCacheCreationInputTokens
         )
     }
 }

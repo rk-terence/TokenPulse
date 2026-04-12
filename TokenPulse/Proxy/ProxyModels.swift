@@ -86,18 +86,171 @@ struct ProxyRequestActivity: Sendable, Identifiable {
     let startedAt: Date
 }
 
+// MARK: - Token usage
+
+/// Aggregated token counts extracted from an Anthropic API response.
+struct TokenUsage: Sendable {
+    let inputTokens: Int?
+    let outputTokens: Int?
+    let cacheReadInputTokens: Int?
+    let cacheCreationInputTokens: Int?
+
+    static let empty = TokenUsage(inputTokens: nil, outputTokens: nil,
+                                  cacheReadInputTokens: nil, cacheCreationInputTokens: nil)
+
+    /// Compute the estimated cost (USD) using the given pricing rates.
+    func cost(for pricing: ModelPricing) -> Double {
+        let input    = Double(inputTokens ?? 0)            * pricing.inputPerMTok
+        let output   = Double(outputTokens ?? 0)           * pricing.outputPerMTok
+        let cacheRd  = Double(cacheReadInputTokens ?? 0)   * pricing.cacheReadPerMTok
+        let cacheWr  = Double(cacheCreationInputTokens ?? 0) * pricing.cacheWritePerMTok
+        return (input + output + cacheRd + cacheWr) / 1_000_000
+    }
+}
+
+// MARK: - Model pricing
+
+/// Per-million-token rates for a single model tier (USD).
+struct ModelPricing: Sendable {
+    let inputPerMTok: Double
+    let outputPerMTok: Double
+    let cacheReadPerMTok: Double
+    let cacheWritePerMTok: Double
+}
+
+/// Lookup pricing for an Anthropic model ID string (e.g. "claude-opus-4-6-20260401").
+/// Matches the longest known prefix. Returns nil for unrecognized models.
+enum ModelPricingTable {
+
+    /// Resolve a model ID to its pricing tier.
+    static func pricing(for modelID: String?) -> ModelPricing? {
+        guard let modelID else { return nil }
+        let id = modelID.lowercased()
+        // Try longest prefixes first to avoid short-prefix false matches.
+        for (prefix, pricing) in sortedEntries {
+            if id.hasPrefix(prefix) { return pricing }
+        }
+        return nil
+    }
+
+    // Entries sorted by prefix length descending so longer prefixes win.
+    private static let sortedEntries: [(String, ModelPricing)] = entries
+        .sorted { $0.key.count > $1.key.count }
+        .map { ($0.key, $0.value) }
+
+    // swiftlint:disable line_length
+    private static let entries: [String: ModelPricing] = [
+        // Opus 4.6 / 4.5 — $5 / $25
+        "claude-opus-4-6":   ModelPricing(inputPerMTok: 5,  outputPerMTok: 25, cacheReadPerMTok: 0.50, cacheWritePerMTok: 6.25),
+        "claude-opus-4-5":   ModelPricing(inputPerMTok: 5,  outputPerMTok: 25, cacheReadPerMTok: 0.50, cacheWritePerMTok: 6.25),
+        // Opus 4.1 — $15 / $75
+        "claude-opus-4-1":   ModelPricing(inputPerMTok: 15, outputPerMTok: 75, cacheReadPerMTok: 1.50, cacheWritePerMTok: 18.75),
+        // Opus 4.0 — $15 / $75 (catch-all for "claude-opus-4-" without 5/6 suffix)
+        "claude-opus-4-":    ModelPricing(inputPerMTok: 15, outputPerMTok: 75, cacheReadPerMTok: 1.50, cacheWritePerMTok: 18.75),
+        // Opus 3 — $15 / $75
+        "claude-opus-3":     ModelPricing(inputPerMTok: 15, outputPerMTok: 75, cacheReadPerMTok: 1.50, cacheWritePerMTok: 18.75),
+        // Sonnet (all 4.x and 3.x) — $3 / $15
+        "claude-sonnet-4":   ModelPricing(inputPerMTok: 3,  outputPerMTok: 15, cacheReadPerMTok: 0.30, cacheWritePerMTok: 3.75),
+        "claude-sonnet-3":   ModelPricing(inputPerMTok: 3,  outputPerMTok: 15, cacheReadPerMTok: 0.30, cacheWritePerMTok: 3.75),
+        // Haiku 4.5 — $1 / $5
+        "claude-haiku-4-5":  ModelPricing(inputPerMTok: 1,  outputPerMTok: 5,  cacheReadPerMTok: 0.10, cacheWritePerMTok: 1.25),
+        // Haiku 3.5 — $0.80 / $4
+        "claude-haiku-3-5":  ModelPricing(inputPerMTok: 0.80, outputPerMTok: 4, cacheReadPerMTok: 0.08, cacheWritePerMTok: 1.0),
+        // Haiku 3 — $0.25 / $1.25
+        "claude-haiku-3":    ModelPricing(inputPerMTok: 0.25, outputPerMTok: 1.25, cacheReadPerMTok: 0.03, cacheWritePerMTok: 0.30),
+    ]
+    // swiftlint:enable line_length
+}
+
 // MARK: - Shared proxy utilities
 
 enum ProxyHTTPUtils {
 
-    /// Parse `cache_read_input_tokens` and `cache_creation_input_tokens` from
-    /// the upstream JSON response's `usage` object.
+    /// Parse all token usage fields from an upstream Anthropic API response.
+    ///
+    /// - Parameters:
+    ///   - data: The raw response body bytes.
+    ///   - streaming: Whether the response uses SSE (server-sent events) format.
+    /// - Returns: A ``TokenUsage`` with whichever fields were found.
+    static func parseTokenUsage(from data: Data, streaming: Bool) -> TokenUsage {
+        if streaming {
+            return parseTokenUsageFromSSE(data)
+        } else {
+            return parseTokenUsageFromJSON(data)
+        }
+    }
+
+    /// Legacy wrapper for callers that only need cache metrics (e.g. KeepaliveManager).
     static func parseCacheMetrics(from data: Data) -> (cacheReadTokens: Int?, cacheCreationTokens: Int?) {
+        let usage = parseTokenUsage(from: data, streaming: false)
+        return (usage.cacheReadInputTokens, usage.cacheCreationInputTokens)
+    }
+
+    // MARK: - Non-streaming JSON parsing
+
+    private static func parseTokenUsageFromJSON(_ data: Data) -> TokenUsage {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let usage = json["usage"] as? [String: Any] else {
-            return (nil, nil)
+            return .empty
         }
-        return (usage["cache_read_input_tokens"] as? Int, usage["cache_creation_input_tokens"] as? Int)
+        return TokenUsage(
+            inputTokens: usage["input_tokens"] as? Int,
+            outputTokens: usage["output_tokens"] as? Int,
+            cacheReadInputTokens: usage["cache_read_input_tokens"] as? Int,
+            cacheCreationInputTokens: usage["cache_creation_input_tokens"] as? Int
+        )
+    }
+
+    // MARK: - Streaming SSE parsing
+
+    /// Parse token usage from accumulated SSE chunks. Usage is split across events:
+    /// - `message_start`: `message.usage` contains input_tokens, cache_read/creation tokens
+    /// - `message_delta`: `usage` contains output_tokens
+    private static func parseTokenUsageFromSSE(_ data: Data) -> TokenUsage {
+        guard let text = String(data: data, encoding: .utf8) else { return .empty }
+
+        var inputTokens: Int?
+        var outputTokens: Int?
+        var cacheReadInputTokens: Int?
+        var cacheCreationInputTokens: Int?
+
+        text.enumerateLines { line, stop in
+            guard line.hasPrefix("data: ") else { return }
+            let payload = line.dropFirst(6) // "data: ".count
+            guard payload != "[DONE]",
+                  let lineData = payload.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                  let type = json["type"] as? String else {
+                return
+            }
+
+            switch type {
+            case "message_start":
+                // usage lives at message.usage
+                guard let message = json["message"] as? [String: Any],
+                      let usage = message["usage"] as? [String: Any] else { return }
+                inputTokens = usage["input_tokens"] as? Int
+                cacheReadInputTokens = usage["cache_read_input_tokens"] as? Int
+                cacheCreationInputTokens = usage["cache_creation_input_tokens"] as? Int
+
+            case "message_delta":
+                // output_tokens lives at usage.output_tokens
+                guard let usage = json["usage"] as? [String: Any] else { return }
+                outputTokens = usage["output_tokens"] as? Int
+                // Stop early — message_delta is the last event with usage data.
+                stop = true
+
+            default:
+                break
+            }
+        }
+
+        return TokenUsage(
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            cacheReadInputTokens: cacheReadInputTokens,
+            cacheCreationInputTokens: cacheCreationInputTokens
+        )
     }
 
     /// Extract all headers from an HTTPURLResponse as name/value tuples.

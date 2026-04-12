@@ -594,6 +594,22 @@ private struct SessionActivityRow: View {
                         .foregroundStyle(.red)
                 }
             }
+            if activity.estimatedCostUSD > 0 {
+                ProxyMetricLabel(
+                    label: "$",
+                    value: formatCost(activity.estimatedCostUSD)
+                )
+            }
+        }
+    }
+
+    private func formatCost(_ cost: Double) -> String {
+        if cost < 0.01 {
+            return String(format: "%.4f", cost)
+        } else if cost < 1 {
+            return String(format: "%.3f", cost)
+        } else {
+            return String(format: "%.2f", cost)
         }
     }
 }

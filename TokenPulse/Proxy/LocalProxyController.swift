@@ -16,6 +16,11 @@ final class LocalProxyController {
         let erroredRequests: Int
         let keepaliveRequests: Int
         let activeRequests: [ProxyRequestActivity]
+        let totalInputTokens: Int
+        let totalOutputTokens: Int
+        let totalCacheReadInputTokens: Int
+        let totalCacheCreationInputTokens: Int
+        let estimatedCostUSD: Double
 
         var id: String { sessionID }
         /// First 8 characters of the session ID — enough to distinguish sessions in the UI.
@@ -33,12 +38,18 @@ final class LocalProxyController {
         let cacheReads: Int
         let cacheWrites: Int
         let estimatedSavings: Double
+        let totalInputTokens: Int
+        let totalOutputTokens: Int
+        let totalCacheReadInputTokens: Int
+        let totalCacheCreationInputTokens: Int
 
         static let empty = ProxyStatus(
             activeSessions: 0, activeKeepalives: 0,
             totalRequestsForwarded: 0, totalKeepalivesSent: 0,
             totalKeepalivesFailed: 0, cacheReads: 0, cacheWrites: 0,
-            estimatedSavings: 0
+            estimatedSavings: 0,
+            totalInputTokens: 0, totalOutputTokens: 0,
+            totalCacheReadInputTokens: 0, totalCacheCreationInputTokens: 0
         )
     }
 
@@ -288,7 +299,12 @@ final class LocalProxyController {
                         completedRequests: snap.completedRequestCount,
                         erroredRequests: snap.erroredRequestCount,
                         keepaliveRequests: snap.keepaliveTotalCount,
-                        activeRequests: snap.activeRequests.sorted { $0.startedAt < $1.startedAt }
+                        activeRequests: snap.activeRequests.sorted { $0.startedAt < $1.startedAt },
+                        totalInputTokens: snap.totalInputTokens,
+                        totalOutputTokens: snap.totalOutputTokens,
+                        totalCacheReadInputTokens: snap.totalCacheReadInputTokens,
+                        totalCacheCreationInputTokens: snap.totalCacheCreationInputTokens,
+                        estimatedCostUSD: snap.estimatedCostUSD
                     )
                 }
 
@@ -357,7 +373,12 @@ final class LocalProxyController {
                             erroredRequests: snap.erroredRequestCount,
                             keepaliveRequests: snap.keepaliveTotalCount,
                             activeRequests: snap.activeRequests
-                                .sorted { $0.startedAt < $1.startedAt }
+                                .sorted { $0.startedAt < $1.startedAt },
+                            totalInputTokens: snap.totalInputTokens,
+                            totalOutputTokens: snap.totalOutputTokens,
+                            totalCacheReadInputTokens: snap.totalCacheReadInputTokens,
+                            totalCacheCreationInputTokens: snap.totalCacheCreationInputTokens,
+                            estimatedCostUSD: snap.estimatedCostUSD
                         )
                     }
 
@@ -374,7 +395,11 @@ final class LocalProxyController {
                         totalKeepalivesFailed: snapshot.totalKeepalivesFailed,
                         cacheReads: snapshot.totalCacheReads,
                         cacheWrites: snapshot.totalCacheWrites,
-                        estimatedSavings: snapshot.estimatedSavingsMultiple
+                        estimatedSavings: snapshot.estimatedSavingsMultiple,
+                        totalInputTokens: snapshot.totalInputTokens,
+                        totalOutputTokens: snapshot.totalOutputTokens,
+                        totalCacheReadInputTokens: snapshot.totalCacheReadInputTokens,
+                        totalCacheCreationInputTokens: snapshot.totalCacheCreationInputTokens
                     )
                 }
             }

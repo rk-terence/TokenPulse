@@ -20,6 +20,12 @@ actor ProxySessionStore {
         // Per-session request counters (completed/errored real requests):
         var completedRequestCount: Int
         var erroredRequestCount: Int
+        // Cumulative token usage and estimated cost:
+        var totalInputTokens: Int
+        var totalOutputTokens: Int
+        var totalCacheReadInputTokens: Int
+        var totalCacheCreationInputTokens: Int
+        var estimatedCostUSD: Double
     }
 
     /// A snapshot of a session's stats and its currently active requests, for UI display.
@@ -31,6 +37,11 @@ actor ProxySessionStore {
         let erroredRequestCount: Int
         let keepaliveTotalCount: Int
         let activeRequests: [ProxyRequestActivity]
+        let totalInputTokens: Int
+        let totalOutputTokens: Int
+        let totalCacheReadInputTokens: Int
+        let totalCacheCreationInputTokens: Int
+        let estimatedCostUSD: Double
     }
 
     private var sessions: [String: Session] = [:]
@@ -73,7 +84,12 @@ actor ProxySessionStore {
                 lastCacheCreationTokens: nil,
                 isKeepaliveDisabled: false,
                 completedRequestCount: 0,
-                erroredRequestCount: 0
+                erroredRequestCount: 0,
+                totalInputTokens: 0,
+                totalOutputTokens: 0,
+                totalCacheReadInputTokens: 0,
+                totalCacheCreationInputTokens: 0,
+                estimatedCostUSD: 0
             )
             sessions[sessionID] = session
             return session
@@ -178,6 +194,21 @@ actor ProxySessionStore {
         }
     }
 
+    // MARK: - Token usage accumulation
+
+    /// Record token usage and estimated cost for a completed request in this session.
+    func recordTokenUsage(_ usage: TokenUsage, model: String?, for sessionID: String) {
+        guard var session = sessions[sessionID] else { return }
+        session.totalInputTokens += usage.inputTokens ?? 0
+        session.totalOutputTokens += usage.outputTokens ?? 0
+        session.totalCacheReadInputTokens += usage.cacheReadInputTokens ?? 0
+        session.totalCacheCreationInputTokens += usage.cacheCreationInputTokens ?? 0
+        if let pricing = ModelPricingTable.pricing(for: model) {
+            session.estimatedCostUSD += usage.cost(for: pricing)
+        }
+        sessions[sessionID] = session
+    }
+
     // MARK: - Request activity tracking
 
     /// Register a new in-flight request. Call immediately before starting the upstream fetch.
@@ -261,7 +292,12 @@ actor ProxySessionStore {
                 completedRequestCount: session.completedRequestCount,
                 erroredRequestCount: session.erroredRequestCount,
                 keepaliveTotalCount: session.keepaliveSuccessCount + session.keepaliveFailureCount,
-                activeRequests: requestsBySession[session.sessionID] ?? []
+                activeRequests: requestsBySession[session.sessionID] ?? [],
+                totalInputTokens: session.totalInputTokens,
+                totalOutputTokens: session.totalOutputTokens,
+                totalCacheReadInputTokens: session.totalCacheReadInputTokens,
+                totalCacheCreationInputTokens: session.totalCacheCreationInputTokens,
+                estimatedCostUSD: session.estimatedCostUSD
             )
         }.sorted {
             max($0.lastSeenAt, $0.lastKeepaliveAt ?? .distantPast)

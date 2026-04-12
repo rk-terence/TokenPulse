@@ -122,8 +122,7 @@ actor ProxyEventLogger {
         response: LoggedResponse,
         durationMs: Int,
         statusCode: Int,
-        cacheReadTokens: Int?,
-        cacheCreationTokens: Int?
+        tokenUsage: TokenUsage
     ) {
         var entry: [String: Any] = [
             "type": "request_completed",
@@ -136,8 +135,10 @@ actor ProxyEventLogger {
         entry["upstreamRequestID"] = extractUpstreamRequestID(from: response.headers)
         entry["request"] = serializeMetadata(request: request)
         entry["response"] = serializeMetadata(response: response)
-        if let cacheReadTokens { entry["cacheReadTokens"] = cacheReadTokens }
-        if let cacheCreationTokens { entry["cacheCreationTokens"] = cacheCreationTokens }
+        if let v = tokenUsage.inputTokens { entry["inputTokens"] = v }
+        if let v = tokenUsage.outputTokens { entry["outputTokens"] = v }
+        if let v = tokenUsage.cacheReadInputTokens { entry["cacheReadTokens"] = v }
+        if let v = tokenUsage.cacheCreationInputTokens { entry["cacheCreationTokens"] = v }
         appendEvent(
             entry,
             content: serializeContent(request: request, response: response)
@@ -190,8 +191,7 @@ actor ProxyEventLogger {
         response: LoggedResponse?,
         durationMs: Int,
         error: String?,
-        cacheReadTokens: Int?,
-        cacheCreationTokens: Int?,
+        tokenUsage: TokenUsage,
         statusCode: Int?
     ) {
         var entry: [String: Any] = [
@@ -206,8 +206,10 @@ actor ProxyEventLogger {
             entry["upstreamRequestID"] = extractUpstreamRequestID(from: response.headers)
         }
         if let error { entry["error"] = error }
-        if let cacheReadTokens { entry["cacheReadTokens"] = cacheReadTokens }
-        if let cacheCreationTokens { entry["cacheCreationTokens"] = cacheCreationTokens }
+        if let v = tokenUsage.inputTokens { entry["inputTokens"] = v }
+        if let v = tokenUsage.outputTokens { entry["outputTokens"] = v }
+        if let v = tokenUsage.cacheReadInputTokens { entry["cacheReadTokens"] = v }
+        if let v = tokenUsage.cacheCreationInputTokens { entry["cacheCreationTokens"] = v }
         if let statusCode { entry["statusCode"] = statusCode }
         appendEvent(
             entry,
@@ -302,8 +304,8 @@ actor ProxyEventLogger {
                 INSERT INTO proxy_events (
                     ts, type, session, model, success, status_code, duration_ms, streaming,
                     method, path, upstream_url, upstream_request_id, cache_read_tokens, cache_creation_tokens,
-                    error, reason, failure_count, port, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    error, reason, failure_count, port, payload_json, input_tokens, output_tokens
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """
 
             var statement: OpaquePointer?
@@ -333,6 +335,8 @@ actor ProxyEventLogger {
             bind(entry["failureCount"] as? Int, to: 17, in: statement)
             bind(entry["port"] as? Int, to: 18, in: statement)
             bind(payloadJSON, to: 19, in: statement)
+            bind(entry["inputTokens"] as? Int, to: 20, in: statement)
+            bind(entry["outputTokens"] as? Int, to: 21, in: statement)
 
             guard sqlite3_step(statement) == SQLITE_DONE else {
                 throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
@@ -394,6 +398,18 @@ actor ProxyEventLogger {
             try addColumnIfMissing(
                 "upstream_request_id TEXT",
                 named: "upstream_request_id",
+                to: "proxy_events",
+                in: database
+            )
+            try addColumnIfMissing(
+                "input_tokens INTEGER",
+                named: "input_tokens",
+                to: "proxy_events",
+                in: database
+            )
+            try addColumnIfMissing(
+                "output_tokens INTEGER",
+                named: "output_tokens",
                 to: "proxy_events",
                 in: database
             )
@@ -606,6 +622,10 @@ actor ProxyEventLogger {
             "totalKeepalivesFailed": snapshot.metrics.totalKeepalivesFailed,
             "cacheReads": snapshot.metrics.totalCacheReads,
             "cacheWrites": snapshot.metrics.totalCacheWrites,
+            "totalInputTokens": snapshot.metrics.totalInputTokens,
+            "totalOutputTokens": snapshot.metrics.totalOutputTokens,
+            "totalCacheReadInputTokens": snapshot.metrics.totalCacheReadInputTokens,
+            "totalCacheCreationInputTokens": snapshot.metrics.totalCacheCreationInputTokens,
             "lastUpdatedAt": isoFormatter.string(from: writeDate),
         ]
 

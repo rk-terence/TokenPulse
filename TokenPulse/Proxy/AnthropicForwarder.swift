@@ -260,7 +260,9 @@ final class AnthropicForwarder: Sendable {
                 bodyBytes: capturedResponseBytes,
                 bodyTruncated: capturedResponseBytes > capturedResponseBody.count
             )
-            let (cacheRead, cacheCreation) = ProxyHTTPUtils.parseCacheMetrics(from: capturedResponseBody)
+            let tokenUsage = ProxyHTTPUtils.parseTokenUsage(from: capturedResponseBody, streaming: true)
+            await metrics.recordTokenUsage(tokenUsage)
+            await sessionStore.recordTokenUsage(tokenUsage, model: model, for: sessionID)
             await eventLogger?.logRequestCompleted(
                 session: sessionID,
                 model: model,
@@ -268,8 +270,7 @@ final class AnthropicForwarder: Sendable {
                 response: responseLog,
                 durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
                 statusCode: upstreamStatusCode,
-                cacheReadTokens: cacheRead,
-                cacheCreationTokens: cacheCreation
+                tokenUsage: tokenUsage
             )
 
         } catch is CancellationError {
@@ -354,8 +355,9 @@ final class AnthropicForwarder: Sendable {
             await sessionStore.finishRequest(id: requestID, errored: false)
             await metrics.recordForwarded()
 
-            // For non-streaming, parse cache metrics from the response body.
-            let (cacheRead, cacheCreation) = ProxyHTTPUtils.parseCacheMetrics(from: data)
+            let tokenUsage = ProxyHTTPUtils.parseTokenUsage(from: data, streaming: false)
+            await metrics.recordTokenUsage(tokenUsage)
+            await sessionStore.recordTokenUsage(tokenUsage, model: model, for: sessionID)
             let responseLog = ProxyEventLogger.LoggedResponse(
                 statusCode: httpResponse.statusCode,
                 headers: ProxyHTTPUtils.allHeaders(from: httpResponse),
@@ -369,8 +371,7 @@ final class AnthropicForwarder: Sendable {
                 response: responseLog,
                 durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
                 statusCode: httpResponse.statusCode,
-                cacheReadTokens: cacheRead,
-                cacheCreationTokens: cacheCreation
+                tokenUsage: tokenUsage
             )
 
         } catch {

@@ -317,8 +317,7 @@ actor KeepaliveManager {
                                 response: responseLog,
                                 durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: keepaliveStartedAt),
                                 error: "auth failure",
-                                cacheReadTokens: nil,
-                                cacheCreationTokens: nil,
+                                tokenUsage: .empty,
                                 statusCode: statusCode
                             )
                             await recordFailure(
@@ -339,8 +338,7 @@ actor KeepaliveManager {
                                 response: responseLog,
                                 durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: keepaliveStartedAt),
                                 error: "upstream returned status \(statusCode)",
-                                cacheReadTokens: nil,
-                                cacheCreationTokens: nil,
+                                tokenUsage: .empty,
                                 statusCode: statusCode
                             )
                             await recordFailure(
@@ -359,8 +357,7 @@ actor KeepaliveManager {
                                 response: responseLog,
                                 durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: keepaliveStartedAt),
                                 error: "unexpected upstream status \(statusCode)",
-                                cacheReadTokens: nil,
-                                cacheCreationTokens: nil,
+                                tokenUsage: .empty,
                                 statusCode: statusCode
                             )
                             await recordFailure(
@@ -370,23 +367,26 @@ actor KeepaliveManager {
                             )
 
                         } else {
-                            // Parse cache metrics from the response.
-                            let (cacheReadTokens, cacheCreationTokens) = ProxyHTTPUtils.parseCacheMetrics(from: data)
+                            // Parse token usage from the response.
+                            let tokenUsage = ProxyHTTPUtils.parseTokenUsage(from: data, streaming: false)
 
                             // Record success.
                             await sessionStore.recordKeepaliveResult(
                                 for: sessionID,
                                 success: true,
-                                cacheReadTokens: cacheReadTokens,
-                                cacheCreationTokens: cacheCreationTokens
+                                cacheReadTokens: tokenUsage.cacheReadInputTokens,
+                                cacheCreationTokens: tokenUsage.cacheCreationInputTokens
                             )
 
-                            if cacheReadTokens != nil && (cacheReadTokens ?? 0) > 0 {
+                            if (tokenUsage.cacheReadInputTokens ?? 0) > 0 {
                                 await metricsStore.recordCacheRead()
                             }
-                            if cacheCreationTokens != nil && (cacheCreationTokens ?? 0) > 0 {
+                            if (tokenUsage.cacheCreationInputTokens ?? 0) > 0 {
                                 await metricsStore.recordCacheWrite()
                             }
+                            await metricsStore.recordTokenUsage(tokenUsage)
+                            let sessionModel = await sessionStore.session(for: sessionID)?.lastKnownModel
+                            await sessionStore.recordTokenUsage(tokenUsage, model: sessionModel, for: sessionID)
 
                             await eventLogger?.logKeepaliveResult(
                                 session: sessionID,
@@ -395,13 +395,12 @@ actor KeepaliveManager {
                                 response: responseLog,
                                 durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: keepaliveStartedAt),
                                 error: nil,
-                                cacheReadTokens: cacheReadTokens,
-                                cacheCreationTokens: cacheCreationTokens,
+                                tokenUsage: tokenUsage,
                                 statusCode: statusCode
                             )
 
                             ProxyLogger.log("Keepalive: success for session \(sessionID) "
-                                + "(cache_read: \(cacheReadTokens ?? 0), cache_creation: \(cacheCreationTokens ?? 0))")
+                                + "(cache_read: \(tokenUsage.cacheReadInputTokens ?? 0), cache_creation: \(tokenUsage.cacheCreationInputTokens ?? 0))")
                         }
 
                     } else {
@@ -413,8 +412,7 @@ actor KeepaliveManager {
                             response: nil,
                             durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: keepaliveStartedAt),
                             error: "non-HTTP response from upstream",
-                            cacheReadTokens: nil,
-                            cacheCreationTokens: nil,
+                            tokenUsage: .empty,
                             statusCode: nil
                         )
                         await recordFailure(
@@ -435,8 +433,7 @@ actor KeepaliveManager {
                         response: nil,
                         durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: keepaliveStartedAt),
                         error: error.localizedDescription,
-                        cacheReadTokens: nil,
-                        cacheCreationTokens: nil,
+                        tokenUsage: .empty,
                         statusCode: nil
                     )
                     await recordFailure(
