@@ -37,6 +37,11 @@ Use conventional commit format: `type: short description` (e.g. `feat: add proxy
 - Notifications fire when 5h utilization crosses 50% or 80%, and when quota windows reset (with jitter filtering)
 - Run `xcodebuild test` after any model or provider changes
 - File I/O (config, usage export) must use `.atomic` writes
+- Proxy listens on `127.0.0.1` only (IPv4 loopback) — never bind all interfaces
+- Max 5 concurrent keepalive loops; max 5 cumulative failures before auto-disable per session
+- Event log uses SQLite with WAL mode; 24-hour retention with 5-minute prune sweeps
+- Payload capture directory (`~/.tokenpulse/proxy_payloads/`) uses 24-hour retention with hourly cleanup
+- Status snapshots (`~/.tokenpulse/proxy_status.json`) throttled to 1-second minimum interval
 
 ## Architecture quick ref
 
@@ -55,6 +60,16 @@ TokenPulse/
 │   ├── ProviderManager.swift   # Per-provider refresh, state machine, icon model
 │   ├── NotificationService.swift # UNUserNotification for threshold/reset alerts
 │   └── UsageExporter.swift     # ~/.tokenpulse/raw_usage.json export
+├── Proxy/
+│   ├── LocalProxyController.swift  # Lifecycle owner: starts/stops server, manages subsystem
+│   ├── ProxyHTTPServer.swift       # Network.framework HTTP/1.1 listener on 127.0.0.1
+│   ├── AnthropicForwarder.swift    # Forwards requests to upstream, streaming support
+│   ├── KeepaliveManager.swift      # Per-session cache-warming keepalive loops
+│   ├── ProxySessionStore.swift     # Session state, byte counters, traffic callbacks
+│   ├── ProxyEventLogger.swift      # SQLite event persistence + status snapshots
+│   ├── ProxyPayloadCapture.swift   # Optional gzip-compressed payload archival
+│   ├── ProxyMetricsStore.swift     # Aggregated counters and savings estimate
+│   └── ProxyModels.swift           # Shared data types (request, activity, utils)
 ├── Views/                      # SwiftUI: PopoverView, SettingsView
 └── Rendering/
     └── BarIconRenderer.swift   # Core Graphics battery bar icon
@@ -64,5 +79,5 @@ TokenPulse/
 
 - Product features, install, usage → README.md
 - Provider API specs, auth flows, response schemas → docs/providers.md
-- Proxy feature design → FEATURE_DESIGN.md
+- Slash animation state machine, timing, rendering → docs/animation.md
 - Build commands, code style, constraints → this file

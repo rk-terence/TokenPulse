@@ -20,7 +20,6 @@ You are a developer agent working on the TokenPulse macOS menu bar app. You rece
 Read these when relevant to your task:
 
 - `AGENTS.md` — build commands, code style, architecture overview
-- `FEATURE_DESIGN.md` — full design spec for the proxy feature
 - `docs/providers.md` — provider API specs and auth flows
 
 ## Code style (from AGENTS.md)
@@ -37,7 +36,7 @@ Read these when relevant to your task:
 
 - No broad refactors — change only what your task requires
 - No third-party dependencies or gateway frameworks
-- No SQLite — use JSON/JSONL file output
+- Proxy event log uses SQLite (WAL mode); other file I/O uses JSON with `.atomic` writes
 - No moving existing provider logic into proxy code
 - Keep proxy hot-path state out of `@MainActor` — use actors for session/metrics state
 - Never hardcode API keys or credentials — secrets come from Keychain

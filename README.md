@@ -13,6 +13,7 @@ A macOS menu bar app that monitors your AI platform token usage at a glance. It 
 - **Graceful degradation** — Shows stale data on transient errors, surfaces auth guidance on credential issues, dims icon when refreshing
 - **Configurable polling** — 60s, 2min, or 5min intervals
 - **Launch at login** — Optional auto-start via macOS Service Management
+- **Local proxy** — Optional HTTP proxy that intercepts Anthropic API requests, enabling cache-warming keepalives and usage observability
 - **No Dock icon** — Runs as a pure menu bar app
 
 ## Supported providers
@@ -103,6 +104,47 @@ jq '.providers | to_entries[] | select(.value.status == "error")' ~/.tokenpulse/
 
 The file is atomically written, so readers always see a complete snapshot.
 
+## Local proxy
+
+TokenPulse includes an optional local HTTP proxy that sits between your AI tools (e.g. Claude Code) and the upstream Anthropic-compatible API. It forwards requests transparently while adding cache-warming keepalives and usage observability.
+
+### Enabling the proxy
+
+1. Open **Settings > Proxy** and toggle **Enable local proxy**
+2. Set the **upstream URL** (defaults to `https://zenmux.ai/api/anthropic`)
+3. Configure your AI tool to route through the proxy:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8080
+```
+
+### Cache-warming keepalives
+
+When enabled, the proxy sends periodic lightweight requests to keep prompt caches warm between your real requests. Each keepalive costs ~0.10x base input tokens; avoiding a cache write saves ~1.15x base input tokens. The popover shows your estimated net savings.
+
+Keepalives run per session (up to 5 concurrent), auto-disable after 5 cumulative failures or after the configured inactivity timeout, and stop automatically when the proxy is turned off.
+
+### Observability
+
+The proxy writes structured event logs to `~/.tokenpulse/proxy_events.sqlite` (SQLite, WAL mode) and an atomic status snapshot to `~/.tokenpulse/proxy_status.json`. Events are pruned after 24 hours.
+
+Optional payload capture stores gzip-compressed request bodies to `~/.tokenpulse/proxy_payloads/` (disabled by default, 24-hour retention).
+
+### Proxy configuration
+
+All fields are in `~/.tokenpulse/config.json`:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `proxyEnabled` | `false` | Start the local proxy on launch |
+| `proxyPort` | `8080` | Listening port on 127.0.0.1 |
+| `proxyUpstreamURL` | `https://zenmux.ai/api/anthropic` | Upstream API to forward requests to |
+| `keepaliveEnabled` | `false` | Send cache-warming keepalives between requests |
+| `keepaliveIntervalSeconds` | `240` | Seconds between keepalive requests |
+| `proxyInactivityTimeoutSeconds` | `900` | Disable keepalives for a session after this many idle seconds |
+| `saveProxyEventLog` | `true` | Write event metadata to SQLite |
+| `saveProxyPayloads` | `false` | Capture full request/response bodies (privacy-sensitive) |
+
 ## Notifications
 
 TokenPulse sends macOS notifications for important usage events:
@@ -124,6 +166,7 @@ TokenPulse/
 ├── Models/         # UsageData, ProviderStatus, ProviderConfig
 ├── Providers/      # UsageProvider protocol + Codex, Claude, ZenMux implementations
 ├── Services/       # KeychainService, ChromeCookieService, ConfigService, PollingManager, ProviderManager, NotificationService
+├── Proxy/          # Local HTTP proxy, keepalive manager, event logger
 ├── Views/          # PopoverView, SettingsView (SwiftUI)
 └── Rendering/      # BarIconRenderer (Core Graphics)
 ```
