@@ -5,19 +5,18 @@ import Foundation
 ///
 /// This type is `Sendable` — it holds only immutable config and a `Sendable` URLSession.
 final class AnthropicForwarder: Sendable {
+    private static let maxLoggedStreamingResponseBytes = 4 * 1024 * 1024
 
     let upstreamBaseURL: String
     /// Shared session used for non-streaming requests only.
     private let session: URLSession
     private let eventLogger: ProxyEventLogger?
     private let proxyPort: Int
-    private let payloadCapture: ProxyPayloadCapture?
 
-    init(upstreamBaseURL: String, eventLogger: ProxyEventLogger? = nil, proxyPort: Int = 0, payloadCapture: ProxyPayloadCapture? = nil) {
+    init(upstreamBaseURL: String, eventLogger: ProxyEventLogger? = nil, proxyPort: Int = 0) {
         self.upstreamBaseURL = upstreamBaseURL
         self.eventLogger = eventLogger
         self.proxyPort = proxyPort
-        self.payloadCapture = payloadCapture
 
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 300  // Long timeout for streaming
@@ -37,84 +36,152 @@ final class AnthropicForwarder: Sendable {
         await sessionStore.touch(sessionID)
         await sessionStore.incrementInFlight(sessionID)
 
-        // Store request body and model for keepalive use.
+        // Store request context for keepalive use.
         let model = extractModel(from: request.body)
-        await sessionStore.storeRequestBody(request.body, model: model, for: sessionID)
+        await sessionStore.storeRequestContext(
+            body: request.body,
+            headers: request.headers,
+            model: model,
+            for: sessionID
+        )
 
-        // Fire-and-forget payload capture (only when enabled).
-        if let capture = payloadCapture {
-            let body = request.body
-            let sid = sessionID
-            Task { await capture.capture(requestBody: body, sessionID: sid) }
-        }
+        await forwardRequest(
+            request: request,
+            sessionID: sessionID,
+            model: model,
+            sessionStore: sessionStore,
+            metrics: metrics,
+            keepaliveManager: keepaliveManager
+        )
+        await sessionStore.decrementInFlight(sessionID)
+    }
 
-        await eventLogger?.logRequestStarted(session: sessionID, model: model)
+    // MARK: - Streaming forwarding
 
-        defer {
-            Task {
-                await sessionStore.decrementInFlight(sessionID)
-            }
-        }
-
-        // 2. Build upstream URL.
+    private func forwardRequest(
+        request: ProxyHTTPRequest,
+        sessionID: String,
+        model: String?,
+        sessionStore: ProxySessionStore,
+        metrics: ProxyMetricsStore,
+        keepaliveManager: KeepaliveManager?
+    ) async {
+        // requestID is created below, after URL validation, so we only track
+        // real upstream attempts (not proxy-side config errors).
         let urlString = upstreamBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             + request.path
+        let wantsStreaming = ProxyRequestBody.isStreaming(from: request.body)
+        let requestStartedAt = Date()
+        let requestLog = ProxyEventLogger.LoggedRequest(
+            method: request.method,
+            path: request.path,
+            upstreamURL: urlString,
+            headers: request.headers,
+            body: request.body,
+            streaming: wantsStreaming
+        )
+        await eventLogger?.logRequestStarted(
+            session: sessionID,
+            model: model,
+            method: request.method,
+            path: request.path,
+            upstreamURL: urlString,
+            streaming: wantsStreaming
+        )
+
         guard let url = URL(string: urlString) else {
             await metrics.recordFailed()
-            await eventLogger?.logRequestFailed(session: sessionID, error: "invalid upstream URL")
-            sendErrorToClient(writer: request.writer, status: 502,
-                              message: String(localized: "Bad Gateway: invalid upstream URL"))
+            let response = proxyErrorResponse(
+                status: 502,
+                message: String(localized: "Bad Gateway: invalid upstream URL")
+            )
+            await eventLogger?.logRequestFailed(
+                session: sessionID,
+                model: model,
+                request: requestLog,
+                response: response.loggedResponse,
+                durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
+                error: "invalid upstream URL"
+            )
+            writeErrorToClient(writer: request.writer, response: response)
             return
         }
 
-        // 3. Build upstream URLRequest.
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = "POST"
         urlRequest.httpBody = request.body
 
-        // Copy all incoming headers.
         for header in request.headers {
             let lowered = header.name.lowercased()
-            // Skip hop-by-hop headers that URLSession manages.
             if lowered == "host" || lowered == "content-length" || lowered == "transfer-encoding" {
                 continue
             }
-            urlRequest.setValue(header.value, forHTTPHeaderField: header.name)
+            urlRequest.addValue(header.value, forHTTPHeaderField: header.name)
         }
 
-        // 4. Determine if the client wants streaming.
-        let wantsStreaming = ProxyRequestBody.isStreaming(from: request.body)
+        // Register the in-flight request in the session store for real-time UI display.
+        let requestID = UUID()
+        await sessionStore.startRequest(id: requestID, sessionID: sessionID)
+        await sessionStore.recordBytesSent(request.body.count)
 
         if wantsStreaming {
-            await forwardStreaming(urlRequest: urlRequest, writer: request.writer, metrics: metrics, sessionID: sessionID, model: model)
+            await forwardStreaming(
+                urlRequest: urlRequest,
+                writer: request.writer,
+                requestID: requestID,
+                sessionStore: sessionStore,
+                metrics: metrics,
+                sessionID: sessionID,
+                model: model,
+                requestLog: requestLog,
+                requestStartedAt: requestStartedAt
+            )
         } else {
-            await forwardNonStreaming(urlRequest: urlRequest, writer: request.writer, metrics: metrics, sessionID: sessionID, model: model)
+            await forwardNonStreaming(
+                urlRequest: urlRequest,
+                writer: request.writer,
+                requestID: requestID,
+                sessionStore: sessionStore,
+                metrics: metrics,
+                sessionID: sessionID,
+                model: model,
+                requestLog: requestLog,
+                requestStartedAt: requestStartedAt
+            )
         }
 
-        // Write status snapshot after each request.
         await writeStatusSnapshot(
             sessionStore: sessionStore,
             metrics: metrics,
             keepaliveManager: keepaliveManager
         )
 
-        // 5. Notify keepalive manager after forwarding completes.
         await keepaliveManager?.startOrReset(sessionID: sessionID, headers: request.headers)
     }
-
-    // MARK: - Streaming forwarding
 
     private func forwardStreaming(
         urlRequest: URLRequest,
         writer: ResponseWriter,
+        requestID: UUID,
+        sessionStore: ProxySessionStore,
         metrics: ProxyMetricsStore,
         sessionID: String,
-        model: String?
+        model: String?,
+        requestLog: ProxyEventLogger.LoggedRequest,
+        requestStartedAt: Date
     ) async {
         do {
             // Create a per-request streaming delegate and session so we receive
             // natural TCP-segment-sized chunks instead of byte-by-byte iteration.
             let streamingDelegate = StreamingDelegate()
+            streamingDelegate.onUploadProgress = { totalBytesSent in
+                Task {
+                    await sessionStore.updateRequestBytesSent(
+                        id: requestID,
+                        totalBytesSent: Int(totalBytesSent)
+                    )
+                }
+            }
             let delegateConfig = URLSessionConfiguration.default
             delegateConfig.timeoutIntervalForRequest = 300
             delegateConfig.timeoutIntervalForResource = 600
@@ -123,13 +190,21 @@ final class AnthropicForwarder: Sendable {
                                               delegateQueue: nil)
             defer { delegateSession.invalidateAndCancel() }
 
-            let dataTask = delegateSession.dataTask(with: urlRequest)
+            // Use uploadTask for reliable didSendBodyData progress callbacks.
+            let bodyData = urlRequest.httpBody ?? Data()
+            var uploadRequest = urlRequest
+            uploadRequest.httpBody = nil
+            let dataTask = delegateSession.uploadTask(with: uploadRequest, from: bodyData)
             let chunks = streamingDelegate.chunkStream
 
             dataTask.resume()
 
             // Track the upstream status code for event logging.
             var upstreamStatusCode = 0
+            var capturedResponseHeaders: [(name: String, value: String)] = []
+            let shouldCaptureResponseBody = eventLogger != nil
+            var capturedResponseBody = Data()
+            var capturedResponseBytes = 0
 
             // Wrap the entire streaming operation — including header wait — in a
             // cancellation handler so the upstream task is cancelled if the client
@@ -138,6 +213,7 @@ final class AnthropicForwarder: Sendable {
                 // Await the HTTP response headers.
                 let httpResponse = try await streamingDelegate.awaitResponse()
                 upstreamStatusCode = httpResponse.statusCode
+                capturedResponseHeaders = ProxyHTTPUtils.allHeaders(from: httpResponse)
 
                 // Write the head with upstream status and headers.
                 var responseHeaders = buildResponseHeaders(from: httpResponse, streaming: true)
@@ -152,10 +228,21 @@ final class AnthropicForwarder: Sendable {
                 }
 
                 writer.writeHead(status: httpResponse.statusCode, headers: responseHeaders)
+                // Headers received — transition to generating state.
+                await sessionStore.markRequestGenerating(id: requestID)
 
                 // Stream chunks through to the client.
                 for await chunk in chunks {
                     try Task.checkCancellation()
+                    await sessionStore.updateRequestBytes(id: requestID, additionalBytes: chunk.count)
+                    if shouldCaptureResponseBody {
+                        capturedResponseBytes += chunk.count
+                        Self.appendForLogging(
+                            chunk,
+                            to: &capturedResponseBody,
+                            maxBytes: Self.maxLoggedStreamingResponseBytes
+                        )
+                    }
                     writer.writeChunk(chunk)
                 }
             } onCancel: {
@@ -163,22 +250,56 @@ final class AnthropicForwarder: Sendable {
             }
 
             writer.end()
+            await sessionStore.finishRequest(id: requestID, errored: false)
             await metrics.recordForwarded()
-            // For streaming, we don't parse the body for cache metrics.
+            let responseLog = ProxyEventLogger.LoggedResponse(
+                statusCode: upstreamStatusCode,
+                headers: capturedResponseHeaders,
+                body: capturedResponseBody,
+                source: "upstream",
+                bodyBytes: capturedResponseBytes,
+                bodyTruncated: capturedResponseBytes > capturedResponseBody.count
+            )
+            let (cacheRead, cacheCreation) = ProxyHTTPUtils.parseCacheMetrics(from: capturedResponseBody)
             await eventLogger?.logRequestCompleted(
-                session: sessionID, model: model, statusCode: upstreamStatusCode,
-                cacheReadTokens: nil, cacheCreationTokens: nil
+                session: sessionID,
+                model: model,
+                request: requestLog,
+                response: responseLog,
+                durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
+                statusCode: upstreamStatusCode,
+                cacheReadTokens: cacheRead,
+                cacheCreationTokens: cacheCreation
             )
 
         } catch is CancellationError {
             // Client disconnected — no error response needed.
+            await sessionStore.finishRequest(id: requestID, errored: true)
             ProxyLogger.log("Streaming request cancelled (client disconnect)")
-            await eventLogger?.logRequestFailed(session: sessionID, error: "client disconnected")
+            await eventLogger?.logRequestFailed(
+                session: sessionID,
+                model: model,
+                request: requestLog,
+                response: nil,
+                durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
+                error: "client disconnected"
+            )
         } catch {
+            await sessionStore.finishRequest(id: requestID, errored: true)
             await metrics.recordFailed()
-            await eventLogger?.logRequestFailed(session: sessionID, error: error.localizedDescription)
-            sendErrorToClient(writer: writer, status: 502,
-                              message: String(localized: "Bad Gateway: upstream error: \(error.localizedDescription)"))
+            let response = proxyErrorResponse(
+                status: 502,
+                message: String(localized: "Bad Gateway: upstream error: \(error.localizedDescription)")
+            )
+            await eventLogger?.logRequestFailed(
+                session: sessionID,
+                model: model,
+                request: requestLog,
+                response: response.loggedResponse,
+                durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
+                error: error.localizedDescription
+            )
+            writeErrorToClient(writer: writer, response: response)
         }
     }
 
@@ -187,18 +308,35 @@ final class AnthropicForwarder: Sendable {
     private func forwardNonStreaming(
         urlRequest: URLRequest,
         writer: ResponseWriter,
+        requestID: UUID,
+        sessionStore: ProxySessionStore,
         metrics: ProxyMetricsStore,
         sessionID: String,
-        model: String?
+        model: String?,
+        requestLog: ProxyEventLogger.LoggedRequest,
+        requestStartedAt: Date
     ) async {
         do {
+            // Mark as generating while we wait for the full response.
+            await sessionStore.markRequestGenerating(id: requestID)
             let (data, response) = try await session.data(for: urlRequest)
 
             guard let httpResponse = response as? HTTPURLResponse else {
+                await sessionStore.finishRequest(id: requestID, errored: true)
                 await metrics.recordFailed()
-                await eventLogger?.logRequestFailed(session: sessionID, error: "non-HTTP response from upstream")
-                sendErrorToClient(writer: writer, status: 502,
-                                  message: String(localized: "Bad Gateway: non-HTTP response from upstream"))
+                let proxyResponse = proxyErrorResponse(
+                    status: 502,
+                    message: String(localized: "Bad Gateway: non-HTTP response from upstream")
+                )
+                await eventLogger?.logRequestFailed(
+                    session: sessionID,
+                    model: model,
+                    request: requestLog,
+                    response: proxyResponse.loggedResponse,
+                    durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
+                    error: "non-HTTP response from upstream"
+                )
+                writeErrorToClient(writer: writer, response: proxyResponse)
                 return
             }
 
@@ -207,23 +345,50 @@ final class AnthropicForwarder: Sendable {
 
             writer.writeHead(status: httpResponse.statusCode, headers: responseHeaders)
             if !data.isEmpty {
+                await sessionStore.updateRequestBytes(id: requestID, additionalBytes: data.count)
+            }
+            if !data.isEmpty {
                 writer.writeChunk(data)
             }
             writer.end()
+            await sessionStore.finishRequest(id: requestID, errored: false)
             await metrics.recordForwarded()
 
             // For non-streaming, parse cache metrics from the response body.
-            let (cacheRead, cacheCreation) = Self.parseCacheMetrics(from: data)
+            let (cacheRead, cacheCreation) = ProxyHTTPUtils.parseCacheMetrics(from: data)
+            let responseLog = ProxyEventLogger.LoggedResponse(
+                statusCode: httpResponse.statusCode,
+                headers: ProxyHTTPUtils.allHeaders(from: httpResponse),
+                body: data,
+                source: "upstream"
+            )
             await eventLogger?.logRequestCompleted(
-                session: sessionID, model: model, statusCode: httpResponse.statusCode,
-                cacheReadTokens: cacheRead, cacheCreationTokens: cacheCreation
+                session: sessionID,
+                model: model,
+                request: requestLog,
+                response: responseLog,
+                durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
+                statusCode: httpResponse.statusCode,
+                cacheReadTokens: cacheRead,
+                cacheCreationTokens: cacheCreation
             )
 
         } catch {
+            await sessionStore.finishRequest(id: requestID, errored: true)
             await metrics.recordFailed()
-            await eventLogger?.logRequestFailed(session: sessionID, error: error.localizedDescription)
-            sendErrorToClient(writer: writer, status: 502,
-                              message: String(localized: "Bad Gateway: upstream error: \(error.localizedDescription)"))
+            let response = proxyErrorResponse(
+                status: 502,
+                message: String(localized: "Bad Gateway: upstream error: \(error.localizedDescription)")
+            )
+            await eventLogger?.logRequestFailed(
+                session: sessionID,
+                model: model,
+                request: requestLog,
+                response: response.loggedResponse,
+                durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
+                error: error.localizedDescription
+            )
+            writeErrorToClient(writer: writer, response: response)
         }
     }
 
@@ -250,15 +415,13 @@ final class AnthropicForwarder: Sendable {
         return headers
     }
 
-    /// Send an error response to the client.
-    private func sendErrorToClient(writer: ResponseWriter, status: Int, message: String) {
-        let body = message.data(using: .utf8) ?? Data()
-        writer.writeHead(status: status, headers: [
-            (name: "Content-Type", value: "text/plain; charset=utf-8"),
-            (name: "Content-Length", value: "\(body.count)"),
-            (name: "Connection", value: "close"),
-        ])
-        writer.writeChunk(body)
+    /// Send a proxy-generated error response to the client.
+    private func writeErrorToClient(
+        writer: ResponseWriter,
+        response: (headers: [(name: String, value: String)], body: Data, loggedResponse: ProxyEventLogger.LoggedResponse)
+    ) {
+        writer.writeHead(status: response.loggedResponse.statusCode, headers: response.headers)
+        writer.writeChunk(response.body)
         writer.end()
     }
 
@@ -270,16 +433,33 @@ final class AnthropicForwarder: Sendable {
         return json["model"] as? String
     }
 
-    /// Parse `cache_read_input_tokens` and `cache_creation_input_tokens` from
-    /// the upstream JSON response's `usage` object.
-    private static func parseCacheMetrics(from data: Data) -> (cacheReadTokens: Int?, cacheCreationTokens: Int?) {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let usage = json["usage"] as? [String: Any] else {
-            return (nil, nil)
+    private func proxyErrorResponse(
+        status: Int,
+        message: String
+    ) -> (headers: [(name: String, value: String)], body: Data, loggedResponse: ProxyEventLogger.LoggedResponse) {
+        let body = ProxyHTTPUtils.anthropicErrorBody(message: message)
+        let headers = [
+            (name: "Content-Type", value: "application/json; charset=utf-8"),
+            (name: "Content-Length", value: "\(body.count)"),
+            (name: "Connection", value: "close"),
+        ]
+        let loggedResponse = ProxyEventLogger.LoggedResponse(
+            statusCode: status,
+            headers: headers,
+            body: body,
+            source: "proxy"
+        )
+        return (headers: headers, body: body, loggedResponse: loggedResponse)
+    }
+
+    private static func appendForLogging(_ chunk: Data, to capturedBody: inout Data, maxBytes: Int) {
+        let remaining = maxBytes - capturedBody.count
+        guard remaining > 0 else { return }
+        if chunk.count <= remaining {
+            capturedBody.append(chunk)
+        } else {
+            capturedBody.append(chunk.prefix(remaining))
         }
-        let cacheRead = usage["cache_read_input_tokens"] as? Int
-        let cacheCreation = usage["cache_creation_input_tokens"] as? Int
-        return (cacheRead, cacheCreation)
     }
 
     /// Write an atomic status snapshot via the event logger.
@@ -312,6 +492,9 @@ final class AnthropicForwarder: Sendable {
 /// callbacks and the async consumer. The response is delivered via a one-element
 /// `AsyncStream<Result<HTTPURLResponse, Error>>`.
 private final class StreamingDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+
+    /// Called on each upload progress report with cumulative bytes sent.
+    var onUploadProgress: (@Sendable (_ totalBytesSent: Int64) -> Void)?
 
     private let chunkContinuation: AsyncStream<Data>.Continuation
     let chunkStream: AsyncStream<Data>
@@ -361,6 +544,13 @@ private final class StreamingDelegate: NSObject, URLSessionDataDelegate, @unchec
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         chunkContinuation.yield(data)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    didSendBodyData bytesSent: Int64,
+                    totalBytesSent: Int64,
+                    totalBytesExpectedToSend: Int64) {
+        onUploadProgress?(totalBytesSent)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {

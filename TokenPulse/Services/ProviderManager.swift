@@ -12,7 +12,8 @@ struct ProviderEntry: Sendable {
 
 struct StatusBarIconModel: Sendable {
     let label: String
-    let utilization: Double?
+    let utilization: Double?          // 5h window utilization %
+    let sevenDayUtilization: Double?  // 7d window utilization %
     let state: StatusBarIconState
 }
 
@@ -375,11 +376,12 @@ final class ProviderManager {
             let provider = providers.first(where: { $0.id == activeProviderID }),
             let status = states[activeProviderID]?.status
         else {
-            onIconUpdate?(StatusBarIconModel(label: "?", utilization: nil, state: .unconfigured))
+            onIconUpdate?(StatusBarIconModel(label: "?", utilization: nil, sevenDayUtilization: nil, state: .unconfigured))
             return
         }
 
-        let utilization = status.displayData?.fiveHour?.utilization
+        let utilization       = status.displayData?.fiveHour?.utilization
+        let sevenDayUtil      = status.displayData?.sevenDay?.utilization
         let iconState: StatusBarIconState
 
         switch status {
@@ -395,6 +397,11 @@ final class ProviderManager {
             iconState = .error
         }
 
-        onIconUpdate?(StatusBarIconModel(label: provider.shortLabel, utilization: utilization, state: iconState))
+        onIconUpdate?(StatusBarIconModel(
+            label: provider.shortLabel,
+            utilization: utilization,
+            sevenDayUtilization: sevenDayUtil,
+            state: iconState
+        ))
     }
 }

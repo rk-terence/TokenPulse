@@ -7,6 +7,11 @@ import Foundation
 actor ProxyPayloadCapture {
 
     private var sequenceCounter: UInt64 = 0
+    private var lastCleanupAt: Date?
+    private let dateFormatter = ISO8601DateFormatter()
+
+    private static let maxPayloadAge: TimeInterval = 24 * 60 * 60
+    private static let cleanupInterval: TimeInterval = 60 * 60
 
     private static let directory: URL = {
         FileManager.default.homeDirectoryForCurrentUser
@@ -16,8 +21,9 @@ actor ProxyPayloadCapture {
 
     /// Capture a request payload. The file is named `{timestamp}_{sessionPrefix}_{seq}.json.zz`.
     func capture(requestBody: Data, sessionID: String) {
+        cleanupOldPayloadsIfNeeded()
         let prefix = String(sessionID.prefix(8))
-        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let timestamp = dateFormatter.string(from: Date())
             .replacingOccurrences(of: ":", with: "-")  // Filesystem-safe
         sequenceCounter += 1
         let seq = sequenceCounter
@@ -30,6 +36,29 @@ actor ProxyPayloadCapture {
             try compressed.write(to: fileURL, options: .atomic)
         } catch {
             ProxyLogger.log("PayloadCapture: failed to write \(filename): \(error)")
+        }
+    }
+
+    /// Remove payload files older than `maxPayloadAge`, throttled by `cleanupInterval`.
+    private func cleanupOldPayloadsIfNeeded() {
+        let now = Date()
+        if let lastCleanupAt, now.timeIntervalSince(lastCleanupAt) < Self.cleanupInterval {
+            return
+        }
+        lastCleanupAt = now
+
+        let cutoff = now.addingTimeInterval(-Self.maxPayloadAge)
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: Self.directory,
+            includingPropertiesForKeys: [.creationDateKey],
+            options: []
+        ) else { return }
+
+        for url in contents {
+            guard let values = try? url.resourceValues(forKeys: [.creationDateKey]),
+                  let created = values.creationDate,
+                  created < cutoff else { continue }
+            try? FileManager.default.removeItem(at: url)
         }
     }
 

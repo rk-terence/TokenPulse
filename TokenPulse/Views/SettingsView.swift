@@ -322,10 +322,15 @@ private struct ProxyTab: View {
                     Divider()
 
                     Toggle(String(localized: "Save event log"), isOn: $config.saveProxyEventLog)
+                    if config.saveProxyEventLog {
+                        Text(String(localized: "Saves proxy metadata to ~/.tokenpulse/proxy_events.sqlite, including request timing, status, cache metrics, and upstream request IDs. Prompt and response content are excluded unless Capture all content is enabled. Restart the proxy to apply."))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
 
-                    Toggle(String(localized: "Save request payloads"), isOn: $config.saveProxyPayloads)
+                    Toggle(String(localized: "Capture all content"), isOn: $config.saveProxyPayloads)
                     if config.saveProxyPayloads {
-                        Text(String(localized: "Saves compressed copies of proxied request bodies to ~/.tokenpulse/proxy_payloads/. These contain your prompts and conversation content. Restart the proxy to apply."))
+                        Text(String(localized: "Saves full proxy request and response headers and bodies to the proxy_event_content table in ~/.tokenpulse/proxy_events.sqlite, linked to per-request event rows. These records contain your prompts, conversation content, and model outputs. Restart the proxy to apply."))
                             .font(.caption)
                             .foregroundStyle(.orange)
                     }
@@ -385,6 +390,7 @@ private struct ProxyTab: View {
             if let interval = Int(newValue.trimmingCharacters(in: .whitespaces)),
                (60...300).contains(interval) {
                 config.keepaliveIntervalSeconds = interval
+                applyKeepaliveConfiguration()
             } else {
                 keepaliveIntervalText = String(config.keepaliveIntervalSeconds)
             }
@@ -393,9 +399,22 @@ private struct ProxyTab: View {
             if let timeout = Int(newValue.trimmingCharacters(in: .whitespaces)),
                (300...3600).contains(timeout) {
                 config.proxyInactivityTimeoutSeconds = timeout
+                applyKeepaliveConfiguration()
             } else {
                 inactivityTimeoutText = String(config.proxyInactivityTimeoutSeconds)
             }
         }
+        .onChange(of: config.keepaliveEnabled) { _, _ in
+            applyKeepaliveConfiguration()
+        }
+    }
+
+    private func applyKeepaliveConfiguration() {
+        guard config.proxyEnabled else { return }
+        proxyController?.updateKeepaliveConfiguration(
+            enabled: config.keepaliveEnabled,
+            intervalSeconds: config.keepaliveIntervalSeconds,
+            inactivityTimeoutSeconds: config.proxyInactivityTimeoutSeconds
+        )
     }
 }

@@ -9,6 +9,7 @@ actor ProxySessionStore {
         var inFlightRequestCount: Int
         // Phase 2 additions:
         var lastRequestBody: Data?
+        var lastRequestHeaders: [(name: String, value: String)]
         var lastKnownModel: String?
         var lastKeepaliveAt: Date?
         var keepaliveSuccessCount: Int
@@ -16,9 +17,38 @@ actor ProxySessionStore {
         var lastCacheReadTokens: Int?
         var lastCacheCreationTokens: Int?
         var isKeepaliveDisabled: Bool
+        // Per-session request counters (completed/errored real requests):
+        var completedRequestCount: Int
+        var erroredRequestCount: Int
+    }
+
+    /// A snapshot of a session's stats and its currently active requests, for UI display.
+    struct SessionSnapshot: Sendable {
+        let sessionID: String
+        let lastSeenAt: Date
+        let lastKeepaliveAt: Date?
+        let completedRequestCount: Int
+        let erroredRequestCount: Int
+        let keepaliveTotalCount: Int
+        let activeRequests: [ProxyRequestActivity]
     }
 
     private var sessions: [String: Session] = [:]
+    /// In-flight requests keyed by their UUID, with the owning session ID stored alongside.
+    private var activeRequests: [UUID: (sessionID: String, activity: ProxyRequestActivity)] = [:]
+
+    // Byte counters for throughput and one-shot upload display.
+    private var totalBytesReceived: Int = 0
+    private var lastRequestBodyBytes: Int = 0
+
+    /// Callback fired when data traffic occurs (upload start or download chunk).
+    /// Called from within the actor — callers should dispatch to MainActor as needed.
+    private var onTraffic: (@Sendable () -> Void)?
+
+    /// Set the traffic callback. Called from outside the actor isolation.
+    func setTrafficCallback(_ callback: @escaping @Sendable () -> Void) {
+        onTraffic = callback
+    }
 
     /// Record that a session was seen (creates it if new) and return its state.
     @discardableResult
@@ -34,13 +64,16 @@ actor ProxySessionStore {
                 lastSeenAt: now,
                 inFlightRequestCount: 0,
                 lastRequestBody: nil,
+                lastRequestHeaders: [],
                 lastKnownModel: nil,
                 lastKeepaliveAt: nil,
                 keepaliveSuccessCount: 0,
                 keepaliveFailureCount: 0,
                 lastCacheReadTokens: nil,
                 lastCacheCreationTokens: nil,
-                isKeepaliveDisabled: false
+                isKeepaliveDisabled: false,
+                completedRequestCount: 0,
+                erroredRequestCount: 0
             )
             sessions[sessionID] = session
             return session
@@ -70,7 +103,8 @@ actor ProxySessionStore {
     func recentSessionCount(within interval: TimeInterval) -> Int {
         let cutoff = Date().addingTimeInterval(-interval)
         return sessions.values.filter { session in
-            session.inFlightRequestCount > 0 || session.lastSeenAt >= cutoff
+            session.inFlightRequestCount > 0
+                || max(session.lastSeenAt, session.lastKeepaliveAt ?? .distantPast) >= cutoff
         }.count
     }
 
@@ -94,10 +128,16 @@ actor ProxySessionStore {
 
     // MARK: - Phase 2 keepalive support
 
-    /// Store the most recent request body and model for a session.
-    func storeRequestBody(_ body: Data, model: String?, for sessionID: String) {
+    /// Store the most recent request body, headers, and model for a session.
+    func storeRequestContext(
+        body: Data,
+        headers: [(name: String, value: String)],
+        model: String?,
+        for sessionID: String
+    ) {
         if var session = sessions[sessionID] {
             session.lastRequestBody = body
+            session.lastRequestHeaders = headers
             session.lastKnownModel = model
             sessions[sessionID] = session
         }
@@ -106,6 +146,16 @@ actor ProxySessionStore {
     /// Retrieve the last stored request body for keepalive use.
     func lastRequestBody(for sessionID: String) -> Data? {
         sessions[sessionID]?.lastRequestBody
+    }
+
+    /// Sessions that already have enough request context to arm keepalive immediately.
+    func keepaliveBootstrapSessions() -> [(sessionID: String, headers: [(name: String, value: String)])] {
+        sessions.values.compactMap { session in
+            guard session.lastRequestBody != nil, !session.lastRequestHeaders.isEmpty else {
+                return nil
+            }
+            return (sessionID: session.sessionID, headers: session.lastRequestHeaders)
+        }
     }
 
     /// Record keepalive result for a session.
@@ -128,13 +178,107 @@ actor ProxySessionStore {
         }
     }
 
-    /// Remove sessions that haven't been seen since the given date.
+    // MARK: - Request activity tracking
+
+    /// Register a new in-flight request. Call immediately before starting the upstream fetch.
+    func startRequest(id: UUID, sessionID: String) {
+        let activity = ProxyRequestActivity(
+            id: id,
+            state: .sending,
+            bytesSent: 0,
+            bytesReceived: 0,
+            lastDataAt: nil,
+            startedAt: Date()
+        )
+        activeRequests[id] = (sessionID: sessionID, activity: activity)
+        onTraffic?()
+    }
+
+    /// Transition a request from `.sending` to `.generating` once headers are received.
+    func markRequestGenerating(id: UUID) {
+        guard var entry = activeRequests[id] else { return }
+        entry.activity.state = .generating
+        entry.activity.lastDataAt = Date()
+        activeRequests[id] = entry
+        onTraffic?()
+    }
+
+    /// Update the cumulative bytes sent to upstream for a request.
+    func updateRequestBytesSent(id: UUID, totalBytesSent: Int) {
+        guard var entry = activeRequests[id] else { return }
+        entry.activity.bytesSent = totalBytesSent
+        activeRequests[id] = entry
+        onTraffic?()
+    }
+
+    /// Accumulate bytes received and refresh the last-data timestamp.
+    func updateRequestBytes(id: UUID, additionalBytes: Int) {
+        guard var entry = activeRequests[id] else { return }
+        entry.activity.bytesReceived += additionalBytes
+        entry.activity.lastDataAt = Date()
+        activeRequests[id] = entry
+        totalBytesReceived += additionalBytes
+        onTraffic?()
+    }
+
+    /// Record bytes sent upstream for a new request (call once per request at start).
+    func recordBytesSent(_ bytes: Int) {
+        lastRequestBodyBytes = bytes
+    }
+
+    /// Size of the most recent request body in bytes. Used for one-shot upload display.
+    func lastUploadSize() -> Int { lastRequestBodyBytes }
+
+    /// Cumulative bytes received since the actor was created. Used for KB/s computation.
+    func cumulativeBytesReceived() -> Int { totalBytesReceived }
+
+    /// Remove the request from the active set and credit the owning session's counter.
+    func finishRequest(id: UUID, errored: Bool) {
+        guard let entry = activeRequests.removeValue(forKey: id) else { return }
+        if var session = sessions[entry.sessionID] {
+            if errored {
+                session.erroredRequestCount += 1
+            } else {
+                session.completedRequestCount += 1
+            }
+            sessions[entry.sessionID] = session
+        }
+        onTraffic?()
+    }
+
+    /// Return a snapshot of all sessions with their stats and in-flight requests,
+    /// sorted by most-recently-seen first.
+    func snapshotSessionActivities() -> [SessionSnapshot] {
+        var requestsBySession: [String: [ProxyRequestActivity]] = [:]
+        for (_, entry) in activeRequests {
+            requestsBySession[entry.sessionID, default: []].append(entry.activity)
+        }
+        return sessions.values.map { session in
+            SessionSnapshot(
+                sessionID: session.sessionID,
+                lastSeenAt: session.lastSeenAt,
+                lastKeepaliveAt: session.lastKeepaliveAt,
+                completedRequestCount: session.completedRequestCount,
+                erroredRequestCount: session.erroredRequestCount,
+                keepaliveTotalCount: session.keepaliveSuccessCount + session.keepaliveFailureCount,
+                activeRequests: requestsBySession[session.sessionID] ?? []
+            )
+        }.sorted {
+            max($0.lastSeenAt, $0.lastKeepaliveAt ?? .distantPast)
+                > max($1.lastSeenAt, $1.lastKeepaliveAt ?? .distantPast)
+        }
+    }
+
+    // MARK: - Session expiration
+
+    /// Remove sessions that have been idle since the given date.
     /// Skips sessions with in-flight requests to avoid dropping state mid-stream.
     /// Returns the session IDs that were removed.
     func expireSessions(olderThan date: Date) -> [String] {
         var expired: [String] = []
         for (id, session) in sessions
-            where session.lastSeenAt < date && session.inFlightRequestCount == 0 {
+            where max(session.lastSeenAt, session.lastKeepaliveAt ?? .distantPast) < date
+                && session.inFlightRequestCount == 0 {
             expired.append(id)
         }
         for id in expired {

@@ -17,22 +17,33 @@ final class ProxyHTTPServer: Sendable {
     private let listener: NWListener
     private let queue: DispatchQueue
     private let handler: ProxyRequestHandler
+    private let onReady: (@Sendable (UInt16) -> Void)?
+    private let onFailure: (@Sendable (String) -> Void)?
+    private let startupLock = NSLock()
+    private let startupResolved = LockedBox(false)
 
     /// Lock-protected mutable tracking state for active connections and tasks.
     private let trackingLock = NSLock()
-    private let _activeConnections = LockedBox<Set<ObjectIdentifier>>()
     private let _connectionMap = LockedBox<[ObjectIdentifier: NWConnection]>()
     private let _activeTasks = LockedBox<[ObjectIdentifier: CancellableTask]>()
 
     /// Maximum allowed Content-Length (50 MB).
     private static let maxContentLength = 50_000_000
 
+    /// Maximum accumulated header bytes before rejecting a request.
+    private static let maxHeaderSize = 65_536
+
     /// Create a server that will listen on the given port.
     /// - Parameters:
     ///   - port: TCP port to bind on 127.0.0.1.
     ///   - handler: Async closure invoked for each parsed request.
     /// - Throws: If the NWListener cannot be created.
-    init(port: UInt16, handler: @escaping ProxyRequestHandler) throws {
+    init(
+        port: UInt16,
+        handler: @escaping ProxyRequestHandler,
+        onReady: (@Sendable (UInt16) -> Void)? = nil,
+        onFailure: (@Sendable (String) -> Void)? = nil
+    ) throws {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             throw ProxyServerError.invalidPort
         }
@@ -44,6 +55,8 @@ final class ProxyHTTPServer: Sendable {
         self.listener = try NWListener(using: params)
         self.queue = DispatchQueue(label: "com.tokenpulse.proxy.server", qos: .userInitiated)
         self.handler = handler
+        self.onReady = onReady
+        self.onFailure = onFailure
     }
 
     /// Start accepting connections.
@@ -69,7 +82,6 @@ final class ProxyHTTPServer: Sendable {
         _activeTasks.value.removeAll()
         connections = Array(_connectionMap.value.values)
         _connectionMap.value.removeAll()
-        _activeConnections.value.removeAll()
         trackingLock.unlock()
 
         for task in tasks {
@@ -92,9 +104,15 @@ final class ProxyHTTPServer: Sendable {
         case .ready:
             if let port = listener.port {
                 ProxyLogger.log("Proxy server listening on 127.0.0.1:\(port.rawValue)")
+                resolveStartupIfNeeded {
+                    onReady?(port.rawValue)
+                }
             }
         case .failed(let error):
             ProxyLogger.log("Proxy server listener failed: \(error)")
+            resolveStartupIfNeeded {
+                onFailure?(error.localizedDescription)
+            }
             listener.cancel()
         case .cancelled:
             ProxyLogger.log("Proxy server listener cancelled")
@@ -103,12 +121,23 @@ final class ProxyHTTPServer: Sendable {
         }
     }
 
+    private func resolveStartupIfNeeded(_ body: () -> Void) {
+        startupLock.lock()
+        let shouldRun = !startupResolved.value
+        if shouldRun {
+            startupResolved.value = true
+        }
+        startupLock.unlock()
+
+        guard shouldRun else { return }
+        body()
+    }
+
     // MARK: - Connection tracking
 
     private func trackConnection(_ connection: NWConnection) {
         let id = ObjectIdentifier(connection)
         trackingLock.lock()
-        _activeConnections.value.insert(id)
         _connectionMap.value[id] = connection
         trackingLock.unlock()
     }
@@ -117,7 +146,6 @@ final class ProxyHTTPServer: Sendable {
         let id = ObjectIdentifier(connection)
         let cancellable: CancellableTask?
         trackingLock.lock()
-        _activeConnections.value.remove(id)
         _connectionMap.value.removeValue(forKey: id)
         cancellable = _activeTasks.value.removeValue(forKey: id)
         trackingLock.unlock()
@@ -172,6 +200,12 @@ final class ProxyHTTPServer: Sendable {
                 // Connection closed before we got a full request.
                 connection.cancel()
             } else {
+                // Reject if headers have grown past the size limit.
+                if buffer.count > Self.maxHeaderSize {
+                    self.sendErrorResponse(connection: connection, status: 400,
+                                          message: String(localized: "Bad Request: headers too large"))
+                    return
+                }
                 // Need more data.
                 self.readRequest(from: connection, accumulated: buffer)
             }
@@ -358,9 +392,9 @@ final class ProxyHTTPServer: Sendable {
 
     private func sendErrorResponse(connection: NWConnection, status: Int, message: String) {
         let statusText = HTTPStatusText.text(for: status)
-        let body = message.data(using: .utf8) ?? Data()
+        let body = ProxyHTTPUtils.anthropicErrorBody(message: message)
         var response = "HTTP/1.1 \(status) \(statusText)\r\n"
-        response += "Content-Type: text/plain; charset=utf-8\r\n"
+        response += "Content-Type: application/json; charset=utf-8\r\n"
         response += "Content-Length: \(body.count)\r\n"
         response += "Connection: close\r\n"
         response += "\r\n"
@@ -372,23 +406,17 @@ final class ProxyHTTPServer: Sendable {
             connection.cancel()
         })
     }
+
 }
 
 // MARK: - LockedBox
 
-/// A simple lock-free mutable container that uses the server's NSLock externally.
-/// This is a value-type wrapper for mutable collections used with `NSLock`.
+/// A mutable container whose access is serialized by an external `NSLock`.
 private final class LockedBox<Value: Sendable>: @unchecked Sendable {
     var value: Value
 
     init(_ value: Value) {
         self.value = value
-    }
-}
-
-extension LockedBox where Value == Set<ObjectIdentifier> {
-    convenience init() {
-        self.init(Set())
     }
 }
 
@@ -545,9 +573,14 @@ enum HTTPStatusText {
         switch status {
         case 200: return "OK"
         case 400: return "Bad Request"
+        case 401: return "Unauthorized"
+        case 403: return "Forbidden"
         case 404: return "Not Found"
         case 405: return "Method Not Allowed"
+        case 429: return "Too Many Requests"
+        case 500: return "Internal Server Error"
         case 502: return "Bad Gateway"
+        case 503: return "Service Unavailable"
         default: return "Unknown"
         }
     }

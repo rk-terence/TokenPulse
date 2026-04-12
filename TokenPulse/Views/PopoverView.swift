@@ -486,7 +486,8 @@ private struct ProxyStatusRow: View {
     let proxy: LocalProxyController
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
+            // Header: running indicator + port
             HStack {
                 Circle()
                     .fill(.green)
@@ -499,27 +500,161 @@ private struct ProxyStatusRow: View {
                     .foregroundStyle(.secondary)
             }
 
-            // Compact metrics grid
-            HStack(spacing: 12) {
-                ProxyMetricLabel(label: String(localized: "sessions"), value: "\(proxy.proxyStatus.activeSessions)")
-                ProxyMetricLabel(label: String(localized: "keepalive"), value: "\(proxy.proxyStatus.activeKeepalives)")
-                ProxyMetricLabel(label: String(localized: "fwd"), value: "\(proxy.proxyStatus.totalRequestsForwarded)")
+            if proxy.sessionActivities.isEmpty {
+                // No recent sessions yet — show aggregate counts only.
+                HStack(spacing: 12) {
+                    ProxyMetricLabel(
+                        label: String(localized: "fwd"),
+                        value: "\(proxy.proxyStatus.totalRequestsForwarded)"
+                    )
+                    if proxy.proxyStatus.activeKeepalives > 0 {
+                        ProxyMetricLabel(
+                            label: String(localized: "ka"),
+                            value: "\(proxy.proxyStatus.activeKeepalives)"
+                        )
+                    }
+                }
+            } else {
+                // Per-session rows.
+                ForEach(proxy.sessionActivities) { activity in
+                    SessionActivityRow(activity: activity)
+                }
             }
 
-            // Cache metrics + savings
-            HStack(spacing: 12) {
-                ProxyMetricLabel(label: String(localized: "cache rd"), value: "\(proxy.proxyStatus.cacheReads)")
-                ProxyMetricLabel(label: String(localized: "cache wr"), value: "\(proxy.proxyStatus.cacheWrites)")
-                if proxy.proxyStatus.estimatedSavings > 0 {
+            // Cache metrics + savings — only meaningful when keepalive is enabled.
+            if ConfigService.shared.keepaliveEnabled,
+               proxy.proxyStatus.cacheReads > 0 || proxy.proxyStatus.cacheWrites > 0 {
+                HStack(spacing: 12) {
                     ProxyMetricLabel(
-                        label: String(localized: "saved"),
-                        value: String(format: "~%.1fx", proxy.proxyStatus.estimatedSavings)
+                        label: String(localized: "cache rd"),
+                        value: "\(proxy.proxyStatus.cacheReads)"
                     )
+                    ProxyMetricLabel(
+                        label: String(localized: "cache wr"),
+                        value: "\(proxy.proxyStatus.cacheWrites)"
+                    )
+                    if proxy.proxyStatus.estimatedSavings > 0 {
+                        ProxyMetricLabel(
+                            label: String(localized: "saved"),
+                            value: String(format: "~%.1fx", proxy.proxyStatus.estimatedSavings)
+                        )
+                    }
                 }
             }
         }
     }
 }
+
+// MARK: - Session Activity Row
+
+private struct SessionActivityRow: View {
+    let activity: LocalProxyController.SessionActivity
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            // Session ID (abbreviated) + completed / keepalive / errored counts
+            HStack(spacing: 0) {
+                Text(activity.shortID)
+                    .font(.callout.monospaced())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                sessionStats
+            }
+
+            // In-flight requests
+            ForEach(activity.activeRequests) { request in
+                RequestActivityRow(request: request)
+                    .padding(.leading, 10)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var sessionStats: some View {
+        HStack(spacing: 8) {
+            if activity.completedRequests > 0 {
+                ProxyMetricLabel(
+                    label: String(localized: "done"),
+                    value: "\(activity.completedRequests)"
+                )
+            }
+            if activity.keepaliveRequests > 0 {
+                ProxyMetricLabel(
+                    label: String(localized: "ka"),
+                    value: "\(activity.keepaliveRequests)"
+                )
+            }
+            if activity.erroredRequests > 0 {
+                HStack(spacing: 3) {
+                    Text(String(localized: "err"))
+                        .font(.callout)
+                        .foregroundStyle(.red.opacity(0.7))
+                    Text("\(activity.erroredRequests)")
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.red)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Request Activity Row
+
+private struct RequestActivityRow: View {
+    let request: ProxyRequestActivity
+
+    /// A request is considered "fresh" if upstream data arrived within this window.
+    private static let freshnessInterval: TimeInterval = 10
+
+    var body: some View {
+        HStack(spacing: 5) {
+            switch request.state {
+            case .sending:
+                Image(systemName: "arrow.right")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                if request.bytesSent > 0 {
+                    Text(formattedBytes(request.bytesSent))
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Text(String(localized: "sent"))
+                        .font(.callout)
+                        .foregroundStyle(.tertiary)
+                } else {
+                    Text(String(localized: "sending"))
+                        .font(.callout)
+                        .foregroundStyle(.tertiary)
+                }
+
+            case .generating:
+                Circle()
+                    .fill(generatingColor)
+                    .frame(width: 6, height: 6)
+                Text(formattedBytes(request.bytesReceived))
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Text(String(localized: "received"))
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private var generatingColor: Color {
+        guard let lastDataAt = request.lastDataAt else { return .gray }
+        return Date().timeIntervalSince(lastDataAt) <= Self.freshnessInterval ? .green : .gray
+    }
+
+    private func formattedBytes(_ bytes: Int) -> String {
+        if bytes < 1024 {
+            return "\(bytes) B"
+        } else {
+            return String(format: "%.1f KB", Double(bytes) / 1024)
+        }
+    }
+}
+
+// MARK: - Proxy Metric Label
 
 private struct ProxyMetricLabel: View {
     let label: String
