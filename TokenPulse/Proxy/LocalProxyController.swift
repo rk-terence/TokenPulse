@@ -42,6 +42,7 @@ final class LocalProxyController {
         let totalOutputTokens: Int
         let totalCacheReadInputTokens: Int
         let totalCacheCreationInputTokens: Int
+        let totalEstimatedCostUSD: Double
 
         static let empty = ProxyStatus(
             activeSessions: 0, activeKeepalives: 0,
@@ -49,7 +50,8 @@ final class LocalProxyController {
             totalKeepalivesFailed: 0, cacheReads: 0, cacheWrites: 0,
             estimatedSavings: 0,
             totalInputTokens: 0, totalOutputTokens: 0,
-            totalCacheReadInputTokens: 0, totalCacheCreationInputTokens: 0
+            totalCacheReadInputTokens: 0, totalCacheCreationInputTokens: 0,
+            totalEstimatedCostUSD: 0
         )
     }
 
@@ -218,6 +220,28 @@ final class LocalProxyController {
         ProxyLogger.log("Proxy controller stopped")
     }
 
+    /// Reset the cumulative proxy cost estimate to zero.
+    func resetCost() async {
+        await sessionStore.resetCost()
+        var s = proxyStatus
+        s = ProxyStatus(
+            activeSessions: s.activeSessions,
+            activeKeepalives: s.activeKeepalives,
+            totalRequestsForwarded: s.totalRequestsForwarded,
+            totalKeepalivesSent: s.totalKeepalivesSent,
+            totalKeepalivesFailed: s.totalKeepalivesFailed,
+            cacheReads: s.cacheReads,
+            cacheWrites: s.cacheWrites,
+            estimatedSavings: s.estimatedSavings,
+            totalInputTokens: s.totalInputTokens,
+            totalOutputTokens: s.totalOutputTokens,
+            totalCacheReadInputTokens: s.totalCacheReadInputTokens,
+            totalCacheCreationInputTokens: s.totalCacheCreationInputTokens,
+            totalEstimatedCostUSD: 0
+        )
+        proxyStatus = s
+    }
+
     /// Apply keepalive changes immediately for a running proxy without a full restart.
     func updateKeepaliveConfiguration(enabled: Bool, intervalSeconds: Int, inactivityTimeoutSeconds: Int) {
         guard isRunning, let upstreamURL = currentUpstreamURL else { return }
@@ -288,6 +312,7 @@ final class LocalProxyController {
 
             let activitySnapshots = await sessStore.snapshotSessionActivities()
             let uploadSize = await sessStore.lastUploadSize()
+            let totalCost = await sessStore.totalEstimatedCostUSD()
             let now = Date()
             let recentCutoff = now.addingTimeInterval(-600)
 
@@ -299,7 +324,7 @@ final class LocalProxyController {
                         completedRequests: snap.completedRequestCount,
                         erroredRequests: snap.erroredRequestCount,
                         keepaliveRequests: snap.keepaliveTotalCount,
-                        activeRequests: snap.activeRequests.sorted { $0.startedAt < $1.startedAt },
+                        activeRequests: snap.activeRequests.sorted { $0.startedAt > $1.startedAt },
                         totalInputTokens: snap.totalInputTokens,
                         totalOutputTokens: snap.totalOutputTokens,
                         totalCacheReadInputTokens: snap.totalCacheReadInputTokens,
@@ -310,6 +335,21 @@ final class LocalProxyController {
 
             self.sessionActivities = activities
             self.lastUploadBytes = uploadSize
+            self.proxyStatus = ProxyStatus(
+                activeSessions: self.proxyStatus.activeSessions,
+                activeKeepalives: self.proxyStatus.activeKeepalives,
+                totalRequestsForwarded: self.proxyStatus.totalRequestsForwarded,
+                totalKeepalivesSent: self.proxyStatus.totalKeepalivesSent,
+                totalKeepalivesFailed: self.proxyStatus.totalKeepalivesFailed,
+                cacheReads: self.proxyStatus.cacheReads,
+                cacheWrites: self.proxyStatus.cacheWrites,
+                estimatedSavings: self.proxyStatus.estimatedSavings,
+                totalInputTokens: self.proxyStatus.totalInputTokens,
+                totalOutputTokens: self.proxyStatus.totalOutputTokens,
+                totalCacheReadInputTokens: self.proxyStatus.totalCacheReadInputTokens,
+                totalCacheCreationInputTokens: self.proxyStatus.totalCacheCreationInputTokens,
+                totalEstimatedCostUSD: totalCost
+            )
             self.trafficRefreshPending = false
         }
     }
@@ -350,6 +390,7 @@ final class LocalProxyController {
                 let activitySnapshots = await sessStore.snapshotSessionActivities()
                 let uploadSize  = await sessStore.lastUploadSize()
                 let bytesRx     = await sessStore.cumulativeBytesReceived()
+                let totalCost   = await sessStore.totalEstimatedCostUSD()
 
                 // Delta-based KB/s from cumulative receive counter.
                 let elapsed = now.timeIntervalSince(prevTransferDate)
@@ -373,7 +414,7 @@ final class LocalProxyController {
                             erroredRequests: snap.erroredRequestCount,
                             keepaliveRequests: snap.keepaliveTotalCount,
                             activeRequests: snap.activeRequests
-                                .sorted { $0.startedAt < $1.startedAt },
+                                .sorted { $0.startedAt > $1.startedAt },
                             totalInputTokens: snap.totalInputTokens,
                             totalOutputTokens: snap.totalOutputTokens,
                             totalCacheReadInputTokens: snap.totalCacheReadInputTokens,
@@ -399,7 +440,8 @@ final class LocalProxyController {
                         totalInputTokens: snapshot.totalInputTokens,
                         totalOutputTokens: snapshot.totalOutputTokens,
                         totalCacheReadInputTokens: snapshot.totalCacheReadInputTokens,
-                        totalCacheCreationInputTokens: snapshot.totalCacheCreationInputTokens
+                        totalCacheCreationInputTokens: snapshot.totalCacheCreationInputTokens,
+                        totalEstimatedCostUSD: totalCost
                     )
                 }
             }

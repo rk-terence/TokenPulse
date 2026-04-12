@@ -250,7 +250,6 @@ final class AnthropicForwarder: Sendable {
             }
 
             writer.end()
-            await sessionStore.finishRequest(id: requestID, errored: false)
             await metrics.recordForwarded()
             let responseLog = ProxyEventLogger.LoggedResponse(
                 statusCode: upstreamStatusCode,
@@ -263,6 +262,8 @@ final class AnthropicForwarder: Sendable {
             let tokenUsage = ProxyHTTPUtils.parseTokenUsage(from: capturedResponseBody, streaming: true)
             await metrics.recordTokenUsage(tokenUsage)
             await sessionStore.recordTokenUsage(tokenUsage, model: model, for: sessionID)
+            let requestCost = ModelPricingTable.pricing(for: model).map { tokenUsage.cost(for: $0) }
+            await sessionStore.markRequestDone(id: requestID, errored: false, tokenUsage: tokenUsage, estimatedCost: requestCost)
             await eventLogger?.logRequestCompleted(
                 session: sessionID,
                 model: model,
@@ -275,7 +276,7 @@ final class AnthropicForwarder: Sendable {
 
         } catch is CancellationError {
             // Client disconnected — no error response needed.
-            await sessionStore.finishRequest(id: requestID, errored: true)
+            await sessionStore.markRequestDone(id: requestID, errored: true, tokenUsage: nil, estimatedCost: nil)
             ProxyLogger.log("Streaming request cancelled (client disconnect)")
             await eventLogger?.logRequestFailed(
                 session: sessionID,
@@ -286,7 +287,7 @@ final class AnthropicForwarder: Sendable {
                 error: "client disconnected"
             )
         } catch {
-            await sessionStore.finishRequest(id: requestID, errored: true)
+            await sessionStore.markRequestDone(id: requestID, errored: true, tokenUsage: nil, estimatedCost: nil)
             await metrics.recordFailed()
             let response = proxyErrorResponse(
                 status: 502,
@@ -323,7 +324,7 @@ final class AnthropicForwarder: Sendable {
             let (data, response) = try await session.data(for: urlRequest)
 
             guard let httpResponse = response as? HTTPURLResponse else {
-                await sessionStore.finishRequest(id: requestID, errored: true)
+                await sessionStore.markRequestDone(id: requestID, errored: true, tokenUsage: nil, estimatedCost: nil)
                 await metrics.recordFailed()
                 let proxyResponse = proxyErrorResponse(
                     status: 502,
@@ -352,12 +353,13 @@ final class AnthropicForwarder: Sendable {
                 writer.writeChunk(data)
             }
             writer.end()
-            await sessionStore.finishRequest(id: requestID, errored: false)
             await metrics.recordForwarded()
 
             let tokenUsage = ProxyHTTPUtils.parseTokenUsage(from: data, streaming: false)
             await metrics.recordTokenUsage(tokenUsage)
             await sessionStore.recordTokenUsage(tokenUsage, model: model, for: sessionID)
+            let requestCost = ModelPricingTable.pricing(for: model).map { tokenUsage.cost(for: $0) }
+            await sessionStore.markRequestDone(id: requestID, errored: false, tokenUsage: tokenUsage, estimatedCost: requestCost)
             let responseLog = ProxyEventLogger.LoggedResponse(
                 statusCode: httpResponse.statusCode,
                 headers: ProxyHTTPUtils.allHeaders(from: httpResponse),
@@ -375,7 +377,7 @@ final class AnthropicForwarder: Sendable {
             )
 
         } catch {
-            await sessionStore.finishRequest(id: requestID, errored: true)
+            await sessionStore.markRequestDone(id: requestID, errored: true, tokenUsage: nil, estimatedCost: nil)
             await metrics.recordFailed()
             let response = proxyErrorResponse(
                 status: 502,

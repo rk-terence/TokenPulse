@@ -52,6 +52,10 @@ actor ProxySessionStore {
     private var totalBytesReceived: Int = 0
     private var lastRequestBodyBytes: Int = 0
 
+    /// Cumulative estimated cost (USD) across all sessions since the proxy started.
+    /// Separate from per-session costs so it survives session expiration.
+    private var cumulativeEstimatedCostUSD: Double = 0
+
     /// Callback fired when data traffic occurs (upload start or download chunk).
     /// Called from within the actor — callers should dispatch to MainActor as needed.
     private var onTraffic: (@Sendable () -> Void)?
@@ -204,9 +208,23 @@ actor ProxySessionStore {
         session.totalCacheReadInputTokens += usage.cacheReadInputTokens ?? 0
         session.totalCacheCreationInputTokens += usage.cacheCreationInputTokens ?? 0
         if let pricing = ModelPricingTable.pricing(for: model) {
-            session.estimatedCostUSD += usage.cost(for: pricing)
+            let cost = usage.cost(for: pricing)
+            session.estimatedCostUSD += cost
+            cumulativeEstimatedCostUSD += cost
         }
         sessions[sessionID] = session
+    }
+
+    /// Cumulative estimated cost since proxy start (survives session expiration).
+    func totalEstimatedCostUSD() -> Double {
+        cumulativeEstimatedCostUSD
+    }
+
+    /// Reset all transient counters while keeping sessions operational for keepalive.
+    /// Preserves request context (body, headers, model) needed by keepalive loops.
+    /// Reset only the cumulative cost estimate to zero. Per-session costs are preserved.
+    func resetCost() {
+        cumulativeEstimatedCostUSD = 0
     }
 
     // MARK: - Request activity tracking
@@ -263,9 +281,16 @@ actor ProxySessionStore {
     /// Cumulative bytes received since the actor was created. Used for KB/s computation.
     func cumulativeBytesReceived() -> Int { totalBytesReceived }
 
-    /// Remove the request from the active set and credit the owning session's counter.
-    func finishRequest(id: UUID, errored: Bool) {
-        guard let entry = activeRequests.removeValue(forKey: id) else { return }
+    /// Transition a request to `.done` with optional token/cost data, and stamp a removal deadline.
+    /// The request stays in the active set until pruned by `snapshotSessionActivities`.
+    func markRequestDone(id: UUID, errored: Bool, tokenUsage: TokenUsage?, estimatedCost: Double?) {
+        guard var entry = activeRequests[id] else { return }
+        entry.activity.state = .done
+        entry.activity.removeAfter = Date().addingTimeInterval(3)
+        entry.activity.tokenUsage = tokenUsage
+        entry.activity.estimatedCost = estimatedCost
+        activeRequests[id] = entry
+
         if var session = sessions[entry.sessionID] {
             if errored {
                 session.erroredRequestCount += 1
@@ -278,8 +303,22 @@ actor ProxySessionStore {
     }
 
     /// Return a snapshot of all sessions with their stats and in-flight requests,
-    /// sorted by most-recently-seen first.
+    /// sorted by most-recently-seen first. Prunes done requests whose deadline has passed.
     func snapshotSessionActivities() -> [SessionSnapshot] {
+        // Prune done requests whose removal deadline has passed.
+        let now = Date()
+        let expiredIDs = activeRequests.filter { (_, entry) in
+            if case .done = entry.activity.state,
+               let removeAfter = entry.activity.removeAfter,
+               removeAfter <= now {
+                return true
+            }
+            return false
+        }.map(\.key)
+        for id in expiredIDs {
+            activeRequests.removeValue(forKey: id)
+        }
+
         var requestsBySession: [String: [ProxyRequestActivity]] = [:]
         for (_, entry) in activeRequests {
             requestsBySession[entry.sessionID, default: []].append(entry.activity)

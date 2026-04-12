@@ -59,6 +59,20 @@ actor ProxyMetricsStore {
         if let v = usage.cacheCreationInputTokens { totalCacheCreationInputTokens += v }
     }
 
+    /// Reset all counters to zero.
+    func reset() {
+        totalRequestsForwarded = 0
+        totalRequestsFailed = 0
+        totalKeepalivesSent = 0
+        totalKeepalivesFailed = 0
+        totalCacheReads = 0
+        totalCacheWrites = 0
+        totalInputTokens = 0
+        totalOutputTokens = 0
+        totalCacheReadInputTokens = 0
+        totalCacheCreationInputTokens = 0
+    }
+
     /// Note: `totalCacheReads` is only incremented from keepalive results (not real
     /// requests), so it serves as a proxy for "avoided cache writes" in the savings formula.
     func snapshot() -> Snapshot {

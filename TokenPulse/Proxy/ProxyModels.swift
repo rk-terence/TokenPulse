@@ -71,9 +71,11 @@ enum ProxyRequestState: Sendable {
     case sending
     /// Response headers received; body is streaming or being accumulated.
     case generating
+    /// Request completed — lingering in the UI until its removal deadline passes.
+    case done
 }
 
-/// Live snapshot of a single in-flight proxy request.
+/// Live snapshot of a single proxy request (in-flight or recently completed).
 struct ProxyRequestActivity: Sendable, Identifiable {
     let id: UUID
     var state: ProxyRequestState
@@ -84,6 +86,21 @@ struct ProxyRequestActivity: Sendable, Identifiable {
     /// Timestamp of the most recent upstream data chunk, used for freshness coloring.
     var lastDataAt: Date?
     let startedAt: Date
+    /// Token usage for this request, populated when state transitions to `.done`.
+    var tokenUsage: TokenUsage?
+    /// Estimated cost (USD) for this single request, populated when state transitions to `.done`.
+    var estimatedCost: Double?
+    /// Earliest date at which this `.done` request may be pruned from the active list.
+    var removeAfter: Date?
+
+    /// Total prompt tokens (input + cache read + cache creation) for display. Nil when unavailable.
+    var promptTokens: Int? {
+        guard let usage = tokenUsage else { return nil }
+        let total = (usage.inputTokens ?? 0)
+                  + (usage.cacheReadInputTokens ?? 0)
+                  + (usage.cacheCreationInputTokens ?? 0)
+        return total > 0 ? total : nil
+    }
 }
 
 // MARK: - Token usage

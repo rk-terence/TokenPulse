@@ -487,38 +487,39 @@ private struct ProxyStatusRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            // Header: running indicator + port
+            // Header: running indicator + port + total cost
             HStack {
                 Circle()
                     .fill(.green)
                     .frame(width: 8, height: 8)
                 Text(String(localized: "Proxy"))
                     .font(.body.weight(.medium))
+
+                if proxy.proxyStatus.totalEstimatedCostUSD > 0 {
+                    Text("$\(formatTotalCost(proxy.proxyStatus.totalEstimatedCostUSD))")
+                        .font(.body.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+
+                Button {
+                    Task { await proxy.resetCost() }
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                        .font(.callout)
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .help(String(localized: "Reset cost estimate"))
+
                 Spacer()
-                Text(":\(proxy.listeningPort)")
-                    .font(.body.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                ProxyMetricLabel(
+                    label: String(localized: "port"),
+                    value: "\(proxy.listeningPort)"
+                )
             }
 
-            if proxy.sessionActivities.isEmpty {
-                // No recent sessions yet — show aggregate counts only.
-                HStack(spacing: 12) {
-                    ProxyMetricLabel(
-                        label: String(localized: "fwd"),
-                        value: "\(proxy.proxyStatus.totalRequestsForwarded)"
-                    )
-                    if proxy.proxyStatus.activeKeepalives > 0 {
-                        ProxyMetricLabel(
-                            label: String(localized: "ka"),
-                            value: "\(proxy.proxyStatus.activeKeepalives)"
-                        )
-                    }
-                }
-            } else {
-                // Per-session rows.
-                ForEach(proxy.sessionActivities) { activity in
-                    SessionActivityRow(activity: activity)
-                }
+            ForEach(proxy.sessionActivities) { activity in
+                SessionActivityRow(activity: activity)
             }
 
             // Cache metrics + savings — only meaningful when keepalive is enabled.
@@ -541,6 +542,16 @@ private struct ProxyStatusRow: View {
                     }
                 }
             }
+        }
+    }
+
+    private func formatTotalCost(_ cost: Double) -> String {
+        if cost < 0.01 {
+            return String(format: "%.4f", cost)
+        } else if cost < 1 {
+            return String(format: "%.3f", cost)
+        } else {
+            return String(format: "%.2f", cost)
         }
     }
 }
@@ -626,16 +637,10 @@ private struct RequestActivityRow: View {
         HStack(spacing: 5) {
             switch request.state {
             case .sending:
-                Image(systemName: "arrow.right")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
                 if request.bytesSent > 0 {
-                    Text(formattedBytes(request.bytesSent))
+                    Text("\u{2191} \(formattedBytes(request.bytesSent))")
                         .font(.callout.monospacedDigit())
                         .foregroundStyle(.secondary)
-                    Text(String(localized: "sent"))
-                        .font(.callout)
-                        .foregroundStyle(.tertiary)
                 } else {
                     Text(String(localized: "sending"))
                         .font(.callout)
@@ -643,22 +648,40 @@ private struct RequestActivityRow: View {
                 }
 
             case .generating:
-                Circle()
-                    .fill(generatingColor)
-                    .frame(width: 6, height: 6)
-                Text(formattedBytes(request.bytesReceived))
+                Text("\u{2191} \(formattedBytes(request.bytesSent))")
                     .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
-                Text(String(localized: "received"))
-                    .font(.callout)
+                Text("\u{2193} \(formattedBytes(request.bytesReceived))")
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(isFresh ? .green : .secondary)
+
+            case .done:
+                Text("\u{2191} \(formattedBytes(request.bytesSent))")
+                    .font(.callout.monospacedDigit())
                     .foregroundStyle(.tertiary)
+                Text("\u{2193} \(formattedBytes(request.bytesReceived))")
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                if let promptK = request.promptTokens {
+                    Text(String(localized: "prompt"))
+                        .font(.callout)
+                        .foregroundStyle(.quaternary)
+                    Text(formattedTokenCount(promptK))
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+                if let cost = request.estimatedCost {
+                    Text("$\(formatCost(cost))")
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
             }
         }
     }
 
-    private var generatingColor: Color {
-        guard let lastDataAt = request.lastDataAt else { return .gray }
-        return Date().timeIntervalSince(lastDataAt) <= Self.freshnessInterval ? .green : .gray
+    private var isFresh: Bool {
+        guard let lastDataAt = request.lastDataAt else { return false }
+        return Date().timeIntervalSince(lastDataAt) <= Self.freshnessInterval
     }
 
     private func formattedBytes(_ bytes: Int) -> String {
@@ -666,6 +689,23 @@ private struct RequestActivityRow: View {
             return "\(bytes) B"
         } else {
             return String(format: "%.1f KB", Double(bytes) / 1024)
+        }
+    }
+
+    private func formattedTokenCount(_ tokens: Int) -> String {
+        if tokens >= 1000 {
+            return "\(tokens / 1000)K"
+        }
+        return "\(tokens)"
+    }
+
+    private func formatCost(_ cost: Double) -> String {
+        if cost < 0.01 {
+            return String(format: "%.4f", cost)
+        } else if cost < 1 {
+            return String(format: "%.3f", cost)
+        } else {
+            return String(format: "%.2f", cost)
         }
     }
 }
