@@ -267,32 +267,18 @@ actor KeepaliveManager {
                 urlRequest.httpMethod = "POST"
                 urlRequest.httpBody = keepaliveBody
                 let keepaliveStartedAt = Date()
-                var loggedHeaders: [(name: String, value: String)] = []
 
                 // Copy stored headers, skipping hop-by-hop.
                 for header in headers {
                     let lowered = header.name.lowercased()
                     if hopByHopHeaders.contains(lowered) { continue }
                     urlRequest.addValue(header.value, forHTTPHeaderField: header.name)
-                    loggedHeaders.append(header)
                 }
                 // Ensure content-type is set.
                 urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                if !loggedHeaders.contains(where: { $0.name.caseInsensitiveCompare("Content-Type") == .orderedSame }) {
-                    loggedHeaders.append((name: "Content-Type", value: "application/json"))
-                }
-
-                let requestLog = ProxyEventLogger.LoggedRequest(
-                    method: "POST",
-                    path: "/v1/messages",
-                    upstreamURL: urlString,
-                    headers: loggedHeaders,
-                    body: keepaliveBody,
-                    streaming: false
-                )
 
                 await metricsStore.recordKeepaliveSent()
-                await eventLogger?.logKeepaliveSent(session: sessionID, request: requestLog)
+                let keepaliveID = await eventLogger?.logKeepaliveSent(session: sessionID)
 
                 // 8. Send keepalive and process result.
                 do {
@@ -300,25 +286,22 @@ actor KeepaliveManager {
 
                     if let httpResponse = response as? HTTPURLResponse {
                         let statusCode = httpResponse.statusCode
-                        let responseLog = ProxyEventLogger.LoggedResponse(
-                            statusCode: statusCode,
-                            headers: ProxyHTTPUtils.allHeaders(from: httpResponse),
-                            body: data,
-                            source: "upstream"
-                        )
+                        let upstreamRequestID = ProxyHTTPUtils.allHeaders(from: httpResponse)
+                            .first(where: { $0.name.caseInsensitiveCompare("request-id") == .orderedSame
+                                || $0.name.caseInsensitiveCompare("x-request-id") == .orderedSame })?.value
 
                         // Handle auth failures -- permanently disable and stop keepalive.
                         if statusCode == 401 || statusCode == 403 {
                             ProxyLogger.log("Keepalive: auth failure (\(statusCode)) for session \(sessionID), stopping")
-                            await eventLogger?.logKeepaliveResult(
+                            await eventLogger?.logKeepaliveCompleted(
+                                keepaliveID: keepaliveID,
                                 session: sessionID,
                                 success: false,
-                                request: requestLog,
-                                response: responseLog,
+                                statusCode: statusCode,
                                 durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: keepaliveStartedAt),
-                                error: "auth failure",
-                                tokenUsage: .empty,
-                                statusCode: statusCode
+                                upstreamRequestID: upstreamRequestID,
+                                tokenUsage: TokenUsage.empty,
+                                error: "auth failure"
                             )
                             await recordFailure(
                                 sessionID: sessionID,
@@ -331,15 +314,15 @@ actor KeepaliveManager {
                         // Handle rate limiting and server errors -- count toward cumulative failures.
                         } else if statusCode == 429 || statusCode >= 500 {
                             ProxyLogger.log("Keepalive: status \(statusCode) for session \(sessionID), counting failure")
-                            await eventLogger?.logKeepaliveResult(
+                            await eventLogger?.logKeepaliveCompleted(
+                                keepaliveID: keepaliveID,
                                 session: sessionID,
                                 success: false,
-                                request: requestLog,
-                                response: responseLog,
+                                statusCode: statusCode,
                                 durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: keepaliveStartedAt),
-                                error: "upstream returned status \(statusCode)",
-                                tokenUsage: .empty,
-                                statusCode: statusCode
+                                upstreamRequestID: upstreamRequestID,
+                                tokenUsage: TokenUsage.empty,
+                                error: "upstream returned status \(statusCode)"
                             )
                             await recordFailure(
                                 sessionID: sessionID,
@@ -350,15 +333,15 @@ actor KeepaliveManager {
                         // Handle other non-success status codes.
                         } else if statusCode < 200 || statusCode >= 300 {
                             ProxyLogger.log("Keepalive: unexpected status \(statusCode) for session \(sessionID)")
-                            await eventLogger?.logKeepaliveResult(
+                            await eventLogger?.logKeepaliveCompleted(
+                                keepaliveID: keepaliveID,
                                 session: sessionID,
                                 success: false,
-                                request: requestLog,
-                                response: responseLog,
+                                statusCode: statusCode,
                                 durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: keepaliveStartedAt),
-                                error: "unexpected upstream status \(statusCode)",
-                                tokenUsage: .empty,
-                                statusCode: statusCode
+                                upstreamRequestID: upstreamRequestID,
+                                tokenUsage: TokenUsage.empty,
+                                error: "unexpected upstream status \(statusCode)"
                             )
                             await recordFailure(
                                 sessionID: sessionID,
@@ -388,15 +371,15 @@ actor KeepaliveManager {
                             let sessionModel = await sessionStore.session(for: sessionID)?.lastKnownModel
                             await sessionStore.recordTokenUsage(tokenUsage, model: sessionModel, for: sessionID)
 
-                            await eventLogger?.logKeepaliveResult(
+                            await eventLogger?.logKeepaliveCompleted(
+                                keepaliveID: keepaliveID,
                                 session: sessionID,
                                 success: true,
-                                request: requestLog,
-                                response: responseLog,
+                                statusCode: statusCode,
                                 durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: keepaliveStartedAt),
-                                error: nil,
+                                upstreamRequestID: upstreamRequestID,
                                 tokenUsage: tokenUsage,
-                                statusCode: statusCode
+                                error: nil
                             )
 
                             ProxyLogger.log("Keepalive: success for session \(sessionID) "
@@ -405,15 +388,15 @@ actor KeepaliveManager {
 
                     } else {
                         ProxyLogger.log("Keepalive: non-HTTP response for session \(sessionID)")
-                        await eventLogger?.logKeepaliveResult(
+                        await eventLogger?.logKeepaliveCompleted(
+                            keepaliveID: keepaliveID,
                             session: sessionID,
                             success: false,
-                            request: requestLog,
-                            response: nil,
+                            statusCode: nil,
                             durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: keepaliveStartedAt),
-                            error: "non-HTTP response from upstream",
-                            tokenUsage: .empty,
-                            statusCode: nil
+                            upstreamRequestID: nil,
+                            tokenUsage: TokenUsage.empty,
+                            error: "non-HTTP response from upstream"
                         )
                         await recordFailure(
                             sessionID: sessionID,
@@ -426,15 +409,15 @@ actor KeepaliveManager {
                     break
                 } catch {
                     ProxyLogger.log("Keepalive: network error for session \(sessionID): \(error.localizedDescription)")
-                    await eventLogger?.logKeepaliveResult(
+                    await eventLogger?.logKeepaliveCompleted(
+                        keepaliveID: keepaliveID,
                         session: sessionID,
                         success: false,
-                        request: requestLog,
-                        response: nil,
+                        statusCode: nil,
                         durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: keepaliveStartedAt),
-                        error: error.localizedDescription,
-                        tokenUsage: .empty,
-                        statusCode: nil
+                        upstreamRequestID: nil,
+                        tokenUsage: TokenUsage.empty,
+                        error: error.localizedDescription
                     )
                     await recordFailure(
                         sessionID: sessionID,

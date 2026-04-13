@@ -233,23 +233,49 @@ actor ProxySessionStore {
     func startRequest(id: UUID, sessionID: String) {
         let activity = ProxyRequestActivity(
             id: id,
-            state: .sending,
+            state: .uploading,
             bytesSent: 0,
             bytesReceived: 0,
             lastDataAt: nil,
-            startedAt: Date()
+            startedAt: Date(),
+            receivingStartedAt: nil,
+            firstDataAt: nil,
+            completedAt: nil
         )
         activeRequests[id] = (sessionID: sessionID, activity: activity)
         onTraffic?()
     }
 
-    /// Transition a request from `.sending` to `.generating` once headers are received.
-    func markRequestGenerating(id: UUID) {
+    /// Transition a request from `.uploading` to `.waiting` once the upload is complete.
+    func markRequestWaiting(id: UUID) {
         guard var entry = activeRequests[id] else { return }
-        entry.activity.state = .generating
+        guard entry.activity.state == .uploading else { return }  // Only advance from .uploading
+        entry.activity.state = .waiting
         entry.activity.lastDataAt = Date()
         activeRequests[id] = entry
         onTraffic?()
+    }
+
+    /// Transition a request from `.uploading` or `.waiting` to `.receiving` once response headers arrive.
+    func markRequestReceiving(id: UUID) {
+        guard var entry = activeRequests[id] else { return }
+        guard entry.activity.state == .uploading || entry.activity.state == .waiting else { return }  // Only advance from .uploading or .waiting
+        entry.activity.state = .receiving
+        entry.activity.lastDataAt = Date()
+        entry.activity.receivingStartedAt = Date()
+        activeRequests[id] = entry
+        onTraffic?()
+    }
+
+    /// Record the timestamp of the first upstream data chunk (once per request).
+    /// This is more accurate than `receivingStartedAt` for TTFT measurement on
+    /// streaming responses where headers may arrive before the first token.
+    func markFirstDataReceived(id: UUID) {
+        guard var entry = activeRequests[id] else { return }
+        guard entry.activity.firstDataAt == nil else { return }  // Only record the first chunk
+        entry.activity.firstDataAt = Date()
+        activeRequests[id] = entry
+        // No onTraffic call — updateRequestBytes follows immediately and handles that.
     }
 
     /// Update the cumulative bytes sent to upstream for a request.
@@ -286,6 +312,7 @@ actor ProxySessionStore {
     func markRequestDone(id: UUID, errored: Bool, tokenUsage: TokenUsage?, estimatedCost: Double?) {
         guard var entry = activeRequests[id] else { return }
         entry.activity.state = .done
+        entry.activity.completedAt = Date()
         entry.activity.removeAfter = Date().addingTimeInterval(6)
         entry.activity.tokenUsage = tokenUsage
         entry.activity.estimatedCost = estimatedCost

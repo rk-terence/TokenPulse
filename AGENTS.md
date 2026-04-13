@@ -40,7 +40,6 @@ Use conventional commit format: `type: short description` (e.g. `feat: add proxy
 - Proxy listens on `127.0.0.1` only (IPv4 loopback) — never bind all interfaces
 - Max 5 concurrent keepalive loops; max 5 cumulative failures before auto-disable per session
 - Event log uses SQLite with WAL mode; 24-hour retention with 5-minute prune sweeps
-- Payload capture directory (`~/.tokenpulse/proxy_payloads/`) uses 24-hour retention with hourly cleanup
 - Status snapshots (`~/.tokenpulse/proxy_status.json`) throttled to 1-second minimum interval
 
 ## Architecture quick ref
@@ -66,8 +65,7 @@ TokenPulse/
 │   ├── AnthropicForwarder.swift    # Forwards requests to upstream, streaming support
 │   ├── KeepaliveManager.swift      # Per-session cache-warming keepalive loops
 │   ├── ProxySessionStore.swift     # Session state, byte counters, traffic callbacks
-│   ├── ProxyEventLogger.swift      # SQLite event persistence + status snapshots
-│   ├── ProxyPayloadCapture.swift   # Optional gzip-compressed payload archival
+│   ├── ProxyEventLogger.swift      # SQLite event persistence (proxy_requests/keepalives/lifecycle tables) + status snapshots
 │   ├── ProxyMetricsStore.swift     # Aggregated counters and savings estimate
 │   └── ProxyModels.swift           # Shared data types (request, activity, utils)
 ├── Views/                      # SwiftUI: PopoverView, SettingsView

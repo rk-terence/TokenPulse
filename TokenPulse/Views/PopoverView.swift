@@ -649,55 +649,125 @@ private struct SessionActivityRow: View {
 private struct RequestActivityRow: View {
     let request: ProxyRequestActivity
 
-    /// A request is considered "fresh" if upstream data arrived within this window.
-    private static let freshnessInterval: TimeInterval = 10
-
     var body: some View {
         HStack(spacing: 5) {
-            switch request.state {
-            case .sending:
-                if request.bytesSent > 0 {
-                    Text("\u{2191} \(formattedBytes(request.bytesSent))")
-                        .font(.callout.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(String(localized: "sending"))
-                        .font(.callout)
-                        .foregroundStyle(.tertiary)
-                }
+            leftStats
+            Spacer()
+            Text(request.startedAt, style: .relative)
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.tertiary)
+                .contentTransition(.numericText())
+                .animation(nil, value: request.startedAt)
+        }
+    }
 
-            case .generating:
-                Text("\u{2191} \(formattedBytes(request.bytesSent))")
+    @ViewBuilder
+    private var leftStats: some View {
+        switch request.state {
+        case .uploading:
+            if request.bytesSent > 0 {
+                Text("\u{2191}")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                Text(formattedBytes(request.bytesSent))
                     .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
-                Text("\u{2193} \(formattedBytes(request.bytesReceived))")
-                    .font(.callout.monospacedDigit())
-                    .foregroundStyle(isFresh ? .green : .secondary)
+                    .italic()
+            } else {
+                Text(String(localized: "sending"))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .italic()
+            }
 
-            case .done:
-                if let promptK = request.promptTokens {
-                    Text("\u{2191} \(formattedTokenCount(promptK))")
-                        .font(.callout.monospacedDigit())
-                        .foregroundStyle(.tertiary)
-                }
-                if let outputK = request.tokenUsage?.outputTokens, outputK > 0 {
-                    Text("\u{2193} \(formattedTokenCount(outputK))")
-                        .font(.callout.monospacedDigit())
-                        .foregroundStyle(.tertiary)
-                }
-                if let cost = request.estimatedCost {
-                    Text("$\(formatCost(cost))")
-                        .font(.callout.monospacedDigit())
-                        .foregroundStyle(.tertiary)
-                }
+        case .waiting:
+            Text("\u{2191}")
+                .font(.callout)
+                .foregroundStyle(.tertiary)
+            Text(formattedBytes(request.bytesSent))
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.tertiary)
+            Text(String(localized: "waiting\u{2026}"))
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .italic()
+
+        case .receiving:
+            // upload bytes, italic download bytes, and TTFT duration
+            Text("\u{2191}")
+                .font(.callout)
+                .foregroundStyle(.tertiary)
+            Text(formattedBytes(request.bytesSent))
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.tertiary)
+            Text("\u{2193}")
+                .font(.callout)
+                .foregroundStyle(.tertiary)
+            Text(formattedBytes(request.bytesReceived))
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .italic()
+            if let ttft = timeToFirstToken {
+                Text("ttft")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                Text(formattedDuration(ttft))
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+        case .done:
+            if let promptK = request.promptTokens {
+                Text("\u{2191}")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                Text(formattedTokenCount(promptK))
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            if let outputK = request.tokenUsage?.outputTokens, outputK > 0 {
+                Text("\u{2193}")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                Text(formattedTokenCount(outputK))
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            if let e2e = endToEndDuration {
+                Text("e2e")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                Text(formattedDuration(e2e))
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            if let cost = request.estimatedCost {
+                Text("$")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                Text(formatCost(cost))
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
             }
         }
     }
 
-    private var isFresh: Bool {
-        guard let lastDataAt = request.lastDataAt else { return false }
-        return Date().timeIntervalSince(lastDataAt) <= Self.freshnessInterval
+    // MARK: - Computed timing
+
+    /// Time from request start to the first upstream data chunk.
+    /// Falls back to `receivingStartedAt` (headers) for non-streaming responses.
+    private var timeToFirstToken: TimeInterval? {
+        guard let dataAt = request.firstDataAt ?? request.receivingStartedAt else { return nil }
+        return dataAt.timeIntervalSince(request.startedAt)
     }
+
+    /// Total request duration from start to completion.
+    private var endToEndDuration: TimeInterval? {
+        guard let completedAt = request.completedAt else { return nil }
+        return completedAt.timeIntervalSince(request.startedAt)
+    }
+
+    // MARK: - Formatting
 
     private func formattedBytes(_ bytes: Int) -> String {
         if bytes < 1024 {
@@ -712,6 +782,14 @@ private struct RequestActivityRow: View {
             return "\(tokens / 1000)K"
         }
         return "\(tokens)"
+    }
+
+    private func formattedDuration(_ seconds: TimeInterval) -> String {
+        if seconds < 10 {
+            return String(format: "%.1fs", seconds)
+        } else {
+            return "\(Int(seconds))s"
+        }
     }
 
     private func formatCost(_ cost: Double) -> String {

@@ -323,14 +323,14 @@ private struct ProxyTab: View {
 
                     Toggle(String(localized: "Save event log"), isOn: $config.saveProxyEventLog)
                     if config.saveProxyEventLog {
-                        Text(String(localized: "Saves proxy metadata to ~/.tokenpulse/proxy_events.sqlite, including request timing, status, cache metrics, and upstream request IDs. Prompt and response content are excluded unless Capture all content is enabled. Restart the proxy to apply."))
+                        Text(String(localized: "Saves proxy metadata to ~/.tokenpulse/proxy_events.sqlite (proxy_requests, proxy_keepalives, proxy_lifecycle tables), including request timing, status, cache metrics, and upstream request IDs. Prompt and response content are excluded unless Capture all content is enabled. Restart the proxy to apply."))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
 
                     Toggle(String(localized: "Capture all content"), isOn: $config.saveProxyPayloads)
                     if config.saveProxyPayloads {
-                        Text(String(localized: "Saves full proxy request and response headers and bodies to the proxy_event_content table in ~/.tokenpulse/proxy_events.sqlite, linked to per-request event rows. These records contain your prompts, conversation content, and model outputs. Restart the proxy to apply."))
+                        Text(String(localized: "Saves full proxy request and response headers and bodies to the proxy_request_content table in ~/.tokenpulse/proxy_events.sqlite, linked to per-request rows. These records contain your prompts, conversation content, and model outputs. Restart the proxy to apply."))
                             .font(.caption)
                             .foregroundStyle(.orange)
                     }

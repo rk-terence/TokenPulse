@@ -67,10 +67,12 @@ enum KeepaliveRequestBuilder {
 
 /// The state of an in-flight proxy request as seen by the UI.
 enum ProxyRequestState: Sendable {
-    /// Awaiting the first response byte — headers not yet received from upstream.
-    case sending
+    /// Request body is being sent to the upstream server.
+    case uploading
+    /// Upload complete; awaiting response headers from upstream.
+    case waiting
     /// Response headers received; body is streaming or being accumulated.
-    case generating
+    case receiving
     /// Request completed — lingering in the UI until its removal deadline passes.
     case done
 }
@@ -86,6 +88,13 @@ struct ProxyRequestActivity: Sendable, Identifiable {
     /// Timestamp of the most recent upstream data chunk, used for freshness coloring.
     var lastDataAt: Date?
     let startedAt: Date
+    /// Timestamp when the request transitioned to `.receiving` (response headers arrived).
+    var receivingStartedAt: Date?
+    /// Timestamp of the first upstream data chunk. Used for TTFT — more accurate than
+    /// `receivingStartedAt` for streaming responses where headers arrive before data.
+    var firstDataAt: Date?
+    /// Timestamp when the request completed (transitioned to `.done`). Used for E2E duration.
+    var completedAt: Date?
     /// Token usage for this request, populated when state transitions to `.done`.
     var tokenUsage: TokenUsage?
     /// Estimated cost (USD) for this single request, populated when state transitions to `.done`.
