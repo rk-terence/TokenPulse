@@ -1,8 +1,11 @@
-# Slash Animation
+---
+title: Slash Animation
+description: State machine, timing, and rendering details for the menu bar slash traffic animation.
+---
 
 The diagonal slash between the 5-hour and weekly utilization numbers in the menu bar icon doubles as a traffic indicator. When the local proxy forwards a request, the slash morphs from a static gray line into a glowing orange segment that bounces back and forth, then settles back to gray when traffic stops.
 
-## State machine
+# State machine
 
 The animation is driven by a five-state machine in `StatusBarController`:
 
@@ -30,7 +33,7 @@ stopping ◄──────────── bouncing ◄─┐
 
 A traffic event arriving mid-animation re-triggers appropriately: during `bouncing` it resets the countdown, during `waitingForCenter` it jumps back to `bouncing`, during `stopping` it reverses to `starting`.
 
-## SlashAnimation struct
+# SlashAnimation struct
 
 Passed from `StatusBarController` to `BarIconRenderer.drawSlash()` each frame:
 
@@ -44,7 +47,7 @@ struct SlashAnimation {
 
 `phase` is converted to a ping-pong value in [0, 1] via `raw <= 1 ? raw : 2 - raw`, so 0 -> 1 -> 0 maps to one full back-and-forth cycle.
 
-## Timing
+# Timing
 
 All values tuned for 30 fps (timer interval = 1/30s):
 
@@ -55,7 +58,7 @@ All values tuned for 30 fps (timer interval = 1/30s):
 | `bounceDuration` | 2.0s | Bounce countdown before coasting to center |
 | `centerEpsilon` | 0.05 | Snap-to-center threshold |
 
-## Rendering
+# Rendering
 
 The slash runs from upper-right to lower-left between the two number cells.
 
@@ -80,7 +83,7 @@ When `transition = 0` (idle), the full slash is drawn. When `transition = 1` (ac
 
 The core line narrows from 1.5pt (idle) to 1.0pt (active) as the glow takes over.
 
-## Key files
+# Key files
 
 - `Rendering/BarIconRenderer.swift` — `SlashFlow`, `SlashAnimation`, `drawSlash()`, color blending
 - `App/StatusBarController.swift` — `AnimationState` enum, 30fps timer, `trafficEventReceived()`, `onAnimationTick()`

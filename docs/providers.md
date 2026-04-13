@@ -1,8 +1,11 @@
-# Provider specifications
+---
+title: Provider Specifications
+description: Authentication flows, endpoints, observed response shapes, and known issues for the Codex, Claude, and ZenMux usage providers.
+---
 
-## Codex subscription provider
+# Codex subscription provider
 
-### Authentication
+## Authentication
 
 TokenPulse reads the local Codex CLI auth file:
 
@@ -31,7 +34,7 @@ Notes:
 - If the file is missing, unreadable, in API key mode, or missing token data, the provider is treated as unconfigured/auth-stale
 - A future enhancement is to replicate Codex CLI token refresh against `https://auth.openai.com/oauth/token`
 
-### API endpoint
+## API endpoint
 
 ```
 GET https://chatgpt.com/backend-api/wham/usage
@@ -43,7 +46,7 @@ Headers:
   User-Agent: TokenPulse/1.0
 ```
 
-### Response
+## Response
 
 Observed response family:
 
@@ -71,16 +74,16 @@ Field notes:
 - `reset_after_seconds` is converted to an absolute reset date relative to fetch time
 - `plan_type` is surfaced in the popover as a tag when present
 
-### Known issues
+## Known issues
 
 - This is not a public API surface; response fields may drift without notice
 - TokenPulse does not currently refresh expired Codex tokens itself
 
 ---
 
-## Claude subscription provider
+# Claude subscription provider
 
-### Authentication
+## Authentication
 
 1. Read Keychain item: service = `"Claude Code-credentials"`, using `SecItemCopyMatching`
 2. Parse JSON → extract `claudeAiOauth.accessToken` (prefix: `sk-ant-oat01-`)
@@ -110,7 +113,7 @@ Credential JSON structure:
 }
 ```
 
-### API endpoint
+## API endpoint
 
 ```
 GET https://api.anthropic.com/api/oauth/usage
@@ -122,7 +125,7 @@ Headers:
   Content-Type: application/json
 ```
 
-### Response
+## Response
 
 ```json
 {
@@ -141,11 +144,11 @@ Headers:
 }
 ```
 
-### Rate limiting
+## Rate limiting
 
 The `/api/oauth/usage` endpoint itself has rate limits. Minimum poll interval: 60 seconds. A possible strategy for handling 429 responses is exponential backoff with jitter (e.g. base 60s, max 300s).
 
-### Known issues
+## Known issues
 
 - Endpoint sometimes returns persistent 429 even at reasonable intervals (see anthropics/claude-code#30930)
 - Anthropic is restricting third-party OAuth usage — monitor for policy changes
@@ -153,9 +156,9 @@ The `/api/oauth/usage` endpoint itself has rate limits. Minimum poll interval: 6
 
 ---
 
-## ZenMux provider
+# ZenMux provider
 
-### Authentication
+## Authentication
 
 Two authentication methods are used:
 
@@ -163,9 +166,9 @@ Two authentication methods are used:
 
 2. **Chrome session cookies** (supplementary) — extracted automatically from Chrome's encrypted cookie store via `ChromeCookieService`. Requires `ctoken`, `sessionId`, and `sessionId.sig` cookies for `zenmux.ai`. Used for the subscription summary endpoint which has no management API equivalent.
 
-### Endpoints
+## Endpoints
 
-#### 1. Subscription detail (Management API) — primary
+### 1. Subscription detail (Management API) — primary
 
 Official documented endpoint. Provides 5h/7d real-time usage and monthly caps.
 
@@ -227,7 +230,7 @@ Field notes:
 - `account_status`: `"healthy"`, `"monitored"`, `"abusive"`, `"suspended"`, or `"banned"`
 - `plan.expires_at`: End of current billing cycle; used as monthly quota reset date
 
-#### 2. Subscription summary (Cookie API) — supplementary
+### 2. Subscription summary (Cookie API) — supplementary
 
 Discovered via Chrome DevTools inspection. Provides current billing cycle cost breakdown. Used to derive monthly utilization since the management API's `quota_monthly` lacks usage data.
 
@@ -264,7 +267,7 @@ Field notes:
 - Date query parameters (`startDate`, `endDate`) are accepted but **ignored** — the endpoint always returns data for the current billing cycle
 - **Unverified assumption**: data resets at billing cycle boundary. To be confirmed after 2026-04-20
 
-#### 3. Current usage (Cookie API) — not used
+### 3. Current usage (Cookie API) — not used
 
 Legacy endpoint used in earlier versions of TokenPulse. Provides 5h and 7d window usage via cookies. Superseded by the management API which provides the same data with simpler authentication.
 
@@ -312,7 +315,7 @@ Field notes:
 - Only `hour_5` and `week` period types are returned — **no monthly period**
 - `ext.gammaRate` on the `week` entry may relate to rate limiting weights
 
-#### 4. Current subscription (Cookie API) — not used
+### 4. Current subscription (Cookie API) — not used
 
 Plan metadata endpoint. All information is available through the management API.
 
@@ -356,6 +359,6 @@ Field notes:
 - `period_quota`: Same as `quota_5_hour.max_flows` in management API
 - Redundant with management API `plan.*` fields plus `quota_*.max_flows` fields
 
-### Rate limiting
+## Rate limiting
 
 Independent rate limit per endpoint; exceeding returns HTTP `422`. No specific minimum interval documented.
