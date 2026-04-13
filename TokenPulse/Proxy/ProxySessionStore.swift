@@ -37,6 +37,7 @@ actor ProxySessionStore {
         let erroredRequestCount: Int
         let keepaliveTotalCount: Int
         let activeRequests: [ProxyRequestActivity]
+        let doneRequests: [ProxyRequestActivity]
         let totalInputTokens: Int
         let totalOutputTokens: Int
         let totalCacheReadInputTokens: Int
@@ -47,6 +48,8 @@ actor ProxySessionStore {
     private var sessions: [String: Session] = [:]
     /// In-flight requests keyed by their UUID, with the owning session ID stored alongside.
     private var activeRequests: [UUID: (sessionID: String, activity: ProxyRequestActivity)] = [:]
+    /// Recently completed requests shown in the session's done section.
+    private var doneRequestsBySession: [String: [ProxyRequestActivity]] = [:]
 
     // Byte counters for throughput and one-shot upload display.
     private var totalBytesReceived: Int = 0
@@ -230,17 +233,21 @@ actor ProxySessionStore {
     // MARK: - Request activity tracking
 
     /// Register a new in-flight request. Call immediately before starting the upstream fetch.
-    func startRequest(id: UUID, sessionID: String) {
+    func startRequest(id: UUID, sessionID: String, model: String?, promptDescriptor: String?) {
         let activity = ProxyRequestActivity(
             id: id,
             state: .uploading,
+            modelID: model,
+            promptDescriptor: promptDescriptor,
             bytesSent: 0,
             bytesReceived: 0,
             lastDataAt: nil,
             startedAt: Date(),
             receivingStartedAt: nil,
             firstDataAt: nil,
-            completedAt: nil
+            completedAt: nil,
+            tokenUsage: nil,
+            estimatedCost: nil
         )
         activeRequests[id] = (sessionID: sessionID, activity: activity)
         onTraffic?()
@@ -307,16 +314,17 @@ actor ProxySessionStore {
     /// Cumulative bytes received since the actor was created. Used for KB/s computation.
     func cumulativeBytesReceived() -> Int { totalBytesReceived }
 
-    /// Transition a request to `.done` with optional token/cost data, and stamp a removal deadline.
-    /// The request stays in the active set until pruned by `snapshotSessionActivities`.
+    /// Transition a request to `.done`, move it into the session's done section,
+    /// and replace one older done request when the new prompt contains it.
     func markRequestDone(id: UUID, errored: Bool, tokenUsage: TokenUsage?, estimatedCost: Double?) {
-        guard var entry = activeRequests[id] else { return }
+        guard var entry = activeRequests.removeValue(forKey: id) else { return }
+        let completedAt = Date()
         entry.activity.state = .done
-        entry.activity.completedAt = Date()
-        entry.activity.removeAfter = Date().addingTimeInterval(6)
+        entry.activity.completedAt = completedAt
         entry.activity.tokenUsage = tokenUsage
         entry.activity.estimatedCost = estimatedCost
-        activeRequests[id] = entry
+
+        insertDoneRequest(entry.activity, for: entry.sessionID)
 
         if var session = sessions[entry.sessionID] {
             if errored {
@@ -330,25 +338,11 @@ actor ProxySessionStore {
     }
 
     /// Return a snapshot of all sessions with their stats and in-flight requests,
-    /// sorted by most-recently-seen first. Prunes done requests whose deadline has passed.
+    /// sorted by most-recently-seen first.
     func snapshotSessionActivities() -> [SessionSnapshot] {
-        // Prune done requests whose removal deadline has passed.
-        let now = Date()
-        let expiredIDs = activeRequests.filter { (_, entry) in
-            if case .done = entry.activity.state,
-               let removeAfter = entry.activity.removeAfter,
-               removeAfter <= now {
-                return true
-            }
-            return false
-        }.map(\.key)
-        for id in expiredIDs {
-            activeRequests.removeValue(forKey: id)
-        }
-
-        var requestsBySession: [String: [ProxyRequestActivity]] = [:]
+        var activeRequestsBySession: [String: [ProxyRequestActivity]] = [:]
         for (_, entry) in activeRequests {
-            requestsBySession[entry.sessionID, default: []].append(entry.activity)
+            activeRequestsBySession[entry.sessionID, default: []].append(entry.activity)
         }
         return sessions.values.map { session in
             SessionSnapshot(
@@ -358,7 +352,8 @@ actor ProxySessionStore {
                 completedRequestCount: session.completedRequestCount,
                 erroredRequestCount: session.erroredRequestCount,
                 keepaliveTotalCount: session.keepaliveSuccessCount + session.keepaliveFailureCount,
-                activeRequests: requestsBySession[session.sessionID] ?? [],
+                activeRequests: activeRequestsBySession[session.sessionID] ?? [],
+                doneRequests: doneRequestsBySession[session.sessionID] ?? [],
                 totalInputTokens: session.totalInputTokens,
                 totalOutputTokens: session.totalOutputTokens,
                 totalCacheReadInputTokens: session.totalCacheReadInputTokens,
@@ -385,7 +380,46 @@ actor ProxySessionStore {
         }
         for id in expired {
             sessions.removeValue(forKey: id)
+            doneRequestsBySession.removeValue(forKey: id)
         }
         return expired
+    }
+
+    private func insertDoneRequest(_ activity: ProxyRequestActivity, for sessionID: String) {
+        var doneRequests = doneRequestsBySession[sessionID] ?? []
+        if let replacementIndex = replacementIndex(for: activity, in: doneRequests) {
+            doneRequests.remove(at: replacementIndex)
+        }
+        doneRequests.append(activity)
+        doneRequestsBySession[sessionID] = doneRequests
+    }
+
+    private func replacementIndex(
+        for newActivity: ProxyRequestActivity,
+        in doneRequests: [ProxyRequestActivity]
+    ) -> Int? {
+        guard let newPrompt = newActivity.promptDescriptor, !newPrompt.isEmpty else {
+            return nil
+        }
+
+        return doneRequests.enumerated()
+            .filter { _, oldActivity in
+                guard oldActivity.modelID == newActivity.modelID,
+                      let oldPrompt = oldActivity.promptDescriptor,
+                      !oldPrompt.isEmpty else {
+                    return false
+                }
+                return newPrompt.contains(oldPrompt)
+            }
+            .max { lhs, rhs in
+                let lhsLength = lhs.element.promptDescriptor?.count ?? 0
+                let rhsLength = rhs.element.promptDescriptor?.count ?? 0
+                if lhsLength == rhsLength {
+                    return (lhs.element.completedAt ?? lhs.element.startedAt)
+                        < (rhs.element.completedAt ?? rhs.element.startedAt)
+                }
+                return lhsLength < rhsLength
+            }?
+            .offset
     }
 }

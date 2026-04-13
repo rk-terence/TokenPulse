@@ -596,6 +596,16 @@ private struct SessionActivityRow: View {
                 RequestActivityRow(request: request)
                     .padding(.leading, 10)
             }
+
+            if !activity.doneRequests.isEmpty {
+                Divider()
+                    .padding(.leading, 10)
+
+                ForEach(activity.doneRequests) { request in
+                    RequestActivityRow(request: request)
+                        .padding(.leading, 10)
+                }
+            }
         }
     }
 
@@ -651,6 +661,13 @@ private struct RequestActivityRow: View {
 
     var body: some View {
         HStack(spacing: 5) {
+            if let modelName = compactModelName {
+                Text(modelName)
+                    .font(.callout.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
             leftStats
             Spacer()
             Text(request.startedAt, style: .relative)
@@ -765,6 +782,68 @@ private struct RequestActivityRow: View {
     private var endToEndDuration: TimeInterval? {
         guard let completedAt = request.completedAt else { return nil }
         return completedAt.timeIntervalSince(request.startedAt)
+    }
+
+    private var compactModelName: String? {
+        guard let rawModelID = request.modelID?
+            .replacingOccurrences(of: #"\s*\([^)]*\)"#, with: "", options: .regularExpression)
+            .split(separator: "/")
+            .last
+            .map(String.init)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawModelID.isEmpty else {
+            return nil
+        }
+
+        let modelID = rawModelID
+            .replacingOccurrences(of: #"[-_@.]20\d{6}$"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"[-_@.]20\d{2}[-_]\d{2}[-_]\d{2}$"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"[-_@.]v?\d{8}$"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-_.@"))
+
+        let normalized = modelID.lowercased()
+
+        if normalized.contains("sonnet") {
+            return "Sonnet"
+        }
+        if normalized.contains("opus") {
+            return "Opus"
+        }
+        if normalized.contains("haiku") {
+            return "Haiku"
+        }
+        if normalized.contains("gpt-5.4") {
+            return "GPT-5.4"
+        }
+        if normalized.contains("gpt-5.3") {
+            return "GPT-5.3"
+        }
+        if normalized.contains("gpt-5.2") {
+            return "GPT-5.2"
+        }
+        if normalized.contains("gpt-5.1") {
+            return "GPT-5.1"
+        }
+        if normalized.contains("gpt-5") {
+            return "GPT-5"
+        }
+        if normalized.contains("gpt-4.1") {
+            return "GPT-4.1"
+        }
+        if normalized.contains("gpt-4o") {
+            return "GPT-4o"
+        }
+        if normalized.contains("o4-mini") {
+            return "o4-mini"
+        }
+        if normalized.contains("o3") {
+            return "o3"
+        }
+        if normalized.contains("o1") {
+            return "o1"
+        }
+
+        return modelID.isEmpty ? rawModelID : modelID
     }
 
     // MARK: - Formatting

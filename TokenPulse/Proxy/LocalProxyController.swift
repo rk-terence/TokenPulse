@@ -16,6 +16,7 @@ final class LocalProxyController {
         let erroredRequests: Int
         let keepaliveRequests: Int
         let activeRequests: [ProxyRequestActivity]
+        let doneRequests: [ProxyRequestActivity]
         let totalInputTokens: Int
         let totalOutputTokens: Int
         let totalCacheReadInputTokens: Int
@@ -317,7 +318,11 @@ final class LocalProxyController {
             let recentCutoff = now.addingTimeInterval(-600)
 
             let activities = activitySnapshots
-                .filter { max($0.lastSeenAt, $0.lastKeepaliveAt ?? .distantPast) >= recentCutoff || !$0.activeRequests.isEmpty }
+                .filter {
+                    max($0.lastSeenAt, $0.lastKeepaliveAt ?? .distantPast) >= recentCutoff
+                        || !$0.activeRequests.isEmpty
+                        || !$0.doneRequests.isEmpty
+                }
                 .map { snap in
                     SessionActivity(
                         sessionID: snap.sessionID,
@@ -325,6 +330,9 @@ final class LocalProxyController {
                         erroredRequests: snap.erroredRequestCount,
                         keepaliveRequests: snap.keepaliveTotalCount,
                         activeRequests: snap.activeRequests.sorted { $0.startedAt > $1.startedAt },
+                        doneRequests: snap.doneRequests.sorted {
+                            ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt)
+                        },
                         totalInputTokens: snap.totalInputTokens,
                         totalOutputTokens: snap.totalOutputTokens,
                         totalCacheReadInputTokens: snap.totalCacheReadInputTokens,
@@ -406,7 +414,11 @@ final class LocalProxyController {
                 // Keep sessions visible while recent real traffic or keepalive activity exists.
                 let recentCutoff = now.addingTimeInterval(-600)
                 let activities = activitySnapshots
-                    .filter { max($0.lastSeenAt, $0.lastKeepaliveAt ?? .distantPast) >= recentCutoff || !$0.activeRequests.isEmpty }
+                    .filter {
+                        max($0.lastSeenAt, $0.lastKeepaliveAt ?? .distantPast) >= recentCutoff
+                            || !$0.activeRequests.isEmpty
+                            || !$0.doneRequests.isEmpty
+                    }
                     .map { snap in
                         SessionActivity(
                             sessionID: snap.sessionID,
@@ -415,6 +427,8 @@ final class LocalProxyController {
                             keepaliveRequests: snap.keepaliveTotalCount,
                             activeRequests: snap.activeRequests
                                 .sorted { $0.startedAt > $1.startedAt },
+                            doneRequests: snap.doneRequests
+                                .sorted { ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt) },
                             totalInputTokens: snap.totalInputTokens,
                             totalOutputTokens: snap.totalOutputTokens,
                             totalCacheReadInputTokens: snap.totalCacheReadInputTokens,

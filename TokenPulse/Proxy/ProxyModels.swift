@@ -10,10 +10,187 @@ enum ProxyRequestBody {
     /// Attempts to read the `stream` field from a JSON body without
     /// deserializing the entire payload.
     static func isStreaming(from body: Data) -> Bool {
-        guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+        guard let json = jsonObject(from: body) else {
             return false
         }
         return (json["stream"] as? Bool) ?? false
+    }
+
+    /// Extract the model ID from a request body.
+    static func model(from body: Data) -> String? {
+        jsonObject(from: body)?["model"] as? String
+    }
+
+    /// Build a stable prompt descriptor used for completed-request replacement.
+    /// We include the Anthropic prompt-shaping fields and preserve message order
+    /// so a later superset prompt contains the earlier prompt as a substring.
+    static func promptDescriptor(from body: Data) -> String? {
+        guard let json = jsonObject(from: body) else {
+            return nil
+        }
+
+        var lines: [String] = []
+        appendCanonicalLine(label: "system", value: normalizedValue(normalizedSystemPrompt(json["system"])), to: &lines)
+        appendCanonicalLine(label: "tools", value: normalizedValue(json["tools"]), to: &lines)
+        appendCanonicalLine(label: "tool_choice", value: normalizedValue(json["tool_choice"]), to: &lines)
+        appendCanonicalLine(label: "thinking", value: normalizedValue(json["thinking"]), to: &lines)
+
+        if let messages = json["messages"] as? [Any] {
+            for message in messages {
+                appendCanonicalLine(label: "message", value: normalizedValue(message), to: &lines)
+            }
+        }
+
+        guard !lines.isEmpty else {
+            return nil
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func jsonObject(from body: Data) -> [String: Any]? {
+        guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+            return nil
+        }
+        return json
+    }
+
+    private static func appendCanonicalLine(label: String, value: Any?, to lines: inout [String]) {
+        guard let value, let canonical = canonicalString(for: value) else {
+            return
+        }
+        lines.append("\(label):\(canonical)")
+    }
+
+    private static func canonicalString(for value: Any) -> String? {
+        switch value {
+        case let string as String:
+            return "\"\(escapeJSONString(string))\""
+        case let number as NSNumber:
+            if CFGetTypeID(number) == CFBooleanGetTypeID() {
+                return number.boolValue ? "true" : "false"
+            }
+            return number.stringValue
+        case _ as NSNull:
+            return "null"
+        case let array as [Any]:
+            let items = array.compactMap { canonicalString(for: $0) }
+            return "[\(items.joined(separator: ","))]"
+        case let dictionary as [String: Any]:
+            let entries = dictionary.keys.sorted().compactMap { key -> String? in
+                guard let rawValue = dictionary[key],
+                      let canonicalValue = canonicalString(for: rawValue) else {
+                    return nil
+                }
+                return "\"\(escapeJSONString(key))\":\(canonicalValue)"
+            }
+            return "{\(entries.joined(separator: ","))}"
+        default:
+            return nil
+        }
+    }
+
+    private static func escapeJSONString(_ string: String) -> String {
+        var escaped = ""
+        escaped.reserveCapacity(string.count)
+        for scalar in string.unicodeScalars {
+            switch scalar {
+            case "\"":
+                escaped.append("\\\"")
+            case "\\":
+                escaped.append("\\\\")
+            case "\n":
+                escaped.append("\\n")
+            case "\r":
+                escaped.append("\\r")
+            case "\t":
+                escaped.append("\\t")
+            default:
+                escaped.append(String(scalar))
+            }
+        }
+        return escaped
+    }
+
+    private static func normalizedSystemPrompt(_ value: Any?) -> Any? {
+        guard let value else {
+            return nil
+        }
+
+        if let entries = value as? [[String: Any]] {
+            let filtered = entries.filter { entry in
+                guard let text = entry["text"] as? String else {
+                    return true
+                }
+                return !text.hasPrefix("x-anthropic-billing-header:")
+            }
+            return filtered.isEmpty ? nil : filtered
+        }
+
+        if let text = value as? String, text.hasPrefix("x-anthropic-billing-header:") {
+            return nil
+        }
+
+        return value
+    }
+
+    private static func normalizedValue(_ value: Any?) -> Any? {
+        guard let value else {
+            return nil
+        }
+
+        if let dictionary = value as? [String: Any] {
+            if let role = dictionary["role"] as? String,
+               let normalizedMessage = normalizedMessage(role: role, dictionary: dictionary) {
+                return normalizedMessage
+            }
+
+            var normalized: [String: Any] = [:]
+            for key in dictionary.keys.sorted() where key != "cache_control" {
+                guard let rawValue = dictionary[key],
+                      let cleanedValue = normalizedValue(rawValue) else {
+                    continue
+                }
+                normalized[key] = cleanedValue
+            }
+            return normalized.isEmpty ? nil : normalized
+        }
+
+        if let array = value as? [Any] {
+            let normalized = array.compactMap { normalizedValue($0) }
+            return normalized.isEmpty ? nil : normalized
+        }
+
+        return value
+    }
+
+    private static func normalizedMessage(role: String, dictionary: [String: Any]) -> [String: Any]? {
+        var normalized: [String: Any] = ["role": role]
+
+        if let content = normalizedMessageContent(dictionary["content"]) {
+            normalized["content"] = content
+        }
+
+        for key in dictionary.keys.sorted() where key != "role" && key != "content" && key != "cache_control" {
+            guard let rawValue = dictionary[key],
+                  let cleanedValue = normalizedValue(rawValue) else {
+                continue
+            }
+            normalized[key] = cleanedValue
+        }
+
+        return normalized
+    }
+
+    private static func normalizedMessageContent(_ value: Any?) -> Any? {
+        guard let value else {
+            return nil
+        }
+
+        if let string = value as? String {
+            return [["type": "text", "text": string]]
+        }
+
+        return normalizedValue(value)
     }
 }
 
@@ -73,7 +250,7 @@ enum ProxyRequestState: Sendable {
     case waiting
     /// Response headers received; body is streaming or being accumulated.
     case receiving
-    /// Request completed — lingering in the UI until its removal deadline passes.
+    /// Request completed — shown in the done section until it expires or is replaced.
     case done
 }
 
@@ -81,6 +258,10 @@ enum ProxyRequestState: Sendable {
 struct ProxyRequestActivity: Sendable, Identifiable {
     let id: UUID
     var state: ProxyRequestState
+    /// Model ID from the request body, used for done-request replacement matching.
+    let modelID: String?
+    /// Stable prompt descriptor built from prompt-shaping fields in the request body.
+    let promptDescriptor: String?
     /// Cumulative bytes sent to upstream so far.
     var bytesSent: Int
     /// Cumulative bytes received from upstream so far.
@@ -99,8 +280,6 @@ struct ProxyRequestActivity: Sendable, Identifiable {
     var tokenUsage: TokenUsage?
     /// Estimated cost (USD) for this single request, populated when state transitions to `.done`.
     var estimatedCost: Double?
-    /// Earliest date at which this `.done` request may be pruned from the active list.
-    var removeAfter: Date?
 
     /// Total prompt tokens (input + cache read + cache creation) for display. Nil when unavailable.
     var promptTokens: Int? {

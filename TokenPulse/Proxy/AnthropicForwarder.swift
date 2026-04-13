@@ -42,7 +42,8 @@ final class AnthropicForwarder: Sendable {
         await sessionStore.incrementInFlight(sessionID)
 
         // Store request context for keepalive use.
-        let model = extractModel(from: request.body)
+        let model = ProxyRequestBody.model(from: request.body)
+        let promptDescriptor = ProxyRequestBody.promptDescriptor(from: request.body)
         await sessionStore.storeRequestContext(
             body: request.body,
             headers: request.headers,
@@ -54,6 +55,7 @@ final class AnthropicForwarder: Sendable {
             request: request,
             sessionID: sessionID,
             model: model,
+            promptDescriptor: promptDescriptor,
             sessionStore: sessionStore,
             metrics: metrics,
             keepaliveManager: keepaliveManager
@@ -67,6 +69,7 @@ final class AnthropicForwarder: Sendable {
         request: ProxyHTTPRequest,
         sessionID: String,
         model: String?,
+        promptDescriptor: String?,
         sessionStore: ProxySessionStore,
         metrics: ProxyMetricsStore,
         keepaliveManager: KeepaliveManager?
@@ -127,7 +130,12 @@ final class AnthropicForwarder: Sendable {
 
         // Register the in-flight request in the session store for real-time UI display.
         let requestID = UUID()
-        await sessionStore.startRequest(id: requestID, sessionID: sessionID)
+        await sessionStore.startRequest(
+            id: requestID,
+            sessionID: sessionID,
+            model: model,
+            promptDescriptor: promptDescriptor
+        )
         await sessionStore.recordBytesSent(request.body.count)
 
         if wantsStreaming {
@@ -481,14 +489,6 @@ final class AnthropicForwarder: Sendable {
         writer.writeHead(status: response.loggedResponse.statusCode, headers: response.headers)
         writer.writeChunk(response.body)
         writer.end()
-    }
-
-    /// Extract the model name from a JSON request body.
-    private func extractModel(from body: Data) -> String? {
-        guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
-            return nil
-        }
-        return json["model"] as? String
     }
 
     private func proxyErrorResponse(
