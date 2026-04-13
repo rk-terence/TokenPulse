@@ -286,7 +286,7 @@ actor ProxySessionStore {
     func markRequestDone(id: UUID, errored: Bool, tokenUsage: TokenUsage?, estimatedCost: Double?) {
         guard var entry = activeRequests[id] else { return }
         entry.activity.state = .done
-        entry.activity.removeAfter = Date().addingTimeInterval(3)
+        entry.activity.removeAfter = Date().addingTimeInterval(6)
         entry.activity.tokenUsage = tokenUsage
         entry.activity.estimatedCost = estimatedCost
         activeRequests[id] = entry

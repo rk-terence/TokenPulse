@@ -3,7 +3,10 @@ import SwiftUI
 struct PopoverView: View {
     let manager: ProviderManager
     var proxyController: LocalProxyController?
+    var onTogglePin: ((Bool) -> Void)?
     var onOpenSettings: (() -> Void)?
+
+    @State private var isPinned = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -12,18 +15,30 @@ struct PopoverView: View {
                 Text("TokenPulse")
                     .font(.headline)
                 Spacer()
+
+                Button {
+                    isPinned.toggle()
+                    onTogglePin?(isPinned)
+                } label: {
+                    Image(systemName: isPinned ? "pin.fill" : "pin")
+                }
+                .buttonStyle(HeaderActionButtonStyle(isEmphasized: isPinned))
+                .help(isPinned
+                    ? String(localized: "Unpin popover")
+                    : String(localized: "Pin popover"))
+
                 HeaderActionButton(
-                    title: manager.isRefreshing
-                        ? String(localized: "Refreshing…")
-                        : String(localized: "Refresh"),
+                    icon: "arrow.clockwise",
                     isEmphasized: manager.isRefreshing,
                     action: { manager.requestRefresh() }
                 )
+                .help(String(localized: "Refresh"))
 
                 HeaderActionButton(
-                    title: String(localized: "Settings"),
+                    icon: "gearshape",
                     action: { onOpenSettings?() }
                 )
+                .help(String(localized: "Settings"))
             }
 
             Divider()
@@ -48,6 +63,14 @@ struct PopoverView: View {
                 }
             }
 
+            if let lastUpdate = manager.lastUpdated {
+                Text("Last checked \(lastUpdate, style: .relative)")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                    .contentTransition(.numericText())
+                    .animation(nil, value: lastUpdate)
+            }
+
             Divider()
 
             // Proxy status (compact)
@@ -58,13 +81,6 @@ struct PopoverView: View {
 
             // Footer
             HStack {
-                if let lastUpdate = manager.lastUpdated {
-                    Text("Last checked \(lastUpdate, style: .relative)")
-                        .font(.callout)
-                        .foregroundStyle(.tertiary)
-                        .contentTransition(.numericText())
-                        .animation(nil, value: lastUpdate)
-                }
                 Spacer()
                 Button("Quit") {
                     NSApplication.shared.terminate(nil)
@@ -76,18 +92,21 @@ struct PopoverView: View {
         }
         .padding(12)
         .frame(width: 320)
+        .background(.thinMaterial)
     }
 
 }
 
 private struct HeaderActionButton: View {
-    let title: String
+    let icon: String
     var isEmphasized = false
     let action: () -> Void
 
     var body: some View {
-        Button(title, action: action)
-            .buttonStyle(HeaderActionButtonStyle(isEmphasized: isEmphasized))
+        Button(action: action) {
+            Image(systemName: icon)
+        }
+        .buttonStyle(HeaderActionButtonStyle(isEmphasized: isEmphasized))
     }
 }
 
@@ -98,7 +117,7 @@ private struct HeaderActionButtonStyle: ButtonStyle {
         configuration.label
             .font(.callout.weight(.semibold))
             .foregroundStyle(foregroundColor(isPressed: configuration.isPressed))
-            .padding(.horizontal, 11)
+            .padding(.horizontal, 8)
             .padding(.vertical, 6)
             .background(backgroundColor(isPressed: configuration.isPressed), in: Capsule())
             .overlay {
@@ -656,17 +675,13 @@ private struct RequestActivityRow: View {
                     .foregroundStyle(isFresh ? .green : .secondary)
 
             case .done:
-                Text("\u{2191} \(formattedBytes(request.bytesSent))")
-                    .font(.callout.monospacedDigit())
-                    .foregroundStyle(.tertiary)
-                Text("\u{2193} \(formattedBytes(request.bytesReceived))")
-                    .font(.callout.monospacedDigit())
-                    .foregroundStyle(.tertiary)
                 if let promptK = request.promptTokens {
-                    Text(String(localized: "prompt"))
-                        .font(.callout)
-                        .foregroundStyle(.quaternary)
-                    Text(formattedTokenCount(promptK))
+                    Text("\u{2191} \(formattedTokenCount(promptK))")
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+                if let outputK = request.tokenUsage?.outputTokens, outputK > 0 {
+                    Text("\u{2193} \(formattedTokenCount(outputK))")
                         .font(.callout.monospacedDigit())
                         .foregroundStyle(.tertiary)
                 }

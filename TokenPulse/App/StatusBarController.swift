@@ -9,6 +9,7 @@ final class StatusBarController {
     nonisolated(unsafe) private var localEventMonitor: Any?
 
     private weak var proxyController: LocalProxyController?
+    private var isPinned = false
     private var currentIconModel = StatusBarIconModel(label: "?", utilization: nil, sevenDayUtilization: nil, state: .unconfigured)
 
     // MARK: - Slash animation state machine
@@ -38,12 +39,19 @@ final class StatusBarController {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         // Popover content
-        let view = PopoverView(manager: providerManager, proxyController: proxyController) { [weak self] in
-            self?.popover.performClose(nil)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                providerManager.openSettings()
+        let view = PopoverView(
+            manager: providerManager,
+            proxyController: proxyController,
+            onTogglePin: { [weak self] pinned in
+                self?.setPinned(pinned)
+            },
+            onOpenSettings: { [weak self] in
+                self?.popover.performClose(nil)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    providerManager.openSettings()
+                }
             }
-        }
+        )
         popover.contentViewController = NSHostingController(rootView: view)
         popover.behavior = .transient
 
@@ -54,9 +62,9 @@ final class StatusBarController {
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
-        // Close popover on external clicks
+        // Close popover on external clicks (only when not pinned)
         eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            guard let self, self.popover.isShown else { return }
+            guard let self, !self.isPinned, self.popover.isShown else { return }
             self.popover.performClose(nil)
         }
 
@@ -81,6 +89,11 @@ final class StatusBarController {
     func updateIcon(_ model: StatusBarIconModel) {
         currentIconModel = model
         render()
+    }
+
+    private func setPinned(_ pinned: Bool) {
+        isPinned = pinned
+        popover.behavior = pinned ? .applicationDefined : .transient
     }
 
     // MARK: - Event-driven animation
