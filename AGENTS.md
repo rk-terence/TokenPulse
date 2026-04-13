@@ -51,10 +51,12 @@ TokenPulse/
 ├── Providers/                  # UsageProvider protocol + per-provider implementations
 │   ├── UsageProvider.swift     # Protocol: fetchUsage(), classifyError() → FailureDisposition
 │   ├── ClaudeProvider.swift    # Keychain OAuth → /api/oauth/usage
+│   ├── CodexProvider.swift     # ~/.codex/auth.json → chatgpt.com/backend-api/wham/usage
 │   └── ZenMuxProvider.swift    # Management API key → /api/v1/management/subscription/detail
 ├── Services/
 │   ├── KeychainService.swift   # Security.framework wrapper
 │   ├── ConfigService.swift     # ~/.tokenpulse/config.json read/write
+│   ├── ChromeCookieService.swift # Chrome encrypted cookie extraction (PBKDF2 + AES-128-CBC)
 │   ├── PollingManager.swift    # Timer-based refresh
 │   ├── ProviderManager.swift   # Per-provider refresh, state machine, icon model
 │   ├── NotificationService.swift # UNUserNotification for threshold/reset alerts
@@ -77,5 +79,6 @@ TokenPulse/
 
 - Product features, install, usage → README.md
 - Provider API specs, auth flows, response schemas → docs/providers.md
+- Proxy architecture, request flow, keepalive economics, event schema → docs/proxy.md
 - Slash animation state machine, timing, rendering → docs/animation.md
 - Build commands, code style, constraints → this file
