@@ -6,8 +6,9 @@ final class ConfigService {
     static let shared = ConfigService()
 
     /// Current on-disk schema version. Bump when adding fields that need migration.
-    private static let currentConfigVersion = 4
-    private static let defaultProxyUpstreamURL = "https://zenmux.ai/api/anthropic"
+    private static let currentConfigVersion = 6
+    private static let defaultAnthropicUpstreamURL = "https://zenmux.ai/api/anthropic"
+    private static let defaultOpenAIUpstreamURL = "https://api.openai.com"
 
     /// Factory defaults for provider enablement.
     static let factoryEnabledProviders: [String: Bool] = ["claude": false, "codex": false, "zenmux": true]
@@ -28,7 +29,11 @@ final class ConfigService {
         didSet { save() }
     }
 
-    var proxyUpstreamURL: String {
+    var anthropicUpstreamURL: String {
+        didSet { save() }
+    }
+
+    var openAIUpstreamURL: String {
         didSet { save() }
     }
 
@@ -70,7 +75,8 @@ final class ConfigService {
         self.pollInterval = loaded.config.pollInterval
         self.enabledProviders = loaded.config.enabledProviders
         self.proxyEnabled = loaded.config.proxyEnabled
-        self.proxyUpstreamURL = loaded.config.proxyUpstreamURL
+        self.anthropicUpstreamURL = loaded.config.anthropicUpstreamURL
+        self.openAIUpstreamURL = loaded.config.openAIUpstreamURL
         self.proxyPort = loaded.config.proxyPort
         self.keepaliveEnabled = loaded.config.keepaliveEnabled
         self.keepaliveIntervalSeconds = loaded.config.keepaliveIntervalSeconds
@@ -99,6 +105,8 @@ final class ConfigService {
         var pollInterval: TimeInterval = ProviderConfig.defaultPollInterval
         var enabledProviders: [String: Bool]?
         var proxyEnabled: Bool?
+        var anthropicUpstreamURL: String?
+        var openAIUpstreamURL: String?
         var proxyUpstreamURL: String?
         var proxyPort: Int?
         var keepaliveEnabled: Bool?
@@ -118,7 +126,8 @@ final class ConfigService {
         var pollInterval: TimeInterval
         var enabledProviders: [String: Bool]
         var proxyEnabled: Bool
-        var proxyUpstreamURL: String
+        var anthropicUpstreamURL: String
+        var openAIUpstreamURL: String
         var proxyPort: Int
         var keepaliveEnabled: Bool
         var keepaliveIntervalSeconds: Int
@@ -137,7 +146,8 @@ final class ConfigService {
                     pollInterval: ProviderConfig.defaultPollInterval,
                     enabledProviders: factoryEnabledProviders,
                     proxyEnabled: false,
-                    proxyUpstreamURL: defaultProxyUpstreamURL,
+                    anthropicUpstreamURL: defaultAnthropicUpstreamURL,
+                    openAIUpstreamURL: defaultOpenAIUpstreamURL,
                     proxyPort: 8080,
                     keepaliveEnabled: false,
                     keepaliveIntervalSeconds: 240,
@@ -151,6 +161,9 @@ final class ConfigService {
 
         let needsMigration = (file.configVersion ?? 0) < currentConfigVersion
         let resolvedProviders = file.enabledProviders ?? factoryEnabledProviders
+        let migratedAnthropicUpstreamURL = file.anthropicUpstreamURL
+            ?? file.proxyUpstreamURL
+            ?? defaultAnthropicUpstreamURL
 
         return LoadResult(
             config: ResolvedConfig(
@@ -158,7 +171,8 @@ final class ConfigService {
                 pollInterval: file.pollInterval,
                 enabledProviders: resolvedProviders,
                 proxyEnabled: file.proxyEnabled ?? false,
-                proxyUpstreamURL: file.proxyUpstreamURL ?? defaultProxyUpstreamURL,
+                anthropicUpstreamURL: migratedAnthropicUpstreamURL,
+                openAIUpstreamURL: file.openAIUpstreamURL ?? defaultOpenAIUpstreamURL,
                 proxyPort: file.proxyPort ?? 8080,
                 keepaliveEnabled: file.keepaliveEnabled ?? false,
                 keepaliveIntervalSeconds: file.keepaliveIntervalSeconds ?? 240,
@@ -177,7 +191,9 @@ final class ConfigService {
             pollInterval: pollInterval,
             enabledProviders: enabledProviders,
             proxyEnabled: proxyEnabled,
-            proxyUpstreamURL: proxyUpstreamURL,
+            anthropicUpstreamURL: anthropicUpstreamURL,
+            openAIUpstreamURL: openAIUpstreamURL,
+            proxyUpstreamURL: nil,
             proxyPort: proxyPort,
             keepaliveEnabled: keepaliveEnabled,
             keepaliveIntervalSeconds: keepaliveIntervalSeconds,

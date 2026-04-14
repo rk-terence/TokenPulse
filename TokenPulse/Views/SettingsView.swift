@@ -258,8 +258,6 @@ private struct ProxyTab: View {
     var proxyController: LocalProxyController?
 
     @State private var portText: String = ""
-    @State private var keepaliveIntervalText: String = ""
-    @State private var inactivityTimeoutText: String = ""
 
     private var proxyEnabledBinding: Binding<Bool> {
         Binding(
@@ -269,7 +267,8 @@ private struct ProxyTab: View {
                 if newValue {
                     proxyController?.start(
                         port: config.proxyPort,
-                        upstreamURL: config.proxyUpstreamURL
+                        anthropicUpstreamURL: config.anthropicUpstreamURL,
+                        openAIUpstreamURL: config.openAIUpstreamURL
                     )
                 } else {
                     proxyController?.stop()
@@ -283,41 +282,32 @@ private struct ProxyTab: View {
             Section(String(localized: "Local Proxy")) {
                 Toggle(String(localized: "Enable local proxy"), isOn: proxyEnabledBinding)
                 if config.proxyEnabled {
-                    TextField(String(localized: "Upstream URL"), text: $config.proxyUpstreamURL)
+                    TextField(String(localized: "Anthropic upstream URL"), text: $config.anthropicUpstreamURL)
                         .textFieldStyle(.roundedBorder)
+
+                    TextField(String(localized: "OpenAI upstream URL"), text: $config.openAIUpstreamURL)
+                        .textFieldStyle(.roundedBorder)
+
                     TextField(String(localized: "Port"), text: $portText)
                         .textFieldStyle(.roundedBorder)
-                    Text(String(localized: "Restart the proxy to apply changes."))
+                    Text(String(
+                        format: NSLocalizedString(
+                            "proxy.settings.restartRoute",
+                            value: "Restart the proxy to apply upstream URL changes. The proxy serves %@ and %@ on the same local port.",
+                            comment: ""
+                        ),
+                        ProxyAPIFlavor.anthropicMessages.supportedRouteDescription,
+                        ProxyAPIFlavor.openAIResponses.supportedRouteDescription
+                    ))
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
                     Divider()
 
-                    Toggle(String(localized: "Enable keepalive"), isOn: $config.keepaliveEnabled)
-
-                    if config.keepaliveEnabled {
-                        HStack {
-                            Text(String(localized: "Keepalive interval (seconds)"))
-                            Spacer()
-                            TextField("", text: $keepaliveIntervalText)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: 80)
-                                .multilineTextAlignment(.trailing)
-                        }
-
-                        HStack {
-                            Text(String(localized: "Inactivity timeout (seconds)"))
-                            Spacer()
-                            TextField("", text: $inactivityTimeoutText)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: 80)
-                                .multilineTextAlignment(.trailing)
-                        }
-
-                        Text(String(localized: "Sends periodic cache-warming requests to keep the prompt cache alive during long generations. Each keepalive costs 0.10x base input; avoiding a cache write saves 1.15x."))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+                    Toggle(String(localized: "Enable keepalive controls"), isOn: $config.keepaliveEnabled)
+                    Text(String(localized: "Shows per-session keepalive controls in the activity popover. Keepalive applies only to Anthropic Messages traffic."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
 
                     Divider()
 
@@ -347,27 +337,9 @@ private struct ProxyTab: View {
                         Text("\(controller.proxyStatus.activeSessions)")
                             .monospacedDigit()
                     }
-                    LabeledContent(String(localized: "Keepalive loops")) {
-                        Text("\(controller.proxyStatus.activeKeepalives)")
-                            .monospacedDigit()
-                    }
                     LabeledContent(String(localized: "Requests forwarded")) {
                         Text("\(controller.proxyStatus.totalRequestsForwarded)")
                             .monospacedDigit()
-                    }
-                    LabeledContent(String(localized: "Cache reads")) {
-                        Text("\(controller.proxyStatus.cacheReads)")
-                            .monospacedDigit()
-                    }
-                    LabeledContent(String(localized: "Cache writes")) {
-                        Text("\(controller.proxyStatus.cacheWrites)")
-                            .monospacedDigit()
-                    }
-                    if controller.proxyStatus.estimatedSavings > 0 {
-                        LabeledContent(String(localized: "Est. savings")) {
-                            Text(String(format: NSLocalizedString("proxy.savings.format", value: "~%.1fx base input", comment: "Estimated savings in base-input-price multiples"), controller.proxyStatus.estimatedSavings))
-                                .monospacedDigit()
-                        }
                     }
                 }
             }
@@ -375,8 +347,6 @@ private struct ProxyTab: View {
         .formStyle(.grouped)
         .onAppear {
             portText = String(config.proxyPort)
-            keepaliveIntervalText = String(config.keepaliveIntervalSeconds)
-            inactivityTimeoutText = String(config.proxyInactivityTimeoutSeconds)
         }
         .onChange(of: portText) { _, newValue in
             if let port = Int(newValue.trimmingCharacters(in: .whitespaces)),
@@ -386,35 +356,5 @@ private struct ProxyTab: View {
                 portText = String(config.proxyPort)
             }
         }
-        .onChange(of: keepaliveIntervalText) { _, newValue in
-            if let interval = Int(newValue.trimmingCharacters(in: .whitespaces)),
-               (60...300).contains(interval) {
-                config.keepaliveIntervalSeconds = interval
-                applyKeepaliveConfiguration()
-            } else {
-                keepaliveIntervalText = String(config.keepaliveIntervalSeconds)
-            }
-        }
-        .onChange(of: inactivityTimeoutText) { _, newValue in
-            if let timeout = Int(newValue.trimmingCharacters(in: .whitespaces)),
-               (300...3600).contains(timeout) {
-                config.proxyInactivityTimeoutSeconds = timeout
-                applyKeepaliveConfiguration()
-            } else {
-                inactivityTimeoutText = String(config.proxyInactivityTimeoutSeconds)
-            }
-        }
-        .onChange(of: config.keepaliveEnabled) { _, _ in
-            applyKeepaliveConfiguration()
-        }
-    }
-
-    private func applyKeepaliveConfiguration() {
-        guard config.proxyEnabled else { return }
-        proxyController?.updateKeepaliveConfiguration(
-            enabled: config.keepaliveEnabled,
-            intervalSeconds: config.keepaliveIntervalSeconds,
-            inactivityTimeoutSeconds: config.proxyInactivityTimeoutSeconds
-        )
     }
 }

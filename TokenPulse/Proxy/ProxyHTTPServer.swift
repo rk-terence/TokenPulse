@@ -6,6 +6,12 @@ import Network
 /// The handler callback invoked for each valid parsed HTTP request.
 /// The handler is responsible for writing the response via `ProxyHTTPRequest.writer`.
 typealias ProxyRequestHandler = @Sendable (ProxyHTTPRequest) async -> Void
+typealias ProxyRequestValidator = @Sendable (String, String) -> ProxyRequestValidationResult
+
+enum ProxyRequestValidationResult: Sendable {
+    case accepted
+    case rejected(status: Int, message: String)
+}
 
 // MARK: - ProxyHTTPServer
 
@@ -16,6 +22,8 @@ final class ProxyHTTPServer: Sendable {
 
     private let listener: NWListener
     private let queue: DispatchQueue
+    private let requestValidator: ProxyRequestValidator
+    private let errorBodyBuilder: @Sendable (String) -> Data
     private let handler: ProxyRequestHandler
     private let onReady: (@Sendable (UInt16) -> Void)?
     private let onFailure: (@Sendable (String) -> Void)?
@@ -40,6 +48,8 @@ final class ProxyHTTPServer: Sendable {
     /// - Throws: If the NWListener cannot be created.
     init(
         port: UInt16,
+        requestValidator: @escaping ProxyRequestValidator,
+        errorBodyBuilder: @escaping @Sendable (String) -> Data,
         handler: @escaping ProxyRequestHandler,
         onReady: (@Sendable (UInt16) -> Void)? = nil,
         onFailure: (@Sendable (String) -> Void)? = nil
@@ -54,6 +64,8 @@ final class ProxyHTTPServer: Sendable {
 
         self.listener = try NWListener(using: params)
         self.queue = DispatchQueue(label: "com.tokenpulse.proxy.server", qos: .userInitiated)
+        self.requestValidator = requestValidator
+        self.errorBodyBuilder = errorBodyBuilder
         self.handler = handler
         self.onReady = onReady
         self.onFailure = onFailure
@@ -356,15 +368,11 @@ final class ProxyHTTPServer: Sendable {
 
     private func dispatchRequest(connection: NWConnection, method: String, path: String,
                                  headers: [(name: String, value: String)], body: Data) {
-        // Only support POST /v1/messages
-        guard path == "/v1/messages" || path.hasPrefix("/v1/messages?") else {
-            sendErrorResponse(connection: connection, status: 404,
-                              message: String(localized: "Not Found: only /v1/messages is supported"))
-            return
-        }
-        guard method.uppercased() == "POST" else {
-            sendErrorResponse(connection: connection, status: 405,
-                              message: String(localized: "Method Not Allowed: only POST is supported"))
+        switch requestValidator(method, path) {
+        case .accepted:
+            break
+        case .rejected(let status, let message):
+            sendErrorResponse(connection: connection, status: status, message: message)
             return
         }
 
@@ -392,7 +400,7 @@ final class ProxyHTTPServer: Sendable {
 
     private func sendErrorResponse(connection: NWConnection, status: Int, message: String) {
         let statusText = HTTPStatusText.text(for: status)
-        let body = ProxyHTTPUtils.anthropicErrorBody(message: message)
+        let body = errorBodyBuilder(message)
         var response = "HTTP/1.1 \(status) \(statusText)\r\n"
         response += "Content-Type: application/json; charset=utf-8\r\n"
         response += "Content-Length: \(body.count)\r\n"

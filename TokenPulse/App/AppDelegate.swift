@@ -45,7 +45,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ConfigService.shared.proxyEnabled {
             proxyController?.start(
                 port: ConfigService.shared.proxyPort,
-                upstreamURL: ConfigService.shared.proxyUpstreamURL
+                anthropicUpstreamURL: ConfigService.shared.anthropicUpstreamURL,
+                openAIUpstreamURL: ConfigService.shared.openAIUpstreamURL
             )
         }
     }

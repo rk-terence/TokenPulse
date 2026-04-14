@@ -1,21 +1,29 @@
 import Foundation
 
-/// Forwards incoming proxy requests to the configured upstream Anthropic-compatible
-/// API and streams responses back to the local client.
+/// Forwards incoming proxy requests to the configured upstream API and streams
+/// responses back to the local client.
 ///
-/// This type is `Sendable` — it holds only immutable config and a `Sendable` URLSession.
-final class AnthropicForwarder: Sendable {
+/// Protocol-specific request parsing, lineage, and keepalive semantics are
+/// delegated to the injected `ProxyAPIHandler`.
+final class ProxyForwarder: Sendable {
     private static let maxLoggedStreamingResponseBytes = 4 * 1024 * 1024
 
     let upstreamBaseURL: String
+    private let apiHandler: any ProxyAPIHandler
     private let eventLogger: ProxyEventLogger?
     private let proxyPort: Int
     /// Shared session for non-streaming requests — preserves TCP/TLS connection reuse.
     private let nonStreamingSession: URLSession
     private let nonStreamingPoolDelegate: NonStreamingPoolDelegate
 
-    init(upstreamBaseURL: String, eventLogger: ProxyEventLogger? = nil, proxyPort: Int = 0) {
+    init(
+        upstreamBaseURL: String,
+        apiHandler: any ProxyAPIHandler,
+        eventLogger: ProxyEventLogger? = nil,
+        proxyPort: Int = 0
+    ) {
         self.upstreamBaseURL = upstreamBaseURL
+        self.apiHandler = apiHandler
         self.eventLogger = eventLogger
         self.proxyPort = proxyPort
 
@@ -33,17 +41,16 @@ final class AnthropicForwarder: Sendable {
     func forward(
         request: ProxyHTTPRequest,
         sessionStore: ProxySessionStore,
-        metrics: ProxyMetricsStore,
-        keepaliveManager: KeepaliveManager?
+        metrics: ProxyMetricsStore
     ) async {
         // 1. Extract session ID and update session store.
-        let sessionID = request.headerValue(for: "X-Claude-Code-Session-Id") ?? "unknown"
+        let sessionID = apiHandler.sessionID(for: request)
         await sessionStore.touch(sessionID)
         await sessionStore.incrementInFlight(sessionID)
 
         // Store generic request context (used by done-request replacement etc.).
-        let model = ProxyRequestBody.model(from: request.body)
-        let promptDescriptor = ProxyRequestBody.promptDescriptor(from: request.body)
+        let model = apiHandler.extractModel(from: request.body)
+        let promptDescriptor = apiHandler.promptDescriptor(from: request.body)
         await sessionStore.storeRequestContext(
             body: request.body,
             headers: request.headers,
@@ -57,8 +64,7 @@ final class AnthropicForwarder: Sendable {
             model: model,
             promptDescriptor: promptDescriptor,
             sessionStore: sessionStore,
-            metrics: metrics,
-            keepaliveManager: keepaliveManager
+            metrics: metrics
         )
         await sessionStore.decrementInFlight(sessionID)
     }
@@ -71,14 +77,14 @@ final class AnthropicForwarder: Sendable {
         model: String?,
         promptDescriptor: String?,
         sessionStore: ProxySessionStore,
-        metrics: ProxyMetricsStore,
-        keepaliveManager: KeepaliveManager?
+        metrics: ProxyMetricsStore
     ) async {
         // requestID is created below, after URL validation, so we only track
         // real upstream attempts (not proxy-side config errors).
+        let upstreamPath = apiHandler.upstreamPath(for: request.path)
         let urlString = upstreamBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            + request.path
-        let wantsStreaming = ProxyRequestBody.isStreaming(from: request.body)
+            + upstreamPath
+        let wantsStreaming = apiHandler.isStreamingRequest(body: request.body)
         let requestStartedAt = Date()
         let requestLog = ProxyEventLogger.LoggedRequest(
             method: request.method,
@@ -130,8 +136,7 @@ final class AnthropicForwarder: Sendable {
 
         // Register the in-flight request in the session store for real-time UI display.
         let requestID = UUID()
-        let isMainAgentShaped = ProxyRequestBody.hasTools(from: request.body)
-            && !ProxyRequestBody.hasJSONSchemaOutputConfig(from: request.body)
+        let isMainAgentShaped = apiHandler.isMainAgentRequest(body: request.body)
         await sessionStore.startRequest(
             id: requestID,
             sessionID: sessionID,
@@ -172,28 +177,26 @@ final class AnthropicForwarder: Sendable {
 
         await writeStatusSnapshot(
             sessionStore: sessionStore,
-            metrics: metrics,
-            keepaliveManager: keepaliveManager
+            metrics: metrics
         )
 
-        // Always evaluate lineage for non-errored requests so bootstrap data
-        // is available if keepalive is enabled later.
+        // Always evaluate lineage for non-errored requests so the tracked
+        // body is available for manual keepalive.
         if !errored {
             let lineageResult = await sessionStore.evaluateAndTrackLineage(
                 body: request.body,
                 headers: request.headers,
                 model: model,
-                for: sessionID
+                for: sessionID,
+                using: apiHandler
             )
 
             switch lineageResult {
             case .tracked:
-                let lineageHeaders = await sessionStore.lineageRequestHeaders(for: sessionID)
-                await keepaliveManager?.startOrReset(sessionID: sessionID, headers: lineageHeaders)
+                break
             case .diverged(let reason):
                 await sessionStore.clearMainAgentFlag(requestID: requestID, sessionID: sessionID)
-                await keepaliveManager?.stop(sessionID: sessionID)
-                let shortSessionID = String(sessionID.prefix(8))
+                let shortSessionID = ProxySessionID.shortDisplayID(for: sessionID)
                 await eventLogger?.logKeepaliveDisabled(
                     session: sessionID,
                     reason: "lineage_diverged: \(reason)",
@@ -320,7 +323,7 @@ final class AnthropicForwarder: Sendable {
                 bodyBytes: capturedResponseBytes,
                 bodyTruncated: capturedResponseBytes > capturedResponseBody.count
             )
-            let tokenUsage = ProxyHTTPUtils.parseTokenUsage(from: capturedResponseBody, streaming: true)
+            let tokenUsage = apiHandler.parseTokenUsage(from: capturedResponseBody, streaming: true)
             await metrics.recordTokenUsage(tokenUsage)
             await sessionStore.recordTokenUsage(tokenUsage, model: model, for: sessionID)
             let requestCost = ModelPricingTable.pricing(for: model).map { tokenUsage.cost(for: $0) }
@@ -439,7 +442,7 @@ final class AnthropicForwarder: Sendable {
                 writer.end()
                 await metrics.recordForwarded()
 
-                let tokenUsage = ProxyHTTPUtils.parseTokenUsage(from: responseData, streaming: false)
+                let tokenUsage = apiHandler.parseTokenUsage(from: responseData, streaming: false)
                 await metrics.recordTokenUsage(tokenUsage)
                 await sessionStore.recordTokenUsage(tokenUsage, model: model, for: sessionID)
                 let requestCost = ModelPricingTable.pricing(for: model).map { tokenUsage.cost(for: $0) }
@@ -539,7 +542,7 @@ final class AnthropicForwarder: Sendable {
         status: Int,
         message: String
     ) -> (headers: [(name: String, value: String)], body: Data, loggedResponse: ProxyEventLogger.LoggedResponse) {
-        let body = ProxyHTTPUtils.anthropicErrorBody(message: message)
+        let body = apiHandler.proxyErrorBody(message: message)
         let headers = [
             (name: "Content-Type", value: "application/json; charset=utf-8"),
             (name: "Content-Length", value: "\(body.count)"),
@@ -567,18 +570,16 @@ final class AnthropicForwarder: Sendable {
     /// Write an atomic status snapshot via the event logger.
     private func writeStatusSnapshot(
         sessionStore: ProxySessionStore,
-        metrics: ProxyMetricsStore,
-        keepaliveManager: KeepaliveManager?
+        metrics: ProxyMetricsStore
     ) async {
         guard let logger = eventLogger else { return }
         let activeSessions = await sessionStore.activeSessions().count
-        let activeKeepalives = await keepaliveManager?.activeCount() ?? 0
         let snapshot = await metrics.snapshot()
         await logger.writeStatusSnapshot(
             enabled: true,
             port: proxyPort,
             activeSessions: activeSessions,
-            activeKeepalives: activeKeepalives,
+            activeKeepalives: 0,
             metrics: snapshot
         )
     }

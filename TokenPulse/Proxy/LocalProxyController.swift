@@ -16,7 +16,7 @@ final class LocalProxyController {
         let sessionID: String
         let completedRequests: Int
         let erroredRequests: Int
-        let keepaliveRequests: Int
+        let keepaliveCount: Int
         let activeRequests: [ProxyRequestActivity]
         let doneRequests: [ProxyRequestActivity]
         let totalInputTokens: Int
@@ -26,10 +26,24 @@ final class LocalProxyController {
         let estimatedCostUSD: Double
         let isKeepaliveDisabled: Bool
         let keepaliveDisabledReason: String?
+        let keepaliveMode: KeepaliveMode
+        /// Whether lineage is established and a keepalive body is available for manual send.
+        let lineageReady: Bool
+        let lastKeepaliveAt: Date?
+        /// Cache read percentage from the last keepalive response (0–100), nil if no keepalive yet.
+        let lastKeepaliveCacheReadPercent: Double?
+        /// Output tokens from the last keepalive response, for verification.
+        let lastKeepaliveOutputTokens: Int?
 
         var id: String { sessionID }
-        /// First 8 characters of the session ID — enough to distinguish sessions in the UI.
-        var shortID: String { String(sessionID.prefix(8)) }
+        var apiFlavor: ProxyAPIFlavor? { ProxySessionID.flavor(for: sessionID) }
+        /// First 8 characters of the display session ID — enough to distinguish sessions in the UI.
+        var shortID: String { ProxySessionID.shortDisplayID(for: sessionID) }
+        var supportsKeepalive: Bool { apiFlavor?.supportsKeepalive ?? false }
+        /// Whether a manual keepalive can be sent right now.
+        var canSendKeepalive: Bool {
+            keepaliveMode == .manual && !isKeepaliveDisabled && lineageReady
+        }
     }
 
     // MARK: - Aggregate metrics snapshot for UI
@@ -75,21 +89,28 @@ final class LocalProxyController {
     private var server: ProxyHTTPServer?
     private let sessionStore = ProxySessionStore()
     private let metricsStore = ProxyMetricsStore()
-    private var forwarder: AnthropicForwarder?
-    private var keepaliveManager: KeepaliveManager?
+    private let anthropicAPIHandler: any ProxyAPIHandler = AnthropicProxyAPIHandler()
+    private let openAIAPIHandler: any ProxyAPIHandler = OpenAIResponsesProxyAPIHandler()
+    private var anthropicForwarder: ProxyForwarder?
+    private var openAIForwarder: ProxyForwarder?
     private var eventLogger: ProxyEventLogger?
     private var refreshTask: Task<Void, Never>?
     private var trafficRefreshTask: Task<Void, Never>?
     private var trafficRefreshPending = false
-    private var currentUpstreamURL: String?
+    private var currentAnthropicUpstreamURL: String?
 
-    /// Start the proxy server on the given port, forwarding to the upstream URL.
-    func start(port: Int, upstreamURL: String) {
+    /// Session IDs currently sending a manual keepalive request.
+    private(set) var manualKeepaliveInFlight: Set<String> = []
+    /// Last manual keepalive result per session (true = success, false = failure).
+    private(set) var manualKeepaliveLastResult: [String: Bool] = [:]
+
+    /// Start the proxy server on the given port, serving both supported API routes.
+    func start(port: Int, anthropicUpstreamURL: String, openAIUpstreamURL: String) {
         guard server == nil else { return }
 
         // Read config from ConfigService (both are @MainActor, safe here).
         let config = ConfigService.shared
-        currentUpstreamURL = upstreamURL
+        currentAnthropicUpstreamURL = anthropicUpstreamURL
 
         let logger = ProxyEventLogger(
             enabled: config.saveProxyEventLog || config.saveProxyPayloads,
@@ -97,22 +118,20 @@ final class LocalProxyController {
         )
         self.eventLogger = logger
 
-        let fwd = AnthropicForwarder(upstreamBaseURL: upstreamURL, eventLogger: logger, proxyPort: port)
-        self.forwarder = fwd
-
-        var kaManager: KeepaliveManager?
-        if config.keepaliveEnabled {
-            kaManager = KeepaliveManager(
-                intervalSeconds: config.keepaliveIntervalSeconds,
-                inactivityTimeoutSeconds: config.proxyInactivityTimeoutSeconds,
-                upstreamBaseURL: upstreamURL,
-                sessionStore: sessionStore,
-                metricsStore: metricsStore,
-                eventLogger: logger,
-                proxyPort: port
-            )
-        }
-        self.keepaliveManager = kaManager
+        let anthropicForwarder = ProxyForwarder(
+            upstreamBaseURL: anthropicUpstreamURL,
+            apiHandler: anthropicAPIHandler,
+            eventLogger: logger,
+            proxyPort: port
+        )
+        let openAIForwarder = ProxyForwarder(
+            upstreamBaseURL: openAIUpstreamURL,
+            apiHandler: openAIAPIHandler,
+            eventLogger: logger,
+            proxyPort: port
+        )
+        self.anthropicForwarder = anthropicForwarder
+        self.openAIForwarder = openAIForwarder
 
         // Wire traffic events from session store to MainActor callback.
         Task { [weak self] in
@@ -129,19 +148,87 @@ final class LocalProxyController {
         // Capture actor-isolated stores for the handler closure.
         let sessStore = sessionStore
         let metStore = metricsStore
+        let anthropicHandler = anthropicAPIHandler
+        let openAIHandler = openAIAPIHandler
 
         do {
             var startedServer: ProxyHTTPServer?
             let httpServer = try ProxyHTTPServer(
                 port: UInt16(clamping: port),
-                handler: { @Sendable [weak self] request in
-                    let controller = self
-                    let keepaliveManager = await MainActor.run { controller?.keepaliveManager }
-                    await fwd.forward(
+                requestValidator: { method, path in
+                    let matchedHandler: (any ProxyAPIHandler)?
+                    if anthropicHandler.acceptsRequest(method: method, path: path) {
+                        matchedHandler = anthropicHandler
+                    } else if openAIHandler.acceptsRequest(method: method, path: path) {
+                        matchedHandler = openAIHandler
+                    } else {
+                        matchedHandler = nil
+                    }
+
+                    if matchedHandler != nil {
+                        return .accepted
+                    }
+
+                    if Self.route(for: path, anthropicHandler: anthropicHandler, openAIHandler: openAIHandler) != nil {
+                        return .rejected(
+                            status: 405,
+                            message: String(localized: "Method Not Allowed: only POST is supported")
+                        )
+                    }
+                    return .rejected(
+                        status: 404,
+                        message: String(
+                            format: NSLocalizedString(
+                                "proxy.notFound.route",
+                                value: "Not Found: only %@ and %@ are supported",
+                                comment: ""
+                            ),
+                            ProxyAPIFlavor.anthropicMessages.supportedRouteDescription,
+                            ProxyAPIFlavor.openAIResponses.supportedRouteDescription
+                        )
+                    )
+                },
+                errorBodyBuilder: { message in
+                    Self.errorBody(
+                        forPath: nil,
+                        message: message,
+                        anthropicHandler: anthropicHandler,
+                        openAIHandler: openAIHandler
+                    )
+                },
+                handler: { @Sendable request in
+                    let route = Self.route(
+                        for: request.path,
+                        anthropicHandler: anthropicHandler,
+                        openAIHandler: openAIHandler
+                    )
+                    let forwarder = Self.forwarder(
+                        for: route,
+                        anthropicForwarder: anthropicForwarder,
+                        openAIForwarder: openAIForwarder
+                    )
+                    guard let forwarder else {
+                        let body = Self.errorBody(
+                            forPath: request.path,
+                            message: String(localized: "Not Found"),
+                            anthropicHandler: anthropicHandler,
+                            openAIHandler: openAIHandler
+                        )
+                        request.writer.writeHead(
+                            status: 404,
+                            headers: [
+                                (name: "Content-Type", value: Self.contentType(forPath: request.path)),
+                                (name: "Content-Length", value: "\(body.count)")
+                            ]
+                        )
+                        request.writer.writeChunk(body)
+                        request.writer.end()
+                        return
+                    }
+                    await forwarder.forward(
                         request: request,
                         sessionStore: sessStore,
-                        metrics: metStore,
-                        keepaliveManager: keepaliveManager
+                        metrics: metStore
                     )
                 },
                 onReady: { [weak self] actualPort in
@@ -160,10 +247,10 @@ final class LocalProxyController {
                         self.refreshTask?.cancel()
                         self.refreshTask = nil
                         self.server = nil
-                        self.forwarder = nil
-                        self.keepaliveManager = nil
+                        self.anthropicForwarder = nil
+                        self.openAIForwarder = nil
                         self.eventLogger = nil
-                        self.currentUpstreamURL = nil
+                        self.currentAnthropicUpstreamURL = nil
                         self.isRunning = false
                         self.listeningPort = 0
                         self.proxyStatus = .empty
@@ -176,7 +263,7 @@ final class LocalProxyController {
             httpServer.start()
             self.server = httpServer
         } catch {
-            currentUpstreamURL = nil
+            currentAnthropicUpstreamURL = nil
             ProxyLogger.log("Failed to start proxy server: \(error)")
         }
     }
@@ -191,15 +278,13 @@ final class LocalProxyController {
 
         server?.stop()
         server = nil
-        forwarder = nil
+        anthropicForwarder = nil
+        openAIForwarder = nil
 
-        let manager = keepaliveManager
-        keepaliveManager = nil
         let logger = eventLogger
         let metStore = metricsStore
 
         Task {
-            await manager?.shutdown()
             guard let logger else { return }
             await logger.logProxyStopped()
             let snapshot = await metStore.snapshot()
@@ -221,7 +306,9 @@ final class LocalProxyController {
         sessionActivities = []
         lastUploadBytes = 0
         downloadBytesPerSec = 0
-        currentUpstreamURL = nil
+        currentAnthropicUpstreamURL = nil
+        manualKeepaliveInFlight.removeAll()
+        manualKeepaliveLastResult.removeAll()
         ProxyLogger.log("Proxy controller stopped")
     }
 
@@ -247,78 +334,200 @@ final class LocalProxyController {
         proxyStatus = s
     }
 
-    /// Apply keepalive changes immediately for a running proxy without a full restart.
-    func updateKeepaliveConfiguration(enabled: Bool, intervalSeconds: Int, inactivityTimeoutSeconds: Int) {
-        guard isRunning, let upstreamURL = currentUpstreamURL else { return }
+    /// Set the keepalive mode for a specific session (user-initiated).
+    func setSessionKeepaliveMode(_ mode: KeepaliveMode, for sessionID: String) {
+        guard ProxySessionID.flavor(for: sessionID)?.supportsKeepalive == true else { return }
+        let sessStore = sessionStore
+        Task {
+            await sessStore.setKeepaliveMode(mode, for: sessionID)
+        }
+    }
 
-        if enabled {
-            if let manager = keepaliveManager {
-                Task {
-                    await manager.reconfigure(
-                        intervalSeconds: intervalSeconds,
-                        inactivityTimeoutSeconds: inactivityTimeoutSeconds,
-                        upstreamBaseURL: upstreamURL
-                    )
-                }
-            } else {
-                let manager = KeepaliveManager(
-                    intervalSeconds: intervalSeconds,
-                    inactivityTimeoutSeconds: inactivityTimeoutSeconds,
-                    upstreamBaseURL: upstreamURL,
-                    sessionStore: sessionStore,
-                    metricsStore: metricsStore,
-                    eventLogger: eventLogger,
-                    proxyPort: listeningPort
-                )
-                keepaliveManager = manager
+    /// Send a single manual keepalive request for a session.
+    func sendManualKeepalive(for sessionID: String) {
+        guard !manualKeepaliveInFlight.contains(sessionID) else { return }
+        guard let upstreamURL = currentAnthropicUpstreamURL else { return }
 
-                let sessStore = sessionStore
-                Task {
-                    let existingSessions = await sessStore.keepaliveBootstrapSessions()
-                    for session in existingSessions {
-                        await manager.startOrReset(sessionID: session.sessionID, headers: session.headers)
-                    }
-                }
+        manualKeepaliveInFlight.insert(sessionID)
+        manualKeepaliveLastResult.removeValue(forKey: sessionID)
+
+        let sessStore = sessionStore
+        let metStore = metricsStore
+        let handler = anthropicAPIHandler
+        let logger = eventLogger
+
+        Task { [weak self] in
+            let result = await Self.performManualKeepalive(
+                sessionID: sessionID,
+                upstreamBaseURL: upstreamURL,
+                sessionStore: sessStore,
+                metricsStore: metStore,
+                apiHandler: handler,
+                eventLogger: logger
+            )
+
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.manualKeepaliveInFlight.remove(sessionID)
+                self.manualKeepaliveLastResult[sessionID] = result
             }
-        } else if let manager = keepaliveManager {
-            keepaliveManager = nil
-            let logger = eventLogger
-            let metStore = metricsStore
-            let sessStore = sessionStore
-            let port = listeningPort
-            Task {
-                await manager.shutdown()
-                guard let logger else { return }
-                let snapshot = await metStore.snapshot()
-                let activeSessions = await sessStore.activeSessions().count
-                await logger.writeStatusSnapshot(
-                    enabled: true,
-                    port: port,
-                    activeSessions: activeSessions,
-                    activeKeepalives: 0,
-                    metrics: snapshot,
-                    force: true
-                )
+
+            // Clear the result indicator after a brief delay.
+            try? await Task.sleep(for: .seconds(2))
+            await MainActor.run { [weak self] in
+                self?.manualKeepaliveLastResult.removeValue(forKey: sessionID)
             }
         }
     }
 
-    /// Enable or disable keepalive for a specific session (user-initiated toggle).
-    func setSessionKeepalive(enabled: Bool, for sessionID: String) {
-        let sessStore = sessionStore
-        let manager = keepaliveManager
-        Task {
-            if enabled {
-                await sessStore.enableKeepalive(for: sessionID)
-                let headers = await sessStore.lineageRequestHeaders(for: sessionID)
-                if !headers.isEmpty {
-                    await manager?.startOrReset(sessionID: sessionID, headers: headers)
-                }
-            } else {
-                await sessStore.disableKeepaliveWithReason(for: sessionID, reason: "manually disabled")
-                await manager?.stop(sessionID: sessionID)
-            }
+    /// Perform a single keepalive request. Returns true on success, false on failure.
+    private nonisolated static func performManualKeepalive(
+        sessionID: String,
+        upstreamBaseURL: String,
+        sessionStore: ProxySessionStore,
+        metricsStore: ProxyMetricsStore,
+        apiHandler: any ProxyAPIHandler,
+        eventLogger: ProxyEventLogger?
+    ) async -> Bool {
+        guard await sessionStore.canSendManualKeepalive(for: sessionID) else { return false }
+
+        guard let lineageBody = await sessionStore.lineageRequestBody(for: sessionID) else {
+            return false
         }
+        guard let keepaliveBody = apiHandler.buildKeepaliveBody(from: lineageBody) else {
+            return false
+        }
+
+        let lineageHeaders = await sessionStore.lineageRequestHeaders(for: sessionID)
+        let urlString = upstreamBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            + apiHandler.keepaliveRequestPath
+        guard let url = URL(string: urlString) else { return false }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = keepaliveBody
+        for header in lineageHeaders {
+            let lowered = header.name.lowercased()
+            if lowered == "host" || lowered == "content-length" || lowered == "transfer-encoding" {
+                continue
+            }
+            request.addValue(header.value, forHTTPHeaderField: header.name)
+        }
+
+        let startedAt = Date()
+        let keepaliveID = await eventLogger?.logKeepaliveSent(session: sessionID)
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let httpResponse = response as? HTTPURLResponse
+            let statusCode = httpResponse?.statusCode ?? 0
+
+            await metricsStore.recordKeepaliveSent()
+
+            if statusCode >= 200 && statusCode < 300 {
+                let tokenUsage = apiHandler.parseTokenUsage(from: data, streaming: false)
+                await sessionStore.recordKeepaliveResult(
+                    for: sessionID,
+                    success: true,
+                    tokenUsage: tokenUsage
+                )
+                await eventLogger?.logKeepaliveCompleted(
+                    keepaliveID: keepaliveID,
+                    session: sessionID,
+                    success: true,
+                    statusCode: statusCode,
+                    durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: startedAt),
+                    upstreamRequestID: nil,
+                    tokenUsage: tokenUsage,
+                    error: nil
+                )
+                return true
+            } else {
+                await metricsStore.recordKeepaliveFailed()
+                await sessionStore.recordKeepaliveResult(
+                    for: sessionID,
+                    success: false,
+                    tokenUsage: .empty
+                )
+                await eventLogger?.logKeepaliveCompleted(
+                    keepaliveID: keepaliveID,
+                    session: sessionID,
+                    success: false,
+                    statusCode: statusCode,
+                    durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: startedAt),
+                    upstreamRequestID: nil,
+                    tokenUsage: .empty,
+                    error: "HTTP \(statusCode)"
+                )
+                return false
+            }
+        } catch {
+            await metricsStore.recordKeepaliveFailed()
+            await sessionStore.recordKeepaliveResult(
+                for: sessionID,
+                success: false,
+                tokenUsage: .empty
+            )
+            await eventLogger?.logKeepaliveCompleted(
+                keepaliveID: keepaliveID,
+                session: sessionID,
+                success: false,
+                statusCode: nil,
+                durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: startedAt),
+                upstreamRequestID: nil,
+                tokenUsage: .empty,
+                error: error.localizedDescription
+            )
+            return false
+        }
+    }
+
+    nonisolated private static func route(
+        for path: String,
+        anthropicHandler: any ProxyAPIHandler,
+        openAIHandler: any ProxyAPIHandler
+    ) -> ProxyAPIFlavor? {
+        if anthropicHandler.acceptsRequest(method: "POST", path: path) {
+            return .anthropicMessages
+        }
+        if openAIHandler.acceptsRequest(method: "POST", path: path) {
+            return .openAIResponses
+        }
+        return nil
+    }
+
+    nonisolated private static func forwarder(
+        for flavor: ProxyAPIFlavor?,
+        anthropicForwarder: ProxyForwarder?,
+        openAIForwarder: ProxyForwarder?
+    ) -> ProxyForwarder? {
+        switch flavor {
+        case .anthropicMessages:
+            return anthropicForwarder
+        case .openAIResponses:
+            return openAIForwarder
+        case nil:
+            return nil
+        }
+    }
+
+    nonisolated private static func errorBody(
+        forPath path: String?,
+        message: String,
+        anthropicHandler: any ProxyAPIHandler,
+        openAIHandler: any ProxyAPIHandler
+    ) -> Data {
+        switch route(for: path ?? "", anthropicHandler: anthropicHandler, openAIHandler: openAIHandler) {
+        case .openAIResponses:
+            return openAIHandler.proxyErrorBody(message: message)
+        case .anthropicMessages, nil:
+            return anthropicHandler.proxyErrorBody(message: message)
+        }
+    }
+
+    nonisolated private static func contentType(forPath path: String?) -> String {
+        _ = path
+        return "application/json"
     }
 
     /// Refresh session activities immediately in response to a traffic event.
@@ -392,8 +601,6 @@ final class LocalProxyController {
                 }
 
                 let sessions = await sessStore.recentSessionCount(within: 600)
-                let keepaliveManager = await MainActor.run { self?.keepaliveManager }
-                let keepalives = await keepaliveManager?.activeCount() ?? 0
                 let snapshot = await metStore.snapshot()
                 let activitySnapshots = await sessStore.snapshotSessionActivities()
                 let uploadSize  = await sessStore.lastUploadSize()
@@ -420,7 +627,7 @@ final class LocalProxyController {
                     self?.downloadBytesPerSec = downloadSpeed
                     self?.proxyStatus = ProxyStatus(
                         activeSessions: sessions,
-                        activeKeepalives: keepalives,
+                        activeKeepalives: 0,
                         totalRequestsForwarded: snapshot.totalRequestsForwarded,
                         totalKeepalivesSent: snapshot.totalKeepalivesSent,
                         totalKeepalivesFailed: snapshot.totalKeepalivesFailed,
@@ -454,7 +661,7 @@ final class LocalProxyController {
                     sessionID: snap.sessionID,
                     completedRequests: snap.completedRequestCount,
                     erroredRequests: snap.erroredRequestCount,
-                    keepaliveRequests: snap.keepaliveTotalCount,
+                    keepaliveCount: snap.keepaliveTotalCount,
                     activeRequests: snap.activeRequests.sorted { $0.startedAt > $1.startedAt },
                     doneRequests: snap.doneRequests.sorted {
                         ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt)
@@ -465,8 +672,24 @@ final class LocalProxyController {
                     totalCacheCreationInputTokens: snap.totalCacheCreationInputTokens,
                     estimatedCostUSD: snap.estimatedCostUSD,
                     isKeepaliveDisabled: snap.isKeepaliveDisabled,
-                    keepaliveDisabledReason: snap.keepaliveDisabledReason
+                    keepaliveDisabledReason: snap.keepaliveDisabledReason,
+                    keepaliveMode: snap.keepaliveMode,
+                    lineageReady: snap.lineageEstablished,
+                    lastKeepaliveAt: snap.lastKeepaliveAt,
+                    lastKeepaliveCacheReadPercent: Self.cacheReadPercent(from: snap.lastKeepaliveTokenUsage),
+                    lastKeepaliveOutputTokens: snap.lastKeepaliveTokenUsage?.outputTokens
                 )
             }
+    }
+
+    /// Compute cache read percentage from a keepalive token usage response.
+    private static func cacheReadPercent(from usage: TokenUsage?) -> Double? {
+        guard let usage else { return nil }
+        let cacheRead = Double(usage.cacheReadInputTokens ?? 0)
+        let cacheWrite = Double(usage.cacheCreationInputTokens ?? 0)
+        let input = Double(usage.inputTokens ?? 0)
+        let total = cacheRead + cacheWrite + input
+        guard total > 0 else { return nil }
+        return (cacheRead / total) * 100
     }
 }

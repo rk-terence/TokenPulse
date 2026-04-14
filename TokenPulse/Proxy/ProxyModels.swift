@@ -1,5 +1,92 @@
 import Foundation
 
+enum ProxyAPIFlavor: String, CaseIterable, Identifiable, Sendable {
+    case anthropicMessages
+    case openAIResponses
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .anthropicMessages:
+            return "Anthropic Messages"
+        case .openAIResponses:
+            return "OpenAI Responses"
+        }
+    }
+
+    var supportsKeepalive: Bool {
+        switch self {
+        case .anthropicMessages:
+            return true
+        case .openAIResponses:
+            return false
+        }
+    }
+
+    var supportedRouteDescription: String {
+        switch self {
+        case .anthropicMessages:
+            return "/v1/messages"
+        case .openAIResponses:
+            return "/v1/responses"
+        }
+    }
+
+    var sessionPrefix: String {
+        switch self {
+        case .anthropicMessages:
+            return "anthropic"
+        case .openAIResponses:
+            return "openai"
+        }
+    }
+}
+
+enum ProxySessionID {
+    static func make(_ rawID: String, flavor: ProxyAPIFlavor) -> String {
+        "\(flavor.sessionPrefix):\(normalized(rawID))"
+    }
+
+    static func flavor(for sessionID: String) -> ProxyAPIFlavor? {
+        if sessionID.hasPrefix("\(ProxyAPIFlavor.anthropicMessages.sessionPrefix):") {
+            return .anthropicMessages
+        }
+        if sessionID.hasPrefix("\(ProxyAPIFlavor.openAIResponses.sessionPrefix):") {
+            return .openAIResponses
+        }
+        return nil
+    }
+
+    static func displayID(for sessionID: String) -> String {
+        let rawID: Substring
+        if let separator = sessionID.firstIndex(of: ":") {
+            rawID = sessionID[sessionID.index(after: separator)...]
+        } else {
+            rawID = Substring(sessionID)
+        }
+        let cleaned = String(rawID)
+        return cleaned.isEmpty ? "unknown" : cleaned
+    }
+
+    static func shortDisplayID(for sessionID: String) -> String {
+        String(displayID(for: sessionID).prefix(8))
+    }
+
+    private static func normalized(_ rawID: String) -> String {
+        let trimmed = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "unknown" : trimmed
+    }
+}
+
+// MARK: - Keepalive mode
+
+enum KeepaliveMode: String, Sendable, CaseIterable {
+    case off
+    case manual
+    // case auto  // future — not implemented
+}
+
 // MARK: - Lightweight model for the proxy passthrough
 
 /// For Phase 1 passthrough, we store the raw body as Data and only extract

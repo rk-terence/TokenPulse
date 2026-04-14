@@ -543,26 +543,6 @@ private struct ProxyStatusRow: View {
                 SessionActivityRow(activity: activity, proxyController: proxy)
             }
 
-            // Cache metrics + savings — only meaningful when keepalive is enabled.
-            if ConfigService.shared.keepaliveEnabled,
-               proxy.proxyStatus.cacheReads > 0 || proxy.proxyStatus.cacheWrites > 0 {
-                HStack(spacing: 12) {
-                    ProxyMetricLabel(
-                        label: String(localized: "cache rd"),
-                        value: "\(proxy.proxyStatus.cacheReads)"
-                    )
-                    ProxyMetricLabel(
-                        label: String(localized: "cache wr"),
-                        value: "\(proxy.proxyStatus.cacheWrites)"
-                    )
-                    if proxy.proxyStatus.estimatedSavings > 0 {
-                        ProxyMetricLabel(
-                            label: String(localized: "saved"),
-                            value: String(format: "~%.1fx", proxy.proxyStatus.estimatedSavings)
-                        )
-                    }
-                }
-            }
         }
     }
 
@@ -583,21 +563,21 @@ private struct SessionActivityRow: View {
     let activity: LocalProxyController.SessionActivity
     let proxyController: LocalProxyController?
 
-    /// Whether keepalive was auto-disabled (lineage divergence, failures, auth)
-    /// as opposed to manually disabled by the user.
-    private var isAutoDisabled: Bool {
-        activity.isKeepaliveDisabled
-            && activity.keepaliveDisabledReason != nil
-            && activity.keepaliveDisabledReason != "manually disabled"
-    }
-
-    private var keepaliveBinding: Binding<Bool> {
+    private var keepaliveModeBinding: Binding<KeepaliveMode> {
         Binding(
-            get: { !activity.isKeepaliveDisabled },
-            set: { enabled in
-                proxyController?.setSessionKeepalive(enabled: enabled, for: activity.sessionID)
+            get: { activity.keepaliveMode },
+            set: { mode in
+                proxyController?.setSessionKeepaliveMode(mode, for: activity.sessionID)
             }
         )
+    }
+
+    private var isInFlight: Bool {
+        proxyController?.manualKeepaliveInFlight.contains(activity.sessionID) ?? false
+    }
+
+    private var lastResult: Bool? {
+        proxyController?.manualKeepaliveLastResult[activity.sessionID]
     }
 
     var body: some View {
@@ -611,19 +591,39 @@ private struct SessionActivityRow: View {
                 sessionStats
             }
 
-            // Per-session keepalive toggle — only shown when global keepalive is enabled
-            if ConfigService.shared.keepaliveEnabled {
-                HStack(spacing: 4) {
-                    Toggle(isOn: keepaliveBinding) {
-                        Text(String(localized: "Keepalive"))
-                            .font(.caption)
+            // Per-session keepalive controls — shown when global keepalive is enabled
+            if ConfigService.shared.keepaliveEnabled,
+               activity.supportsKeepalive {
+                HStack(spacing: 6) {
+                    Picker("", selection: keepaliveModeBinding) {
+                        Text(String(localized: "Off")).tag(KeepaliveMode.off)
+                        Text(String(localized: "Manual")).tag(KeepaliveMode.manual)
                     }
-                    .toggleStyle(.switch)
+                    .pickerStyle(.segmented)
+                    .frame(width: 120)
                     .controlSize(.mini)
-                    .disabled(isAutoDisabled)
 
-                    if let reason = activity.keepaliveDisabledReason,
-                       reason != "manually disabled" {
+                    if activity.keepaliveMode == .manual {
+                        if isInFlight {
+                            ProgressView()
+                                .controlSize(.mini)
+                        } else if let result = lastResult {
+                            Image(systemName: result ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundStyle(result ? .green : .red)
+                                .font(.caption)
+                        } else {
+                            Button(String(localized: "Send")) {
+                                proxyController?.sendManualKeepalive(for: activity.sessionID)
+                            }
+                            .controlSize(.mini)
+                            .disabled(!activity.canSendKeepalive)
+                            .help(activity.canSendKeepalive
+                                ? String(localized: "Send a cache-warming keepalive request")
+                                : String(localized: "Waiting for lineage to be established"))
+                        }
+                    }
+
+                    if let reason = activity.keepaliveDisabledReason {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundStyle(.orange)
                             .font(.caption2)
@@ -631,6 +631,32 @@ private struct SessionActivityRow: View {
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
+                    }
+                }
+                .padding(.leading, 10)
+            }
+
+            // Per-session keepalive stats
+            if activity.keepaliveCount > 0,
+               let cachePercent = activity.lastKeepaliveCacheReadPercent {
+                HStack(spacing: 4) {
+                    Text(String(
+                        format: NSLocalizedString(
+                            "proxy.keepalive.stats",
+                            value: "#keepalive: %d  last: %.0f%% cache read, %d out tok",
+                            comment: ""
+                        ),
+                        activity.keepaliveCount,
+                        cachePercent,
+                        activity.lastKeepaliveOutputTokens ?? 0
+                    ))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+
+                    if let lastAt = activity.lastKeepaliveAt {
+                        Text(relativeTime(since: lastAt))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.tertiary)
                     }
                 }
                 .padding(.leading, 10)
@@ -680,10 +706,10 @@ private struct SessionActivityRow: View {
                     value: "\(activity.completedRequests)"
                 )
             }
-            if activity.keepaliveRequests > 0 {
+            if activity.keepaliveCount > 0 {
                 ProxyMetricLabel(
                     label: String(localized: "ka"),
-                    value: "\(activity.keepaliveRequests)"
+                    value: "\(activity.keepaliveCount)"
                 )
             }
             if activity.erroredRequests > 0 {
@@ -712,6 +738,17 @@ private struct SessionActivityRow: View {
             return String(format: "%.3f", cost)
         } else {
             return String(format: "%.2f", cost)
+        }
+    }
+
+    private func relativeTime(since date: Date) -> String {
+        let seconds = Int(Date().timeIntervalSince(date))
+        if seconds < 60 {
+            return "\(seconds)s"
+        } else if seconds < 3600 {
+            return "\(seconds / 60)m"
+        } else {
+            return "\(seconds / 3600)h"
         }
     }
 }

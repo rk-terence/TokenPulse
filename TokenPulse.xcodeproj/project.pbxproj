@@ -32,10 +32,11 @@
 		C30000010000000000000002 /* ProxySessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000002 /* ProxySessionStore.swift */; };
 		C30000010000000000000003 /* ProxyMetricsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000003 /* ProxyMetricsStore.swift */; };
 		C30000010000000000000004 /* ProxyHTTPServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000004 /* ProxyHTTPServer.swift */; };
-		C30000010000000000000005 /* AnthropicForwarder.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000005 /* AnthropicForwarder.swift */; };
+		C30000010000000000000005 /* ProxyForwarder.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000005 /* ProxyForwarder.swift */; };
 		C30000010000000000000006 /* LocalProxyController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000006 /* LocalProxyController.swift */; };
-		C30000010000000000000007 /* KeepaliveManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000007 /* KeepaliveManager.swift */; };
 		C30000010000000000000008 /* ProxyEventLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000008 /* ProxyEventLogger.swift */; };
+		C30000010000000000000009 /* AnthropicProxyAPIHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000009 /* AnthropicProxyAPIHandler.swift */; };
+		C3000001000000000000000A /* OpenAIResponsesProxyAPIHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2000001000000000000000A /* OpenAIResponsesProxyAPIHandler.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -68,10 +69,11 @@
 		C20000010000000000000002 /* ProxySessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxySessionStore.swift; sourceTree = "<group>"; };
 		C20000010000000000000003 /* ProxyMetricsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyMetricsStore.swift; sourceTree = "<group>"; };
 		C20000010000000000000004 /* ProxyHTTPServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyHTTPServer.swift; sourceTree = "<group>"; };
-		C20000010000000000000005 /* AnthropicForwarder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnthropicForwarder.swift; sourceTree = "<group>"; };
+		C20000010000000000000005 /* ProxyForwarder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyForwarder.swift; sourceTree = "<group>"; };
 		C20000010000000000000006 /* LocalProxyController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalProxyController.swift; sourceTree = "<group>"; };
-		C20000010000000000000007 /* KeepaliveManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeepaliveManager.swift; sourceTree = "<group>"; };
 		C20000010000000000000008 /* ProxyEventLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyEventLogger.swift; sourceTree = "<group>"; };
+		C20000010000000000000009 /* AnthropicProxyAPIHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnthropicProxyAPIHandler.swift; sourceTree = "<group>"; };
+		C2000001000000000000000A /* OpenAIResponsesProxyAPIHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenAIResponsesProxyAPIHandler.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -180,9 +182,10 @@
 				C20000010000000000000002 /* ProxySessionStore.swift */,
 				C20000010000000000000003 /* ProxyMetricsStore.swift */,
 				C20000010000000000000004 /* ProxyHTTPServer.swift */,
-				C20000010000000000000005 /* AnthropicForwarder.swift */,
+				C20000010000000000000005 /* ProxyForwarder.swift */,
+				C20000010000000000000009 /* AnthropicProxyAPIHandler.swift */,
+				C2000001000000000000000A /* OpenAIResponsesProxyAPIHandler.swift */,
 				C20000010000000000000006 /* LocalProxyController.swift */,
-				C20000010000000000000007 /* KeepaliveManager.swift */,
 				C20000010000000000000008 /* ProxyEventLogger.swift */,
 			);
 			path = Proxy;
@@ -289,9 +292,10 @@
 				C30000010000000000000002 /* ProxySessionStore.swift in Sources */,
 				C30000010000000000000003 /* ProxyMetricsStore.swift in Sources */,
 				C30000010000000000000004 /* ProxyHTTPServer.swift in Sources */,
-				C30000010000000000000005 /* AnthropicForwarder.swift in Sources */,
+				C30000010000000000000005 /* ProxyForwarder.swift in Sources */,
+				C30000010000000000000009 /* AnthropicProxyAPIHandler.swift in Sources */,
+				C3000001000000000000000A /* OpenAIResponsesProxyAPIHandler.swift in Sources */,
 				C30000010000000000000006 /* LocalProxyController.swift in Sources */,
-				C30000010000000000000007 /* KeepaliveManager.swift in Sources */,
 				C30000010000000000000008 /* ProxyEventLogger.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
