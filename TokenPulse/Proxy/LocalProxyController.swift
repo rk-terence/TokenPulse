@@ -7,6 +7,7 @@ import Foundation
 final class LocalProxyController {
     private static let sessionExpirationSweepInterval: TimeInterval = 60
     private static let sessionRetentionSeconds: TimeInterval = 24 * 60 * 60
+    private static let sessionVisibilitySeconds: TimeInterval = 10 * 60
 
     // MARK: - Per-session activity snapshot for UI
 
@@ -334,34 +335,7 @@ final class LocalProxyController {
             let activitySnapshots = await sessStore.snapshotSessionActivities()
             let uploadSize = await sessStore.lastUploadSize()
             let totalCost = await sessStore.totalEstimatedCostUSD()
-            let now = Date()
-            let recentCutoff = now.addingTimeInterval(-600)
-
-            let activities = activitySnapshots
-                .filter {
-                    max($0.lastSeenAt, $0.lastKeepaliveAt ?? .distantPast) >= recentCutoff
-                        || !$0.activeRequests.isEmpty
-                        || !$0.doneRequests.isEmpty
-                }
-                .map { snap in
-                    SessionActivity(
-                        sessionID: snap.sessionID,
-                        completedRequests: snap.completedRequestCount,
-                        erroredRequests: snap.erroredRequestCount,
-                        keepaliveRequests: snap.keepaliveTotalCount,
-                        activeRequests: snap.activeRequests.sorted { $0.startedAt > $1.startedAt },
-                        doneRequests: snap.doneRequests.sorted {
-                            ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt)
-                        },
-                        totalInputTokens: snap.totalInputTokens,
-                        totalOutputTokens: snap.totalOutputTokens,
-                        totalCacheReadInputTokens: snap.totalCacheReadInputTokens,
-                        totalCacheCreationInputTokens: snap.totalCacheCreationInputTokens,
-                        estimatedCostUSD: snap.estimatedCostUSD,
-                        isKeepaliveDisabled: snap.isKeepaliveDisabled,
-                        keepaliveDisabledReason: snap.keepaliveDisabledReason
-                    )
-                }
+            let activities = Self.visibleSessionActivities(from: activitySnapshots, now: Date())
 
             self.sessionActivities = activities
             self.lastUploadBytes = uploadSize
@@ -433,33 +407,7 @@ final class LocalProxyController {
                 prevTransfer     = (sent: 0, received: bytesRx)
                 prevTransferDate = now
 
-                // Keep sessions visible while recent real traffic or keepalive activity exists.
-                let recentCutoff = now.addingTimeInterval(-600)
-                let activities = activitySnapshots
-                    .filter {
-                        max($0.lastSeenAt, $0.lastKeepaliveAt ?? .distantPast) >= recentCutoff
-                            || !$0.activeRequests.isEmpty
-                            || !$0.doneRequests.isEmpty
-                    }
-                    .map { snap in
-                        SessionActivity(
-                            sessionID: snap.sessionID,
-                            completedRequests: snap.completedRequestCount,
-                            erroredRequests: snap.erroredRequestCount,
-                            keepaliveRequests: snap.keepaliveTotalCount,
-                            activeRequests: snap.activeRequests
-                                .sorted { $0.startedAt > $1.startedAt },
-                            doneRequests: snap.doneRequests
-                                .sorted { ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt) },
-                            totalInputTokens: snap.totalInputTokens,
-                            totalOutputTokens: snap.totalOutputTokens,
-                            totalCacheReadInputTokens: snap.totalCacheReadInputTokens,
-                            totalCacheCreationInputTokens: snap.totalCacheCreationInputTokens,
-                            estimatedCostUSD: snap.estimatedCostUSD,
-                            isKeepaliveDisabled: snap.isKeepaliveDisabled,
-                            keepaliveDisabledReason: snap.keepaliveDisabledReason
-                        )
-                    }
+                let activities = Self.visibleSessionActivities(from: activitySnapshots, now: now)
 
                 await MainActor.run {
                     guard !Task.isCancelled else { return }
@@ -484,5 +432,37 @@ final class LocalProxyController {
                 }
             }
         }
+    }
+
+    private static func visibleSessionActivities(
+        from snapshots: [ProxySessionStore.SessionSnapshot],
+        now: Date
+    ) -> [SessionActivity] {
+        let recentCutoff = now.addingTimeInterval(-sessionVisibilitySeconds)
+
+        return snapshots
+            .filter {
+                max($0.lastSeenAt, $0.lastKeepaliveAt ?? .distantPast) >= recentCutoff
+                    || !$0.activeRequests.isEmpty
+            }
+            .map { snap in
+                SessionActivity(
+                    sessionID: snap.sessionID,
+                    completedRequests: snap.completedRequestCount,
+                    erroredRequests: snap.erroredRequestCount,
+                    keepaliveRequests: snap.keepaliveTotalCount,
+                    activeRequests: snap.activeRequests.sorted { $0.startedAt > $1.startedAt },
+                    doneRequests: snap.doneRequests.sorted {
+                        ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt)
+                    },
+                    totalInputTokens: snap.totalInputTokens,
+                    totalOutputTokens: snap.totalOutputTokens,
+                    totalCacheReadInputTokens: snap.totalCacheReadInputTokens,
+                    totalCacheCreationInputTokens: snap.totalCacheCreationInputTokens,
+                    estimatedCostUSD: snap.estimatedCostUSD,
+                    isKeepaliveDisabled: snap.isKeepaliveDisabled,
+                    keepaliveDisabledReason: snap.keepaliveDisabledReason
+                )
+            }
     }
 }

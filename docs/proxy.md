@@ -62,7 +62,7 @@ The design keeps all hot-path state (session tracking, metrics, event logging) o
 The proxy keeps session state in memory longer than it keeps every session visible in the popover.
 
 - **Retention in memory**: a session is evicted only when it has no in-flight requests and its most recent activity (`max(lastSeenAt, lastKeepaliveAt)`) is older than 24 hours.
-- **Visibility in UI**: a session row is shown when it was active within the last 10 minutes, or when it still has active requests, or when it still has done requests to display.
+- **Visibility in UI**: a session row is shown when it was active within the last 10 minutes, or when it still has active requests. Retained done requests do not keep an otherwise inactive session visible.
 - **Request visibility follows session visibility**: requests are rendered only inside their parent session row, so if a session is filtered out of the UI, all of its requests are hidden with it.
 
 Done requests are stored in memory per session. They are not time-evicted. A done request disappears only when it is replaced by a newer done request whose prompt contains the older prompt for the same model, or when the entire session expires.
