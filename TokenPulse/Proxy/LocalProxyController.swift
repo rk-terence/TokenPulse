@@ -8,6 +8,7 @@ final class LocalProxyController {
     private static let sessionExpirationSweepInterval: TimeInterval = 60
     private static let sessionRetentionSeconds: TimeInterval = 24 * 60 * 60
     private static let sessionVisibilitySeconds: TimeInterval = 10 * 60
+    private static let sideTrafficDoneRetentionSeconds: TimeInterval = 5 * 60
 
     // MARK: - Per-session activity snapshot for UI
 
@@ -385,6 +386,9 @@ final class LocalProxyController {
                             await logger?.logSessionExpired(session: sessionID)
                         }
                     }
+                    await sessStore.pruneStaleDoneRequests(
+                        olderThan: now.addingTimeInterval(-Self.sideTrafficDoneRetentionSeconds)
+                    )
                 }
 
                 let sessions = await sessStore.recentSessionCount(within: 600)

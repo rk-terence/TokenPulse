@@ -130,11 +130,14 @@ final class AnthropicForwarder: Sendable {
 
         // Register the in-flight request in the session store for real-time UI display.
         let requestID = UUID()
+        let isMainAgentShaped = ProxyRequestBody.hasTools(from: request.body)
+            && !ProxyRequestBody.hasJSONSchemaOutputConfig(from: request.body)
         await sessionStore.startRequest(
             id: requestID,
             sessionID: sessionID,
             model: model,
-            promptDescriptor: promptDescriptor
+            promptDescriptor: promptDescriptor,
+            isMainAgentShaped: isMainAgentShaped
         )
         await sessionStore.recordBytesSent(request.body.count)
 
@@ -173,7 +176,8 @@ final class AnthropicForwarder: Sendable {
             keepaliveManager: keepaliveManager
         )
 
-        // Evaluate lineage only for non-errored done requests.
+        // Always evaluate lineage for non-errored requests so bootstrap data
+        // is available if keepalive is enabled later.
         if !errored {
             let lineageResult = await sessionStore.evaluateAndTrackLineage(
                 body: request.body,

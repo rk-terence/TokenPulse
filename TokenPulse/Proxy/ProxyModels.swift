@@ -382,6 +382,9 @@ struct ProxyRequestActivity: Sendable, Identifiable {
     let modelID: String?
     /// Stable prompt descriptor built from prompt-shaping fields in the request body.
     let promptDescriptor: String?
+    /// Whether this request matches the main-agent shape (has tools, not schema-constrained).
+    /// Main-agent done requests persist for the session lifetime; others expire after 5 minutes.
+    let isMainAgentShaped: Bool
     /// Cumulative bytes sent to upstream so far.
     var bytesSent: Int
     /// Cumulative bytes received from upstream so far.
@@ -419,9 +422,13 @@ struct TokenUsage: Sendable {
     let outputTokens: Int?
     let cacheReadInputTokens: Int?
     let cacheCreationInputTokens: Int?
+    /// The API's stop reason (e.g. "end_turn", "max_tokens", "tool_use").
+    /// Non-nil only when the response completed normally.
+    let stopReason: String?
 
     static let empty = TokenUsage(inputTokens: nil, outputTokens: nil,
-                                  cacheReadInputTokens: nil, cacheCreationInputTokens: nil)
+                                  cacheReadInputTokens: nil, cacheCreationInputTokens: nil,
+                                  stopReason: nil)
 
     /// Compute the estimated cost (USD) using the given pricing rates.
     func cost(for pricing: ModelPricing) -> Double {
@@ -522,7 +529,8 @@ enum ProxyHTTPUtils {
             inputTokens: usage["input_tokens"] as? Int,
             outputTokens: usage["output_tokens"] as? Int,
             cacheReadInputTokens: usage["cache_read_input_tokens"] as? Int,
-            cacheCreationInputTokens: usage["cache_creation_input_tokens"] as? Int
+            cacheCreationInputTokens: usage["cache_creation_input_tokens"] as? Int,
+            stopReason: json["stop_reason"] as? String
         )
     }
 
@@ -538,6 +546,7 @@ enum ProxyHTTPUtils {
         var outputTokens: Int?
         var cacheReadInputTokens: Int?
         var cacheCreationInputTokens: Int?
+        var stopReason: String?
 
         text.enumerateLines { line, stop in
             guard line.hasPrefix("data: ") else { return }
@@ -559,9 +568,14 @@ enum ProxyHTTPUtils {
                 cacheCreationInputTokens = usage["cache_creation_input_tokens"] as? Int
 
             case "message_delta":
+                // stop_reason lives at delta.stop_reason
+                if let delta = json["delta"] as? [String: Any] {
+                    stopReason = delta["stop_reason"] as? String
+                }
                 // output_tokens lives at usage.output_tokens
-                guard let usage = json["usage"] as? [String: Any] else { return }
-                outputTokens = usage["output_tokens"] as? Int
+                if let usage = json["usage"] as? [String: Any] {
+                    outputTokens = usage["output_tokens"] as? Int
+                }
                 // Stop early — message_delta is the last event with usage data.
                 stop = true
 
@@ -574,7 +588,8 @@ enum ProxyHTTPUtils {
             inputTokens: inputTokens,
             outputTokens: outputTokens,
             cacheReadInputTokens: cacheReadInputTokens,
-            cacheCreationInputTokens: cacheCreationInputTokens
+            cacheCreationInputTokens: cacheCreationInputTokens,
+            stopReason: stopReason
         )
     }
 

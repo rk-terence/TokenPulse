@@ -437,12 +437,13 @@ actor ProxySessionStore {
     // MARK: - Request activity tracking
 
     /// Register a new in-flight request. Call immediately before starting the upstream fetch.
-    func startRequest(id: UUID, sessionID: String, model: String?, promptDescriptor: String?) {
+    func startRequest(id: UUID, sessionID: String, model: String?, promptDescriptor: String?, isMainAgentShaped: Bool) {
         let activity = ProxyRequestActivity(
             id: id,
             state: .uploading,
             modelID: model,
             promptDescriptor: promptDescriptor,
+            isMainAgentShaped: isMainAgentShaped,
             bytesSent: 0,
             bytesReceived: 0,
             lastDataAt: nil,
@@ -518,7 +519,7 @@ actor ProxySessionStore {
     /// Cumulative bytes received since the actor was created. Used for KB/s computation.
     func cumulativeBytesReceived() -> Int { totalBytesReceived }
 
-    /// Finalize a request, promoting only successful completions into the session's
+    /// Finalize a request, promoting only non-errored responses into the session's
     /// done section where prompt-based replacement is evaluated.
     func markRequestDone(id: UUID, errored: Bool, tokenUsage: TokenUsage?, estimatedCost: Double?) {
         guard var entry = activeRequests.removeValue(forKey: id) else { return }
@@ -528,15 +529,19 @@ actor ProxySessionStore {
         entry.activity.tokenUsage = tokenUsage
         entry.activity.estimatedCost = estimatedCost
 
-        if !errored {
+        // A response is "complete" when no transport/HTTP error occurred.
+        // We don't require stopReason because the streaming capture buffer
+        // may be truncated (4 MB cap) and miss the final message_delta event.
+        let isComplete = !errored
+        if isComplete {
             insertDoneRequest(entry.activity, for: entry.sessionID)
         }
 
         if var session = sessions[entry.sessionID] {
-            if errored {
-                session.erroredRequestCount += 1
-            } else {
+            if isComplete {
                 session.completedRequestCount += 1
+            } else {
+                session.erroredRequestCount += 1
             }
             sessions[entry.sessionID] = session
         }
@@ -591,6 +596,21 @@ actor ProxySessionStore {
             doneRequestsBySession.removeValue(forKey: id)
         }
         return expired
+    }
+
+    /// Remove non-main-agent done requests older than the given cutoff.
+    /// Main-agent requests persist for the session lifetime.
+    func pruneStaleDoneRequests(olderThan cutoff: Date) {
+        for (sessionID, requests) in doneRequestsBySession {
+            let filtered = requests.filter { request in
+                request.isMainAgentShaped || (request.completedAt ?? request.startedAt) >= cutoff
+            }
+            if filtered.isEmpty {
+                doneRequestsBySession.removeValue(forKey: sessionID)
+            } else if filtered.count != requests.count {
+                doneRequestsBySession[sessionID] = filtered
+            }
+        }
     }
 
     private func insertDoneRequest(_ activity: ProxyRequestActivity, for sessionID: String) {
