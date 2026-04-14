@@ -1,6 +1,8 @@
 import SwiftUI
 
 struct PopoverView: View {
+    private static let popoverWidth: CGFloat = 384
+
     let manager: ProviderManager
     var proxyController: LocalProxyController?
     var onTogglePin: ((Bool) -> Void)?
@@ -91,7 +93,7 @@ struct PopoverView: View {
             }
         }
         .padding(12)
-        .frame(width: 320)
+        .frame(width: Self.popoverWidth)
         .background(.thinMaterial)
     }
 
