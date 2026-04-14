@@ -26,6 +26,14 @@ actor ProxySessionStore {
         var totalCacheReadInputTokens: Int
         var totalCacheCreationInputTokens: Int
         var estimatedCostUSD: Double
+        // Lineage tracking for keepalive:
+        var totalRequestsSeen: Int
+        var lineageFingerprint: LineageFingerprint?
+        var lineageMessagesDescriptor: String?
+        var lineageRequestBody: Data?
+        var lineageRequestHeaders: [(name: String, value: String)]
+        var lineageEstablished: Bool
+        var keepaliveDisabledReason: String?
     }
 
     /// A snapshot of a session's stats and its currently active requests, for UI display.
@@ -43,6 +51,22 @@ actor ProxySessionStore {
         let totalCacheReadInputTokens: Int
         let totalCacheCreationInputTokens: Int
         let estimatedCostUSD: Double
+        let isKeepaliveDisabled: Bool
+        let keepaliveDisabledReason: String?
+    }
+
+    /// Result of evaluating an incoming request against the tracked main-agent lineage.
+    enum LineageEvaluation: Sendable {
+        /// Request accepted as a main-agent continuation; keepalive body updated.
+        case tracked
+        /// Request does not look like the main agent (side traffic); ignored.
+        case ignored
+        /// Was tracking, but this request diverges; keepalive disabled for the session.
+        case diverged(reason: String)
+        /// Keepalive already disabled for this session.
+        case alreadyDisabled
+        /// Within the first 2 requests; still identifying the main agent.
+        case pendingIdentification
     }
 
     private var sessions: [String: Session] = [:]
@@ -96,7 +120,14 @@ actor ProxySessionStore {
                 totalOutputTokens: 0,
                 totalCacheReadInputTokens: 0,
                 totalCacheCreationInputTokens: 0,
-                estimatedCostUSD: 0
+                estimatedCostUSD: 0,
+                totalRequestsSeen: 0,
+                lineageFingerprint: nil,
+                lineageMessagesDescriptor: nil,
+                lineageRequestBody: nil,
+                lineageRequestHeaders: [],
+                lineageEstablished: false,
+                keepaliveDisabledReason: nil
             )
             sessions[sessionID] = session
             return session
@@ -171,14 +202,187 @@ actor ProxySessionStore {
         sessions[sessionID]?.lastRequestBody
     }
 
-    /// Sessions that already have enough request context to arm keepalive immediately.
+    /// Sessions that already have enough lineage context to arm keepalive immediately.
     func keepaliveBootstrapSessions() -> [(sessionID: String, headers: [(name: String, value: String)])] {
         sessions.values.compactMap { session in
-            guard session.lastRequestBody != nil, !session.lastRequestHeaders.isEmpty else {
+            guard session.lineageRequestBody != nil, !session.lineageRequestHeaders.isEmpty else {
                 return nil
             }
-            return (sessionID: session.sessionID, headers: session.lastRequestHeaders)
+            return (sessionID: session.sessionID, headers: session.lineageRequestHeaders)
         }
+    }
+
+    // MARK: - Lineage tracking
+
+    /// Evaluate an incoming request against the tracked main-agent lineage.
+    /// Updates lineage state and returns an evaluation that tells the caller
+    /// whether to start/reset keepalive, stop it, or leave it alone.
+    func evaluateAndTrackLineage(
+        body: Data,
+        headers: [(name: String, value: String)],
+        model: String?,
+        for sessionID: String
+    ) -> LineageEvaluation {
+        guard var session = sessions[sessionID] else { return .ignored }
+
+        // Already disabled — nothing to do.
+        if session.isKeepaliveDisabled {
+            return .alreadyDisabled
+        }
+
+        session.totalRequestsSeen += 1
+        sessions[sessionID] = session
+
+        // Classify the incoming request.
+        let hasTools = ProxyRequestBody.hasTools(from: body)
+        let isSchemaConstrained = ProxyRequestBody.hasJSONSchemaOutputConfig(from: body)
+        let isMainAgentShaped = hasTools && !isSchemaConstrained
+
+        // Phase 1: Lineage not yet established — identify the main agent from
+        // the first 2 requests. We store a candidate fingerprint on the first
+        // main-agent-shaped request but keep the window open until 2 requests
+        // have been seen.
+        if !session.lineageEstablished {
+            if isMainAgentShaped {
+                if session.lineageFingerprint == nil {
+                    // First main-agent-shaped request — store as candidate.
+                    guard let fingerprint = ProxyRequestBody.lineageFingerprint(from: body) else {
+                        return .ignored
+                    }
+                    session.lineageFingerprint = fingerprint
+                    session.lineageMessagesDescriptor = ProxyRequestBody.messagesDescriptor(from: body)
+                    session.lineageRequestBody = body
+                    session.lineageRequestHeaders = headers
+                    // Close the window if this is already request #2.
+                    if session.totalRequestsSeen >= 2 {
+                        session.lineageEstablished = true
+                    }
+                    sessions[sessionID] = session
+                    return .tracked
+                } else {
+                    // Second main-agent-shaped request in window — close the
+                    // window and fall through to the continuation check below.
+                    session.lineageEstablished = true
+                    sessions[sessionID] = session
+                }
+            } else {
+                // Not main-agent-shaped.
+                if session.totalRequestsSeen >= 2 && session.lineageFingerprint == nil {
+                    // Past identification window without finding a main agent.
+                    disableKeepaliveWithReason(
+                        for: sessionID,
+                        reason: String(localized: "no main-agent candidate in first 2 requests")
+                    )
+                    return .diverged(reason: "no main-agent candidate in first 2 requests")
+                }
+                if session.totalRequestsSeen >= 2 && session.lineageFingerprint != nil {
+                    // Window closed with a candidate already stored — establish it.
+                    session.lineageEstablished = true
+                    sessions[sessionID] = session
+                }
+                return session.lineageEstablished ? .ignored : .pendingIdentification
+            }
+        }
+
+        // Reload session after potential updates above.
+        guard let currentSession = sessions[sessionID] else { return .ignored }
+
+        // Phase 2: Lineage established — classify against tracked fingerprint.
+        if !isMainAgentShaped {
+            return .ignored
+        }
+
+        guard let tracked = currentSession.lineageFingerprint else { return .ignored }
+        guard let incoming = ProxyRequestBody.lineageFingerprint(from: body) else { return .ignored }
+
+        // Check fingerprint divergence — compare all cache-key fields individually
+        // so we can report which field diverged.
+        if incoming.model != tracked.model {
+            let reason = "model changed: \(tracked.model) → \(incoming.model)"
+            disableKeepaliveWithReason(for: sessionID, reason: reason)
+            return .diverged(reason: reason)
+        }
+        if incoming.systemCanonical != tracked.systemCanonical {
+            let reason = String(localized: "system prompt changed")
+            disableKeepaliveWithReason(for: sessionID, reason: reason)
+            return .diverged(reason: reason)
+        }
+        if incoming.toolsCanonical != tracked.toolsCanonical {
+            let reason = String(localized: "tools changed")
+            disableKeepaliveWithReason(for: sessionID, reason: reason)
+            return .diverged(reason: reason)
+        }
+        if incoming.toolChoiceCanonical != tracked.toolChoiceCanonical {
+            let reason = String(localized: "tool_choice changed")
+            disableKeepaliveWithReason(for: sessionID, reason: reason)
+            return .diverged(reason: reason)
+        }
+        if incoming.thinkingCanonical != tracked.thinkingCanonical {
+            let reason = String(localized: "thinking config changed")
+            disableKeepaliveWithReason(for: sessionID, reason: reason)
+            return .diverged(reason: reason)
+        }
+
+        // Check append-only messages.
+        let incomingMessages = ProxyRequestBody.messagesDescriptor(from: body)
+        if let trackedMessages = currentSession.lineageMessagesDescriptor,
+           let incomingMsg = incomingMessages {
+            if !incomingMsg.hasPrefix(trackedMessages) {
+                // Count message lines to distinguish "shorter = side traffic" from "rewrite = divergence".
+                let trackedCount = trackedMessages.components(separatedBy: "\nmessage:").count
+                let incomingCount = incomingMsg.components(separatedBy: "\nmessage:").count
+                if incomingCount < trackedCount {
+                    return .ignored
+                }
+                let reason = String(localized: "messages not append-only")
+                disableKeepaliveWithReason(for: sessionID, reason: reason)
+                return .diverged(reason: reason)
+            }
+        }
+
+        // All checks pass — promote this request as the latest lineage point.
+        if var updated = sessions[sessionID] {
+            updated.lineageMessagesDescriptor = incomingMessages
+            updated.lineageRequestBody = body
+            updated.lineageRequestHeaders = headers
+            sessions[sessionID] = updated
+        }
+        return .tracked
+    }
+
+    /// Retrieve the lineage request body for keepalive use.
+    func lineageRequestBody(for sessionID: String) -> Data? {
+        sessions[sessionID]?.lineageRequestBody
+    }
+
+    /// Retrieve the lineage request headers for keepalive use.
+    func lineageRequestHeaders(for sessionID: String) -> [(name: String, value: String)] {
+        sessions[sessionID]?.lineageRequestHeaders ?? []
+    }
+
+    /// Disable keepalive with a human-readable reason for UI display.
+    func disableKeepaliveWithReason(for sessionID: String, reason: String) {
+        if var session = sessions[sessionID] {
+            session.isKeepaliveDisabled = true
+            session.keepaliveDisabledReason = reason
+            sessions[sessionID] = session
+        }
+    }
+
+    /// Re-enable keepalive for a session after a user-initiated disable.
+    /// Clears the disabled flag and reason. Lineage state is preserved so the
+    /// next tracked request can resume the keepalive loop.
+    func enableKeepalive(for sessionID: String) {
+        if var session = sessions[sessionID] {
+            session.isKeepaliveDisabled = false
+            session.keepaliveDisabledReason = nil
+            sessions[sessionID] = session
+        }
+    }
+
+    /// The reason keepalive was disabled for a session, if any.
+    func keepaliveDisabledReason(for sessionID: String) -> String? {
+        sessions[sessionID]?.keepaliveDisabledReason
     }
 
     /// Record keepalive result for a session.
@@ -358,7 +562,9 @@ actor ProxySessionStore {
                 totalOutputTokens: session.totalOutputTokens,
                 totalCacheReadInputTokens: session.totalCacheReadInputTokens,
                 totalCacheCreationInputTokens: session.totalCacheCreationInputTokens,
-                estimatedCostUSD: session.estimatedCostUSD
+                estimatedCostUSD: session.estimatedCostUSD,
+                isKeepaliveDisabled: session.isKeepaliveDisabled,
+                keepaliveDisabledReason: session.keepaliveDisabledReason
             )
         }.sorted {
             max($0.lastSeenAt, $0.lastKeepaliveAt ?? .distantPast)

@@ -538,7 +538,7 @@ private struct ProxyStatusRow: View {
             }
 
             ForEach(proxy.sessionActivities) { activity in
-                SessionActivityRow(activity: activity)
+                SessionActivityRow(activity: activity, proxyController: proxy)
             }
 
             // Cache metrics + savings — only meaningful when keepalive is enabled.
@@ -579,6 +579,24 @@ private struct ProxyStatusRow: View {
 
 private struct SessionActivityRow: View {
     let activity: LocalProxyController.SessionActivity
+    let proxyController: LocalProxyController?
+
+    /// Whether keepalive was auto-disabled (lineage divergence, failures, auth)
+    /// as opposed to manually disabled by the user.
+    private var isAutoDisabled: Bool {
+        activity.isKeepaliveDisabled
+            && activity.keepaliveDisabledReason != nil
+            && activity.keepaliveDisabledReason != "manually disabled"
+    }
+
+    private var keepaliveBinding: Binding<Bool> {
+        Binding(
+            get: { !activity.isKeepaliveDisabled },
+            set: { enabled in
+                proxyController?.setSessionKeepalive(enabled: enabled, for: activity.sessionID)
+            }
+        )
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -591,14 +609,48 @@ private struct SessionActivityRow: View {
                 sessionStats
             }
 
+            // Per-session keepalive toggle — only shown when global keepalive is enabled
+            if ConfigService.shared.keepaliveEnabled {
+                HStack(spacing: 4) {
+                    Toggle(isOn: keepaliveBinding) {
+                        Text(String(localized: "Keepalive"))
+                            .font(.caption)
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .disabled(isAutoDisabled)
+
+                    if let reason = activity.keepaliveDisabledReason,
+                       reason != "manually disabled" {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .font(.caption2)
+                        Text(reason)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .padding(.leading, 10)
+            }
+
             // In-flight requests
-            ForEach(activity.activeRequests) { request in
-                RequestActivityRow(request: request)
+            if !activity.activeRequests.isEmpty {
+                Text(String(localized: "Active"))
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
                     .padding(.leading, 10)
+
+                ForEach(activity.activeRequests) { request in
+                    RequestActivityRow(request: request)
+                        .padding(.leading, 10)
+                }
             }
 
             if !activity.doneRequests.isEmpty {
-                Divider()
+                Text(String(localized: "Done"))
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
                     .padding(.leading, 10)
 
                 ForEach(activity.doneRequests) { request in

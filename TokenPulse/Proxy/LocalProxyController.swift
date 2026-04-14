@@ -22,6 +22,8 @@ final class LocalProxyController {
         let totalCacheReadInputTokens: Int
         let totalCacheCreationInputTokens: Int
         let estimatedCostUSD: Double
+        let isKeepaliveDisabled: Bool
+        let keepaliveDisabledReason: String?
 
         var id: String { sessionID }
         /// First 8 characters of the session ID — enough to distinguish sessions in the UI.
@@ -299,6 +301,24 @@ final class LocalProxyController {
         }
     }
 
+    /// Enable or disable keepalive for a specific session (user-initiated toggle).
+    func setSessionKeepalive(enabled: Bool, for sessionID: String) {
+        let sessStore = sessionStore
+        let manager = keepaliveManager
+        Task {
+            if enabled {
+                await sessStore.enableKeepalive(for: sessionID)
+                let headers = await sessStore.lineageRequestHeaders(for: sessionID)
+                if !headers.isEmpty {
+                    await manager?.startOrReset(sessionID: sessionID, headers: headers)
+                }
+            } else {
+                await sessStore.disableKeepaliveWithReason(for: sessionID, reason: "manually disabled")
+                await manager?.stop(sessionID: sessionID)
+            }
+        }
+    }
+
     /// Refresh session activities immediately in response to a traffic event.
     /// Coalesces rapid calls: the first call schedules a refresh after a short delay;
     /// subsequent calls within that window are absorbed.
@@ -337,7 +357,9 @@ final class LocalProxyController {
                         totalOutputTokens: snap.totalOutputTokens,
                         totalCacheReadInputTokens: snap.totalCacheReadInputTokens,
                         totalCacheCreationInputTokens: snap.totalCacheCreationInputTokens,
-                        estimatedCostUSD: snap.estimatedCostUSD
+                        estimatedCostUSD: snap.estimatedCostUSD,
+                        isKeepaliveDisabled: snap.isKeepaliveDisabled,
+                        keepaliveDisabledReason: snap.keepaliveDisabledReason
                     )
                 }
 
@@ -433,7 +455,9 @@ final class LocalProxyController {
                             totalOutputTokens: snap.totalOutputTokens,
                             totalCacheReadInputTokens: snap.totalCacheReadInputTokens,
                             totalCacheCreationInputTokens: snap.totalCacheCreationInputTokens,
-                            estimatedCostUSD: snap.estimatedCostUSD
+                            estimatedCostUSD: snap.estimatedCostUSD,
+                            isKeepaliveDisabled: snap.isKeepaliveDisabled,
+                            keepaliveDisabledReason: snap.keepaliveDisabledReason
                         )
                     }
 

@@ -47,6 +47,109 @@ enum ProxyRequestBody {
         return lines.joined(separator: "\n")
     }
 
+    // MARK: - Lineage extraction
+
+    /// Whether the request body has a non-empty `tools` array.
+    static func hasTools(from body: Data) -> Bool {
+        guard let json = jsonObject(from: body),
+              let tools = json["tools"] as? [Any] else {
+            return false
+        }
+        return !tools.isEmpty
+    }
+
+    /// Whether the request body has `output_config.format.type == "json_schema"`.
+    static func hasJSONSchemaOutputConfig(from body: Data) -> Bool {
+        guard let json = jsonObject(from: body),
+              let outputConfig = json["output_config"] as? [String: Any],
+              let format = outputConfig["format"] as? [String: Any],
+              let type = format["type"] as? String else {
+            return false
+        }
+        return type == "json_schema"
+    }
+
+    /// Extract the `thinking.type` string ("enabled", "disabled", or "adaptive").
+    static func thinkingType(from body: Data) -> String? {
+        guard let json = jsonObject(from: body),
+              let thinking = json["thinking"] as? [String: Any] else {
+            return nil
+        }
+        return thinking["type"] as? String
+    }
+
+    /// Canonical string of the `tools` array for fingerprint comparison.
+    static func toolsCanonical(from body: Data) -> String? {
+        guard let json = jsonObject(from: body),
+              let tools = json["tools"] as? [Any],
+              !tools.isEmpty else {
+            return nil
+        }
+        return canonicalString(for: tools)
+    }
+
+    /// Canonical string of the `tool_choice` field for fingerprint comparison.
+    static func toolChoiceCanonical(from body: Data) -> String? {
+        guard let json = jsonObject(from: body),
+              let toolChoice = json["tool_choice"] else {
+            return nil
+        }
+        return canonicalString(for: toolChoice)
+    }
+
+    /// Build a canonical descriptor of just the messages array for append-only checks.
+    /// Each message becomes a `message:<canonical>` line, joined by newlines.
+    static func messagesDescriptor(from body: Data) -> String? {
+        guard let json = jsonObject(from: body),
+              let messages = json["messages"] as? [Any],
+              !messages.isEmpty else {
+            return nil
+        }
+        var lines: [String] = []
+        for message in messages {
+            appendCanonicalLine(label: "message", value: normalizedValue(message), to: &lines)
+        }
+        return lines.isEmpty ? nil : lines.joined(separator: "\n")
+    }
+
+    /// Build a `LineageFingerprint` from a request body. Returns nil if model or tools
+    /// are missing (the request is not main-agent-shaped).
+    /// Includes all cache-key-relevant fields: model, system, tools, tool_choice, thinking.
+    static func lineageFingerprint(from body: Data) -> LineageFingerprint? {
+        guard let json = jsonObject(from: body),
+              let model = json["model"] as? String,
+              let tools = json["tools"] as? [Any],
+              !tools.isEmpty,
+              let toolsStr = canonicalString(for: tools) else {
+            return nil
+        }
+        let systemStr: String?
+        if let sys = normalizedSystemPrompt(json["system"]) {
+            systemStr = canonicalString(for: sys)
+        } else {
+            systemStr = nil
+        }
+        let toolChoiceStr: String?
+        if let tc = json["tool_choice"] {
+            toolChoiceStr = canonicalString(for: tc)
+        } else {
+            toolChoiceStr = nil
+        }
+        let thinkingStr: String?
+        if let thinking = json["thinking"] {
+            thinkingStr = canonicalString(for: thinking)
+        } else {
+            thinkingStr = nil
+        }
+        return LineageFingerprint(
+            model: model,
+            systemCanonical: systemStr,
+            toolsCanonical: toolsStr,
+            toolChoiceCanonical: toolChoiceStr,
+            thinkingCanonical: thinkingStr
+        )
+    }
+
     private static func jsonObject(from body: Data) -> [String: Any]? {
         guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
             return nil
@@ -61,7 +164,7 @@ enum ProxyRequestBody {
         lines.append("\(label):\(canonical)")
     }
 
-    private static func canonicalString(for value: Any) -> String? {
+    static func canonicalString(for value: Any) -> String? {
         switch value {
         case let string as String:
             return "\"\(escapeJSONString(string))\""
@@ -192,6 +295,23 @@ enum ProxyRequestBody {
 
         return normalizedValue(value)
     }
+}
+
+// MARK: - Lineage fingerprint
+
+/// Captures the cache-identity-relevant "shape" of a main-agent request.
+/// Two requests with different fingerprints cannot share an upstream prompt cache.
+/// Includes all fields that contribute to the Anthropic cache key.
+struct LineageFingerprint: Sendable, Equatable {
+    let model: String
+    /// Canonical string of the normalized system prompt (nil when absent).
+    let systemCanonical: String?
+    /// Canonical string representation of the `tools` array.
+    let toolsCanonical: String
+    /// Canonical string representation of `tool_choice` (nil when absent).
+    let toolChoiceCanonical: String?
+    /// Canonical string of the full `thinking` object (nil when absent).
+    let thinkingCanonical: String?
 }
 
 // MARK: - HTTP primitives used by the proxy server

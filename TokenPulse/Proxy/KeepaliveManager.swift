@@ -213,7 +213,7 @@ actor KeepaliveManager {
                     ProxyLogger.log("Keepalive: session \(sessionID) exceeded \(maxCumulativeFailures) cumulative failures, stopping")
                     let shortSessionID = String(sessionID.prefix(8))
                     await eventLogger?.logKeepaliveDisabled(session: sessionID, reason: "cumulative_failures", failureCount: sessionData.keepaliveFailureCount)
-                    await sessionStore.disableKeepalive(for: sessionID)
+                    await sessionStore.disableKeepaliveWithReason(for: sessionID, reason: String(localized: "repeated failures"))
                     await MainActor.run {
                         NotificationService.shared.sendProxyKeepaliveDisabled(sessionID: shortSessionID)
                     }
@@ -223,8 +223,8 @@ actor KeepaliveManager {
 
             // Only perform network work if we are not already exiting.
             if !shouldExit {
-                // 5. Load last request body.
-                guard let lastBody = await sessionStore.lastRequestBody(for: sessionID) else {
+                // 5. Load lineage request body (tracked main-agent request, not generic last request).
+                guard let lastBody = await sessionStore.lineageRequestBody(for: sessionID) else {
                     // Write status snapshot even when skipping.
                     await writeStatusSnapshot(
                         eventLogger: eventLogger,
@@ -308,7 +308,7 @@ actor KeepaliveManager {
                                 sessionStore: sessionStore,
                                 metricsStore: metricsStore
                             )
-                            await sessionStore.disableKeepalive(for: sessionID)
+                            await sessionStore.disableKeepaliveWithReason(for: sessionID, reason: String(localized: "auth failure"))
                             shouldExit = true
 
                         // Handle rate limiting and server errors -- count toward cumulative failures.

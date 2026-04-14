@@ -41,7 +41,7 @@ final class AnthropicForwarder: Sendable {
         await sessionStore.touch(sessionID)
         await sessionStore.incrementInFlight(sessionID)
 
-        // Store request context for keepalive use.
+        // Store generic request context (used by done-request replacement etc.).
         let model = ProxyRequestBody.model(from: request.body)
         let promptDescriptor = ProxyRequestBody.promptDescriptor(from: request.body)
         await sessionStore.storeRequestContext(
@@ -138,8 +138,9 @@ final class AnthropicForwarder: Sendable {
         )
         await sessionStore.recordBytesSent(request.body.count)
 
+        let errored: Bool
         if wantsStreaming {
-            await forwardStreaming(
+            errored = await forwardStreaming(
                 urlRequest: urlRequest,
                 writer: request.writer,
                 requestID: requestID,
@@ -152,7 +153,7 @@ final class AnthropicForwarder: Sendable {
                 loggedRequestID: loggedRequestID
             )
         } else {
-            await forwardNonStreaming(
+            errored = await forwardNonStreaming(
                 urlRequest: urlRequest,
                 writer: request.writer,
                 requestID: requestID,
@@ -172,7 +173,37 @@ final class AnthropicForwarder: Sendable {
             keepaliveManager: keepaliveManager
         )
 
-        await keepaliveManager?.startOrReset(sessionID: sessionID, headers: request.headers)
+        // Evaluate lineage only for non-errored done requests.
+        if !errored {
+            let lineageResult = await sessionStore.evaluateAndTrackLineage(
+                body: request.body,
+                headers: request.headers,
+                model: model,
+                for: sessionID
+            )
+
+            switch lineageResult {
+            case .tracked:
+                let lineageHeaders = await sessionStore.lineageRequestHeaders(for: sessionID)
+                await keepaliveManager?.startOrReset(sessionID: sessionID, headers: lineageHeaders)
+            case .diverged(let reason):
+                await keepaliveManager?.stop(sessionID: sessionID)
+                let shortSessionID = String(sessionID.prefix(8))
+                await eventLogger?.logKeepaliveDisabled(
+                    session: sessionID,
+                    reason: "lineage_diverged: \(reason)",
+                    failureCount: 0
+                )
+                await MainActor.run {
+                    NotificationService.shared.sendProxyKeepaliveDisabled(
+                        sessionID: shortSessionID,
+                        reason: reason
+                    )
+                }
+            case .ignored, .pendingIdentification, .alreadyDisabled:
+                break
+            }
+        }
     }
 
     private func forwardStreaming(
@@ -186,7 +217,7 @@ final class AnthropicForwarder: Sendable {
         requestLog: ProxyEventLogger.LoggedRequest,
         requestStartedAt: Date,
         loggedRequestID: Int64?
-    ) async {
+    ) async -> Bool {
         do {
             // Create a per-request streaming delegate and session so we receive
             // natural TCP-segment-sized chunks instead of byte-by-byte iteration.
@@ -299,6 +330,7 @@ final class AnthropicForwarder: Sendable {
                 tokenUsage: tokenUsage,
                 errored: isUpstreamError
             )
+            return isUpstreamError
 
         } catch is CancellationError {
             // Client disconnected — no error response needed.
@@ -313,6 +345,7 @@ final class AnthropicForwarder: Sendable {
                 durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
                 error: "client disconnected"
             )
+            return true
         } catch {
             await sessionStore.markRequestDone(id: requestID, errored: true, tokenUsage: nil, estimatedCost: nil)
             await metrics.recordFailed()
@@ -330,6 +363,7 @@ final class AnthropicForwarder: Sendable {
                 error: error.localizedDescription
             )
             writeErrorToClient(writer: writer, response: response)
+            return true
         }
     }
 
@@ -346,9 +380,10 @@ final class AnthropicForwarder: Sendable {
         requestLog: ProxyEventLogger.LoggedRequest,
         requestStartedAt: Date,
         loggedRequestID: Int64?
-    ) async {
+    ) async -> Bool {
         // Use the shared non-streaming session for TCP/TLS connection reuse.
         // Per-task callbacks are routed through the multiplexing pool delegate.
+        var errored = true
         let taskContext = NonStreamingPoolDelegate.TaskContext()
         taskContext.onUploadProgress = { totalBytesSent in
             Task {
@@ -402,6 +437,7 @@ final class AnthropicForwarder: Sendable {
                 await sessionStore.recordTokenUsage(tokenUsage, model: model, for: sessionID)
                 let requestCost = ModelPricingTable.pricing(for: model).map { tokenUsage.cost(for: $0) }
                 let isUpstreamError = httpResponse.statusCode >= 400
+                errored = isUpstreamError
                 await sessionStore.markRequestDone(id: requestID, errored: isUpstreamError, tokenUsage: tokenUsage, estimatedCost: requestCost)
                 let responseLog = ProxyEventLogger.LoggedResponse(
                     statusCode: httpResponse.statusCode,
@@ -456,6 +492,7 @@ final class AnthropicForwarder: Sendable {
         }
 
         nonStreamingPoolDelegate.unregister(taskIdentifier: dataTask.taskIdentifier)
+        return errored
     }
 
     // MARK: - Helpers

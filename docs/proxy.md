@@ -91,14 +91,14 @@ A complete request lifecycle from client connection to response delivery:
    a. Extract X-Claude-Code-Session-Id header (default: "unknown")
    b. Touch session in ProxySessionStore (create if new)
    c. Increment in-flight count
-   d. Store request context (body, headers, model) for keepalive use
+   d. Store request context (body, headers, model)
    e. Extract model name from JSON body
    f. Log request start to ProxyEventLogger
    g. Build upstream URLRequest (copy headers, skip host/content-length/transfer-encoding)
    h. Determine streaming mode from body's "stream" field
    i. Forward via streaming or non-streaming path (see below)
    j. Write status snapshot
-   k. Start/reset keepalive loop for this session
+   k. If the request completed without error, evaluate lineage and start/reset keepalive
    l. Decrement in-flight count
 ```
 
@@ -156,9 +156,9 @@ All proxy-generated error responses use Anthropic's error JSON format:
 
 ## How it works
 
-When a real request completes for a session, the proxy starts (or resets) a keepalive loop for that session. The loop periodically sends minimal requests to the upstream API to keep the prompt cache warm.
+When a real request completes successfully for a session, the proxy evaluates it against the tracked main-agent lineage. Only non-errored done requests are candidates — failed requests are ignored so lineage is never established from a request that didn't succeed upstream. If the request is accepted as a lineage continuation, the proxy starts (or resets) a keepalive loop for that session.
 
-1. **Extract cache-relevant fields**: The proxy stores the most recent request body per session. The `KeepaliveRequestBuilder` extracts all cache-identity-relevant fields (system prompt, messages, tools, tool_choice, cache_control, thinking config) and discards the rest.
+1. **Extract cache-relevant fields**: The proxy stores the lineage request body per session. The `KeepaliveRequestBuilder` extracts all cache-identity-relevant fields (system prompt, messages, tools, tool_choice, cache_control, thinking config) and discards the rest.
 
 2. **Build minimal request**: `stream` is set to `false` and `max_tokens` is set to 1 (or `budget_tokens + 1` when thinking mode is enabled, since `max_tokens` must exceed `budget_tokens`). This produces the cheapest possible request that still exercises the cache.
 
@@ -166,7 +166,7 @@ When a real request completes for a session, the proxy starts (or resets) a keep
 
 4. **Loop cycle**: Sleep for the configured interval, then check inactivity timeout and cumulative failure count before sending the keepalive. Parse the response for cache metrics. Record success/failure.
 
-5. **Headers**: The stored headers from the most recent real request are copied (excluding hop-by-hop headers: host, content-length, transfer-encoding). This preserves authentication and API version headers.
+5. **Headers**: The stored headers from the most recent successful lineage request are copied (excluding hop-by-hop headers: host, content-length, transfer-encoding). This preserves authentication and API version headers.
 
 ## Auto-disable conditions
 
