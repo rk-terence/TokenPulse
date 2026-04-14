@@ -584,8 +584,8 @@ private struct SessionActivityRow: View {
         VStack(alignment: .leading, spacing: 3) {
             // Session ID (abbreviated) + completed / keepalive / errored counts
             HStack(spacing: 0) {
-                Text(activity.shortID)
-                    .font(.callout.monospaced())
+                Text(activity.rowTitle)
+                    .font(activity.isOtherTraffic ? .callout : .callout.monospaced())
                     .foregroundStyle(.secondary)
                 Spacer()
                 sessionStats

@@ -44,6 +44,8 @@ enum ProxyAPIFlavor: String, CaseIterable, Identifiable, Sendable {
 }
 
 enum ProxySessionID {
+    static let other = "other"
+
     static func make(_ rawID: String, flavor: ProxyAPIFlavor) -> String {
         "\(flavor.sessionPrefix):\(normalized(rawID))"
     }
@@ -58,7 +60,18 @@ enum ProxySessionID {
         return nil
     }
 
+    static func isOther(_ sessionID: String) -> Bool {
+        sessionID == other
+    }
+
+    static func supportsTrackedSession(_ sessionID: String) -> Bool {
+        flavor(for: sessionID)?.supportsKeepalive == true
+    }
+
     static func displayID(for sessionID: String) -> String {
+        if isOther(sessionID) {
+            return String(localized: "Other")
+        }
         let rawID: Substring
         if let separator = sessionID.firstIndex(of: ":") {
             rawID = sessionID[sessionID.index(after: separator)...]
@@ -70,7 +83,10 @@ enum ProxySessionID {
     }
 
     static func shortDisplayID(for sessionID: String) -> String {
-        String(displayID(for: sessionID).prefix(8))
+        if isOther(sessionID) {
+            return displayID(for: sessionID)
+        }
+        return String(displayID(for: sessionID).prefix(8))
     }
 
     private static func normalized(_ rawID: String) -> String {
@@ -469,8 +485,9 @@ struct ProxyRequestActivity: Sendable, Identifiable {
     let modelID: String?
     /// Stable prompt descriptor built from prompt-shaping fields in the request body.
     let promptDescriptor: String?
-    /// Whether this request matches the main-agent shape (has tools, not schema-constrained).
-    /// Main-agent done requests persist for the session lifetime; others expire after 5 minutes.
+    /// Whether this request matches the tracked Anthropic main-agent shape.
+    /// Tracked-session main-agent done requests persist for the session lifetime;
+    /// non-session traffic expires on the short retention timer.
     var isMainAgentShaped: Bool
     /// Cumulative bytes sent to upstream so far.
     var bytesSent: Int

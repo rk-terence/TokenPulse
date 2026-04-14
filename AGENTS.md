@@ -14,6 +14,8 @@ xcodebuild -scheme TokenPulse -configuration Debug build
 xcodebuild -scheme TokenPulse -configuration Debug test
 ```
 
+> For Codex: run the build outside the sanbox so Xcode's plugin and simulator services and initialize normally.
+
 ## Git commits
 
 Use conventional commit format: `type: short description` (e.g. `feat: add proxy subsystem`, `fix: correct upstream URL default`). Common types: `feat`, `fix`, `chore`, `refactor`, `docs`, `test`.

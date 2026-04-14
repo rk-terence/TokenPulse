@@ -30,10 +30,12 @@ struct AnthropicProxyAPIHandler: ProxyAPIHandler {
     }
 
     func sessionID(for request: ProxyHTTPRequest) -> String {
-        ProxySessionID.make(
-            request.headerValue(for: "X-Claude-Code-Session-Id") ?? "unknown",
-            flavor: .anthropicMessages
-        )
+        guard let rawSessionID = request.headerValue(for: "X-Claude-Code-Session-Id")?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !rawSessionID.isEmpty else {
+            return ProxySessionID.other
+        }
+        return ProxySessionID.make(rawSessionID, flavor: .anthropicMessages)
     }
 
     func extractModel(from body: Data) -> String? {

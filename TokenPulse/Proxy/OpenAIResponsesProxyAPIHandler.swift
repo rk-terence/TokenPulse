@@ -13,16 +13,7 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
     }
 
     func sessionID(for request: ProxyHTTPRequest) -> String {
-        guard let json = jsonObject(from: request.body) else {
-            return ProxySessionID.make("unknown", flavor: .openAIResponses)
-        }
-        if let conversation = json["conversation"] as? String, !conversation.isEmpty {
-            return ProxySessionID.make(conversation, flavor: .openAIResponses)
-        }
-        if let previousResponseID = json["previous_response_id"] as? String, !previousResponseID.isEmpty {
-            return ProxySessionID.make(previousResponseID, flavor: .openAIResponses)
-        }
-        return ProxySessionID.make("unknown", flavor: .openAIResponses)
+        ProxySessionID.other
     }
 
     func extractModel(from body: Data) -> String? {

@@ -45,24 +45,28 @@ final class ProxyForwarder: Sendable {
     ) async {
         // 1. Extract session ID and update session store.
         let sessionID = apiHandler.sessionID(for: request)
+        let supportsTrackedSession = ProxySessionID.supportsTrackedSession(sessionID)
         await sessionStore.touch(sessionID)
         await sessionStore.incrementInFlight(sessionID)
 
         // Store generic request context (used by done-request replacement etc.).
         let model = apiHandler.extractModel(from: request.body)
-        let promptDescriptor = apiHandler.promptDescriptor(from: request.body)
-        await sessionStore.storeRequestContext(
-            body: request.body,
-            headers: request.headers,
-            model: model,
-            for: sessionID
-        )
+        let promptDescriptor = supportsTrackedSession ? apiHandler.promptDescriptor(from: request.body) : nil
+        if supportsTrackedSession {
+            await sessionStore.storeRequestContext(
+                body: request.body,
+                headers: request.headers,
+                model: model,
+                for: sessionID
+            )
+        }
 
         await forwardRequest(
             request: request,
             sessionID: sessionID,
             model: model,
             promptDescriptor: promptDescriptor,
+            supportsTrackedSession: supportsTrackedSession,
             sessionStore: sessionStore,
             metrics: metrics
         )
@@ -76,6 +80,7 @@ final class ProxyForwarder: Sendable {
         sessionID: String,
         model: String?,
         promptDescriptor: String?,
+        supportsTrackedSession: Bool,
         sessionStore: ProxySessionStore,
         metrics: ProxyMetricsStore
     ) async {
@@ -136,7 +141,7 @@ final class ProxyForwarder: Sendable {
 
         // Register the in-flight request in the session store for real-time UI display.
         let requestID = UUID()
-        let isMainAgentShaped = apiHandler.isMainAgentRequest(body: request.body)
+        let isMainAgentShaped = supportsTrackedSession && apiHandler.isMainAgentRequest(body: request.body)
         await sessionStore.startRequest(
             id: requestID,
             sessionID: sessionID,
@@ -182,7 +187,7 @@ final class ProxyForwarder: Sendable {
 
         // Always evaluate lineage for non-errored requests so the tracked
         // body is available for manual keepalive.
-        if !errored {
+        if !errored && supportsTrackedSession {
             let lineageResult = await sessionStore.evaluateAndTrackLineage(
                 body: request.body,
                 headers: request.headers,

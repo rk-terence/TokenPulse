@@ -606,11 +606,14 @@ actor ProxySessionStore {
     /// Remove sessions that have been idle since the given date.
     /// Skips sessions with in-flight requests to avoid dropping state mid-stream.
     /// Returns the session IDs that were removed.
-    func expireSessions(olderThan date: Date) -> [String] {
+    func expireSessions(olderThan date: Date, otherOlderThan otherDate: Date) -> [String] {
         var expired: [String] = []
-        for (id, session) in sessions
-            where max(session.lastSeenAt, session.lastKeepaliveAt ?? .distantPast) < date
-                && session.inFlightRequestCount == 0 {
+        for (id, session) in sessions {
+            let cutoff = ProxySessionID.isOther(id) ? otherDate : date
+            guard max(session.lastSeenAt, session.lastKeepaliveAt ?? .distantPast) < cutoff,
+                  session.inFlightRequestCount == 0 else {
+                continue
+            }
             expired.append(id)
         }
         for id in expired {
@@ -622,10 +625,13 @@ actor ProxySessionStore {
 
     /// Remove non-main-agent done requests older than the given cutoff.
     /// Main-agent requests persist for the session lifetime.
-    func pruneStaleDoneRequests(olderThan cutoff: Date) {
+    func pruneStaleDoneRequests(olderThan cutoff: Date, otherOlderThan otherCutoff: Date) {
         for (sessionID, requests) in doneRequestsBySession {
             let filtered = requests.filter { request in
-                request.isMainAgentShaped || (request.completedAt ?? request.startedAt) >= cutoff
+                if ProxySessionID.isOther(sessionID) {
+                    return (request.completedAt ?? request.startedAt) >= otherCutoff
+                }
+                return request.isMainAgentShaped || (request.completedAt ?? request.startedAt) >= cutoff
             }
             if filtered.isEmpty {
                 doneRequestsBySession.removeValue(forKey: sessionID)

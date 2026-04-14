@@ -9,6 +9,7 @@ final class LocalProxyController {
     private static let sessionRetentionSeconds: TimeInterval = 24 * 60 * 60
     private static let sessionVisibilitySeconds: TimeInterval = 10 * 60
     private static let sideTrafficDoneRetentionSeconds: TimeInterval = 5 * 60
+    private static let otherTrafficRetentionSeconds: TimeInterval = 60
 
     // MARK: - Per-session activity snapshot for UI
 
@@ -37,8 +38,13 @@ final class LocalProxyController {
 
         var id: String { sessionID }
         var apiFlavor: ProxyAPIFlavor? { ProxySessionID.flavor(for: sessionID) }
+        var displayID: String { ProxySessionID.displayID(for: sessionID) }
         /// First 8 characters of the display session ID — enough to distinguish sessions in the UI.
         var shortID: String { ProxySessionID.shortDisplayID(for: sessionID) }
+        var rowTitle: String {
+            ProxySessionID.isOther(sessionID) ? displayID : shortID
+        }
+        var isOtherTraffic: Bool { ProxySessionID.isOther(sessionID) }
         var supportsKeepalive: Bool { apiFlavor?.supportsKeepalive ?? false }
         /// Whether a manual keepalive can be sent right now.
         var canSendKeepalive: Bool {
@@ -375,7 +381,7 @@ final class LocalProxyController {
             // Clear the result indicator after a brief delay.
             try? await Task.sleep(for: .seconds(2))
             await MainActor.run { [weak self] in
-                self?.manualKeepaliveLastResult.removeValue(forKey: sessionID)
+                _ = self?.manualKeepaliveLastResult.removeValue(forKey: sessionID)
             }
         }
     }
@@ -550,7 +556,7 @@ final class LocalProxyController {
             self.sessionActivities = activities
             self.lastUploadBytes = uploadSize
             self.proxyStatus = ProxyStatus(
-                activeSessions: self.proxyStatus.activeSessions,
+                activeSessions: activities.count,
                 activeKeepalives: self.proxyStatus.activeKeepalives,
                 totalRequestsForwarded: self.proxyStatus.totalRequestsForwarded,
                 totalKeepalivesSent: self.proxyStatus.totalKeepalivesSent,
@@ -587,7 +593,8 @@ final class LocalProxyController {
                 if now.timeIntervalSince(lastSessionExpirationSweep) >= Self.sessionExpirationSweepInterval {
                     lastSessionExpirationSweep = now
                     let expiredSessionIDs = await sessStore.expireSessions(
-                        olderThan: now.addingTimeInterval(-Self.sessionRetentionSeconds)
+                        olderThan: now.addingTimeInterval(-Self.sessionRetentionSeconds),
+                        otherOlderThan: now.addingTimeInterval(-Self.otherTrafficRetentionSeconds)
                     )
                     if !expiredSessionIDs.isEmpty {
                         let logger = await MainActor.run { self?.eventLogger }
@@ -596,11 +603,11 @@ final class LocalProxyController {
                         }
                     }
                     await sessStore.pruneStaleDoneRequests(
-                        olderThan: now.addingTimeInterval(-Self.sideTrafficDoneRetentionSeconds)
+                        olderThan: now.addingTimeInterval(-Self.sideTrafficDoneRetentionSeconds),
+                        otherOlderThan: now.addingTimeInterval(-Self.otherTrafficRetentionSeconds)
                     )
                 }
 
-                let sessions = await sessStore.recentSessionCount(within: 600)
                 let snapshot = await metStore.snapshot()
                 let activitySnapshots = await sessStore.snapshotSessionActivities()
                 let uploadSize  = await sessStore.lastUploadSize()
@@ -626,7 +633,7 @@ final class LocalProxyController {
                     self?.lastUploadBytes     = uploadSize
                     self?.downloadBytesPerSec = downloadSpeed
                     self?.proxyStatus = ProxyStatus(
-                        activeSessions: sessions,
+                        activeSessions: activities.count,
                         activeKeepalives: 0,
                         totalRequestsForwarded: snapshot.totalRequestsForwarded,
                         totalKeepalivesSent: snapshot.totalKeepalivesSent,
@@ -649,11 +656,13 @@ final class LocalProxyController {
         from snapshots: [ProxySessionStore.SessionSnapshot],
         now: Date
     ) -> [SessionActivity] {
-        let recentCutoff = now.addingTimeInterval(-sessionVisibilitySeconds)
+        let sessionCutoff = now.addingTimeInterval(-sessionVisibilitySeconds)
+        let otherCutoff = now.addingTimeInterval(-otherTrafficRetentionSeconds)
 
         return snapshots
             .filter {
-                max($0.lastSeenAt, $0.lastKeepaliveAt ?? .distantPast) >= recentCutoff
+                let cutoff = ProxySessionID.isOther($0.sessionID) ? otherCutoff : sessionCutoff
+                return max($0.lastSeenAt, $0.lastKeepaliveAt ?? .distantPast) >= cutoff
                     || !$0.activeRequests.isEmpty
             }
             .map { snap in
