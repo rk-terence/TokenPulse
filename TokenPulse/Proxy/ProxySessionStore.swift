@@ -314,8 +314,8 @@ actor ProxySessionStore {
     /// Cumulative bytes received since the actor was created. Used for KB/s computation.
     func cumulativeBytesReceived() -> Int { totalBytesReceived }
 
-    /// Transition a request to `.done`, move it into the session's done section,
-    /// and replace one older done request when the new prompt contains it.
+    /// Finalize a request, promoting only successful completions into the session's
+    /// done section where prompt-based replacement is evaluated.
     func markRequestDone(id: UUID, errored: Bool, tokenUsage: TokenUsage?, estimatedCost: Double?) {
         guard var entry = activeRequests.removeValue(forKey: id) else { return }
         let completedAt = Date()
@@ -324,7 +324,9 @@ actor ProxySessionStore {
         entry.activity.tokenUsage = tokenUsage
         entry.activity.estimatedCost = estimatedCost
 
-        insertDoneRequest(entry.activity, for: entry.sessionID)
+        if !errored {
+            insertDoneRequest(entry.activity, for: entry.sessionID)
+        }
 
         if var session = sessions[entry.sessionID] {
             if errored {
