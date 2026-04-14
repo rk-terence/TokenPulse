@@ -3,6 +3,11 @@ import Foundation
 /// Tracks active Claude Code sessions by their `X-Claude-Code-Session-Id`.
 actor ProxySessionStore {
 
+    struct CostSnapshot: Sendable {
+        let totalEstimatedCostUSD: Double
+        let estimatedCostUSDByAPI: [ProxyAPIFlavor: Double]
+    }
+
     struct Session: Sendable {
         let sessionID: String
         var lastSeenAt: Date
@@ -85,6 +90,7 @@ actor ProxySessionStore {
     /// Cumulative estimated cost (USD) across all sessions since the proxy started.
     /// Separate from per-session costs so it survives session expiration.
     private var cumulativeEstimatedCostUSD: Double = 0
+    private var cumulativeEstimatedCostUSDByAPI: [ProxyAPIFlavor: Double] = [:]
 
     /// Callback fired when data traffic occurs (upload start or download chunk).
     /// Called from within the actor — callers should dispatch to MainActor as needed.
@@ -404,7 +410,8 @@ actor ProxySessionStore {
     func recordKeepaliveResult(
         for sessionID: String,
         success: Bool,
-        tokenUsage: TokenUsage
+        tokenUsage: TokenUsage,
+        apiFlavor: ProxyAPIFlavor
     ) {
         if var session = sessions[sessionID] {
             session.lastKeepaliveAt = Date()
@@ -415,7 +422,7 @@ actor ProxySessionStore {
                 if let pricing = ModelPricingTable.pricing(for: session.lastKnownModel) {
                     let cost = tokenUsage.cost(for: pricing)
                     session.estimatedCostUSD += cost
-                    cumulativeEstimatedCostUSD += cost
+                    accumulateCost(cost, for: apiFlavor)
                 }
             } else {
                 session.keepaliveFailureCount += 1
@@ -427,7 +434,12 @@ actor ProxySessionStore {
     // MARK: - Token usage accumulation
 
     /// Record token usage and estimated cost for a completed request in this session.
-    func recordTokenUsage(_ usage: TokenUsage, model: String?, for sessionID: String) {
+    func recordTokenUsage(
+        _ usage: TokenUsage,
+        model: String?,
+        for sessionID: String,
+        apiFlavor: ProxyAPIFlavor
+    ) {
         guard var session = sessions[sessionID] else { return }
         session.totalInputTokens += usage.inputTokens ?? 0
         session.totalOutputTokens += usage.outputTokens ?? 0
@@ -436,14 +448,17 @@ actor ProxySessionStore {
         if let pricing = ModelPricingTable.pricing(for: model) {
             let cost = usage.cost(for: pricing)
             session.estimatedCostUSD += cost
-            cumulativeEstimatedCostUSD += cost
+            accumulateCost(cost, for: apiFlavor)
         }
         sessions[sessionID] = session
     }
 
     /// Cumulative estimated cost since proxy start (survives session expiration).
-    func totalEstimatedCostUSD() -> Double {
-        cumulativeEstimatedCostUSD
+    func costSnapshot() -> CostSnapshot {
+        CostSnapshot(
+            totalEstimatedCostUSD: cumulativeEstimatedCostUSD,
+            estimatedCostUSDByAPI: cumulativeEstimatedCostUSDByAPI
+        )
     }
 
     /// Reset all transient counters while keeping sessions operational for keepalive.
@@ -451,6 +466,7 @@ actor ProxySessionStore {
     /// Reset only the cumulative cost estimate to zero. Per-session costs are preserved.
     func resetCost() {
         cumulativeEstimatedCostUSD = 0
+        cumulativeEstimatedCostUSDByAPI.removeAll()
     }
 
     // MARK: - Request activity tracking
@@ -658,6 +674,11 @@ actor ProxySessionStore {
         }
         doneRequests.append(activity)
         doneRequestsBySession[sessionID] = doneRequests
+    }
+
+    private func accumulateCost(_ cost: Double, for apiFlavor: ProxyAPIFlavor) {
+        cumulativeEstimatedCostUSD += cost
+        cumulativeEstimatedCostUSDByAPI[apiFlavor, default: 0] += cost
     }
 
     private func replacementIndex(

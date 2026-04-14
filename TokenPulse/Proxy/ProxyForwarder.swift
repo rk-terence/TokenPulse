@@ -9,6 +9,7 @@ final class ProxyForwarder: Sendable {
     private static let maxLoggedStreamingResponseBytes = 4 * 1024 * 1024
 
     let upstreamBaseURL: String
+    private let apiFlavor: ProxyAPIFlavor
     private let apiHandler: any ProxyAPIHandler
     private let eventLogger: ProxyEventLogger?
     private let proxyPort: Int
@@ -18,11 +19,13 @@ final class ProxyForwarder: Sendable {
 
     init(
         upstreamBaseURL: String,
+        apiFlavor: ProxyAPIFlavor,
         apiHandler: any ProxyAPIHandler,
         eventLogger: ProxyEventLogger? = nil,
         proxyPort: Int = 0
     ) {
         self.upstreamBaseURL = upstreamBaseURL
+        self.apiFlavor = apiFlavor
         self.apiHandler = apiHandler
         self.eventLogger = eventLogger
         self.proxyPort = proxyPort
@@ -330,7 +333,12 @@ final class ProxyForwarder: Sendable {
             )
             let tokenUsage = apiHandler.parseTokenUsage(from: capturedResponseBody, streaming: true)
             await metrics.recordTokenUsage(tokenUsage)
-            await sessionStore.recordTokenUsage(tokenUsage, model: model, for: sessionID)
+            await sessionStore.recordTokenUsage(
+                tokenUsage,
+                model: model,
+                for: sessionID,
+                apiFlavor: apiFlavor
+            )
             let requestCost = ModelPricingTable.pricing(for: model).map { tokenUsage.cost(for: $0) }
             let isUpstreamError = upstreamStatusCode >= 400
             await sessionStore.markRequestDone(id: requestID, errored: isUpstreamError, tokenUsage: tokenUsage, estimatedCost: requestCost)
@@ -449,7 +457,12 @@ final class ProxyForwarder: Sendable {
 
                 let tokenUsage = apiHandler.parseTokenUsage(from: responseData, streaming: false)
                 await metrics.recordTokenUsage(tokenUsage)
-                await sessionStore.recordTokenUsage(tokenUsage, model: model, for: sessionID)
+                await sessionStore.recordTokenUsage(
+                    tokenUsage,
+                    model: model,
+                    for: sessionID,
+                    apiFlavor: apiFlavor
+                )
                 let requestCost = ModelPricingTable.pricing(for: model).map { tokenUsage.cost(for: $0) }
                 let isUpstreamError = httpResponse.statusCode >= 400
                 errored = isUpstreamError

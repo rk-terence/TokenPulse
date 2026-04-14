@@ -9,9 +9,18 @@ enum ProxyAPIFlavor: String, CaseIterable, Identifiable, Sendable {
     var displayName: String {
         switch self {
         case .anthropicMessages:
-            return "Anthropic Messages"
+            return String(localized: "Anthropic Messages")
         case .openAIResponses:
-            return "OpenAI Responses"
+            return String(localized: "OpenAI Responses")
+        }
+    }
+
+    var summaryLabel: String {
+        switch self {
+        case .anthropicMessages:
+            return String(localized: "Anthropic")
+        case .openAIResponses:
+            return String(localized: "OpenAI")
         }
     }
 
@@ -526,19 +535,32 @@ struct TokenUsage: Sendable {
     let outputTokens: Int?
     let cacheReadInputTokens: Int?
     let cacheCreationInputTokens: Int?
+    /// Whether `inputTokens` already includes cached input tokens.
+    /// Anthropic reports uncached and cached input separately; OpenAI Responses
+    /// reports cached tokens as a subset of total input tokens.
+    let inputTokensIncludeCacheReads: Bool
     /// The API's stop reason (e.g. "end_turn", "max_tokens", "tool_use").
     /// Non-nil only when the response completed normally.
     let stopReason: String?
 
     static let empty = TokenUsage(inputTokens: nil, outputTokens: nil,
                                   cacheReadInputTokens: nil, cacheCreationInputTokens: nil,
+                                  inputTokensIncludeCacheReads: false,
                                   stopReason: nil)
 
     /// Compute the estimated cost (USD) using the given pricing rates.
     func cost(for pricing: ModelPricing) -> Double {
-        let input    = Double(inputTokens ?? 0)            * pricing.inputPerMTok
+        let cachedInputTokens = max(0, cacheReadInputTokens ?? 0)
+        let billableInputTokens: Int
+        if inputTokensIncludeCacheReads {
+            billableInputTokens = max(0, (inputTokens ?? 0) - cachedInputTokens)
+        } else {
+            billableInputTokens = inputTokens ?? 0
+        }
+
+        let input    = Double(billableInputTokens)         * pricing.inputPerMTok
         let output   = Double(outputTokens ?? 0)           * pricing.outputPerMTok
-        let cacheRd  = Double(cacheReadInputTokens ?? 0)   * pricing.cacheReadPerMTok
+        let cacheRd  = Double(cachedInputTokens)           * pricing.cacheReadPerMTok
         let cacheWr  = Double(cacheCreationInputTokens ?? 0) * pricing.cacheWritePerMTok
         return (input + output + cacheRd + cacheWr) / 1_000_000
     }
@@ -554,7 +576,7 @@ struct ModelPricing: Sendable {
     let cacheWritePerMTok: Double
 }
 
-/// Lookup pricing for an Anthropic model ID string (e.g. "claude-opus-4-6-20260401").
+/// Lookup pricing for supported Anthropic and OpenAI text model IDs.
 /// Matches the longest known prefix. Returns nil for unrecognized models.
 enum ModelPricingTable {
 
@@ -576,6 +598,26 @@ enum ModelPricingTable {
 
     // swiftlint:disable line_length
     private static let entries: [String: ModelPricing] = [
+        // OpenAI GPT-5.4 family
+        "gpt-5.4-mini":      ModelPricing(inputPerMTok: 0.75, outputPerMTok: 4.50, cacheReadPerMTok: 0.075, cacheWritePerMTok: 0),
+        "gpt-5.4-nano":      ModelPricing(inputPerMTok: 0.20, outputPerMTok: 1.25, cacheReadPerMTok: 0.02, cacheWritePerMTok: 0),
+        "gpt-5.4":           ModelPricing(inputPerMTok: 2.50, outputPerMTok: 15.0, cacheReadPerMTok: 0.25, cacheWritePerMTok: 0),
+        // OpenAI GPT-5.3 family
+        "gpt-5.3-codex":     ModelPricing(inputPerMTok: 1.75, outputPerMTok: 14.0, cacheReadPerMTok: 0.175, cacheWritePerMTok: 0),
+        "gpt-5.3-chat":      ModelPricing(inputPerMTok: 1.75, outputPerMTok: 14.0, cacheReadPerMTok: 0.175, cacheWritePerMTok: 0),
+        "gpt-5.3":           ModelPricing(inputPerMTok: 1.75, outputPerMTok: 14.0, cacheReadPerMTok: 0.175, cacheWritePerMTok: 0),
+        // OpenAI GPT-5.2 / 5.1 / 5 family
+        "gpt-5.2":           ModelPricing(inputPerMTok: 1.75, outputPerMTok: 14.0, cacheReadPerMTok: 0.175, cacheWritePerMTok: 0),
+        "gpt-5.1":           ModelPricing(inputPerMTok: 1.25, outputPerMTok: 10.0, cacheReadPerMTok: 0.125, cacheWritePerMTok: 0),
+        "gpt-5-mini":        ModelPricing(inputPerMTok: 0.25, outputPerMTok: 2.0, cacheReadPerMTok: 0.025, cacheWritePerMTok: 0),
+        "gpt-5-nano":        ModelPricing(inputPerMTok: 0.05, outputPerMTok: 0.40, cacheReadPerMTok: 0.005, cacheWritePerMTok: 0),
+        "gpt-5":             ModelPricing(inputPerMTok: 1.25, outputPerMTok: 10.0, cacheReadPerMTok: 0.125, cacheWritePerMTok: 0),
+        // OpenAI GPT-4.1 / 4o family
+        "gpt-4.1-mini":      ModelPricing(inputPerMTok: 0.40, outputPerMTok: 1.60, cacheReadPerMTok: 0.10, cacheWritePerMTok: 0),
+        "gpt-4.1-nano":      ModelPricing(inputPerMTok: 0.10, outputPerMTok: 0.40, cacheReadPerMTok: 0.025, cacheWritePerMTok: 0),
+        "gpt-4.1":           ModelPricing(inputPerMTok: 2.0, outputPerMTok: 8.0, cacheReadPerMTok: 0.50, cacheWritePerMTok: 0),
+        "gpt-4o-mini":       ModelPricing(inputPerMTok: 0.15, outputPerMTok: 0.60, cacheReadPerMTok: 0.075, cacheWritePerMTok: 0),
+        "gpt-4o":            ModelPricing(inputPerMTok: 2.50, outputPerMTok: 10.0, cacheReadPerMTok: 1.25, cacheWritePerMTok: 0),
         // Opus 4.6 / 4.5 — $5 / $25
         "claude-opus-4-6":   ModelPricing(inputPerMTok: 5,  outputPerMTok: 25, cacheReadPerMTok: 0.50, cacheWritePerMTok: 6.25),
         "claude-opus-4-5":   ModelPricing(inputPerMTok: 5,  outputPerMTok: 25, cacheReadPerMTok: 0.50, cacheWritePerMTok: 6.25),
@@ -634,6 +676,7 @@ enum ProxyHTTPUtils {
             outputTokens: usage["output_tokens"] as? Int,
             cacheReadInputTokens: usage["cache_read_input_tokens"] as? Int,
             cacheCreationInputTokens: usage["cache_creation_input_tokens"] as? Int,
+            inputTokensIncludeCacheReads: false,
             stopReason: json["stop_reason"] as? String
         )
     }
@@ -693,6 +736,7 @@ enum ProxyHTTPUtils {
             outputTokens: outputTokens,
             cacheReadInputTokens: cacheReadInputTokens,
             cacheCreationInputTokens: cacheCreationInputTokens,
+            inputTokensIncludeCacheReads: false,
             stopReason: stopReason
         )
     }

@@ -112,6 +112,7 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
             outputTokens: outputTokens,
             cacheReadInputTokens: cachedTokens,
             cacheCreationInputTokens: nil,
+            inputTokensIncludeCacheReads: true,
             stopReason: stopReason
         )
     }

@@ -68,6 +68,7 @@ final class LocalProxyController {
         let totalCacheReadInputTokens: Int
         let totalCacheCreationInputTokens: Int
         let totalEstimatedCostUSD: Double
+        let estimatedCostUSDByAPI: [ProxyAPIFlavor: Double]
 
         static let empty = ProxyStatus(
             activeSessions: 0, activeKeepalives: 0,
@@ -76,7 +77,8 @@ final class LocalProxyController {
             estimatedSavings: 0,
             totalInputTokens: 0, totalOutputTokens: 0,
             totalCacheReadInputTokens: 0, totalCacheCreationInputTokens: 0,
-            totalEstimatedCostUSD: 0
+            totalEstimatedCostUSD: 0,
+            estimatedCostUSDByAPI: [:]
         )
     }
 
@@ -126,12 +128,14 @@ final class LocalProxyController {
 
         let anthropicForwarder = ProxyForwarder(
             upstreamBaseURL: anthropicUpstreamURL,
+            apiFlavor: .anthropicMessages,
             apiHandler: anthropicAPIHandler,
             eventLogger: logger,
             proxyPort: port
         )
         let openAIForwarder = ProxyForwarder(
             upstreamBaseURL: openAIUpstreamURL,
+            apiFlavor: .openAIResponses,
             apiHandler: openAIAPIHandler,
             eventLogger: logger,
             proxyPort: port
@@ -335,7 +339,8 @@ final class LocalProxyController {
             totalOutputTokens: s.totalOutputTokens,
             totalCacheReadInputTokens: s.totalCacheReadInputTokens,
             totalCacheCreationInputTokens: s.totalCacheCreationInputTokens,
-            totalEstimatedCostUSD: 0
+            totalEstimatedCostUSD: 0,
+            estimatedCostUSDByAPI: [:]
         )
         proxyStatus = s
     }
@@ -435,7 +440,8 @@ final class LocalProxyController {
                 await sessionStore.recordKeepaliveResult(
                     for: sessionID,
                     success: true,
-                    tokenUsage: tokenUsage
+                    tokenUsage: tokenUsage,
+                    apiFlavor: .anthropicMessages
                 )
                 await eventLogger?.logKeepaliveCompleted(
                     keepaliveID: keepaliveID,
@@ -453,7 +459,8 @@ final class LocalProxyController {
                 await sessionStore.recordKeepaliveResult(
                     for: sessionID,
                     success: false,
-                    tokenUsage: .empty
+                    tokenUsage: .empty,
+                    apiFlavor: .anthropicMessages
                 )
                 await eventLogger?.logKeepaliveCompleted(
                     keepaliveID: keepaliveID,
@@ -472,7 +479,8 @@ final class LocalProxyController {
             await sessionStore.recordKeepaliveResult(
                 for: sessionID,
                 success: false,
-                tokenUsage: .empty
+                tokenUsage: .empty,
+                apiFlavor: .anthropicMessages
             )
             await eventLogger?.logKeepaliveCompleted(
                 keepaliveID: keepaliveID,
@@ -550,7 +558,7 @@ final class LocalProxyController {
 
             let activitySnapshots = await sessStore.snapshotSessionActivities()
             let uploadSize = await sessStore.lastUploadSize()
-            let totalCost = await sessStore.totalEstimatedCostUSD()
+            let costSnapshot = await sessStore.costSnapshot()
             let activities = Self.visibleSessionActivities(from: activitySnapshots, now: Date())
 
             self.sessionActivities = activities
@@ -568,7 +576,8 @@ final class LocalProxyController {
                 totalOutputTokens: self.proxyStatus.totalOutputTokens,
                 totalCacheReadInputTokens: self.proxyStatus.totalCacheReadInputTokens,
                 totalCacheCreationInputTokens: self.proxyStatus.totalCacheCreationInputTokens,
-                totalEstimatedCostUSD: totalCost
+                totalEstimatedCostUSD: costSnapshot.totalEstimatedCostUSD,
+                estimatedCostUSDByAPI: costSnapshot.estimatedCostUSDByAPI
             )
             self.trafficRefreshPending = false
         }
@@ -612,7 +621,7 @@ final class LocalProxyController {
                 let activitySnapshots = await sessStore.snapshotSessionActivities()
                 let uploadSize  = await sessStore.lastUploadSize()
                 let bytesRx     = await sessStore.cumulativeBytesReceived()
-                let totalCost   = await sessStore.totalEstimatedCostUSD()
+                let costSnapshot = await sessStore.costSnapshot()
 
                 // Delta-based KB/s from cumulative receive counter.
                 let elapsed = now.timeIntervalSince(prevTransferDate)
@@ -645,7 +654,8 @@ final class LocalProxyController {
                         totalOutputTokens: snapshot.totalOutputTokens,
                         totalCacheReadInputTokens: snapshot.totalCacheReadInputTokens,
                         totalCacheCreationInputTokens: snapshot.totalCacheCreationInputTokens,
-                        totalEstimatedCostUSD: totalCost
+                        totalEstimatedCostUSD: costSnapshot.totalEstimatedCostUSD,
+                        estimatedCostUSDByAPI: costSnapshot.estimatedCostUSDByAPI
                     )
                 }
             }

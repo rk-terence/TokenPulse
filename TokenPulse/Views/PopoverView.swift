@@ -539,10 +539,37 @@ private struct ProxyStatusRow: View {
                 )
             }
 
+            if !apiCostBreakdowns.isEmpty {
+                HStack(spacing: 6) {
+                    ForEach(apiCostBreakdowns, id: \.flavor) { breakdown in
+                        TagView(
+                            text: String(
+                                format: NSLocalizedString(
+                                    "proxy.costBreakdown.tag",
+                                    value: "%@ $%@",
+                                    comment: "Proxy aggregate cost breakdown tag: API label then formatted dollar cost"
+                                ),
+                                breakdown.flavor.summaryLabel,
+                                formatTotalCost(breakdown.cost)
+                            ),
+                            color: breakdownColor(for: breakdown.flavor)
+                        )
+                    }
+                }
+            }
+
             ForEach(proxy.sessionActivities) { activity in
                 SessionActivityRow(activity: activity, proxyController: proxy)
             }
 
+        }
+    }
+
+    private var apiCostBreakdowns: [(flavor: ProxyAPIFlavor, cost: Double)] {
+        ProxyAPIFlavor.allCases.compactMap { flavor in
+            let cost = proxy.proxyStatus.estimatedCostUSDByAPI[flavor] ?? 0
+            guard cost > 0 else { return nil }
+            return (flavor, cost)
         }
     }
 
@@ -553,6 +580,15 @@ private struct ProxyStatusRow: View {
             return String(format: "%.3f", cost)
         } else {
             return String(format: "%.2f", cost)
+        }
+    }
+
+    private func breakdownColor(for flavor: ProxyAPIFlavor) -> Color {
+        switch flavor {
+        case .anthropicMessages:
+            return .orange
+        case .openAIResponses:
+            return .blue
         }
     }
 }
