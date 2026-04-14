@@ -14,7 +14,7 @@ xcodebuild -scheme TokenPulse -configuration Debug build
 xcodebuild -scheme TokenPulse -configuration Debug test
 ```
 
-> For Codex: run the build outside the sanbox so Xcode's plugin and simulator services and initialize normally.
+> For Codex: run the build outside the sandbox so Xcode's plugin and simulator services can initialize normally.
 
 ## Git commits
 

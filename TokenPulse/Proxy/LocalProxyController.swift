@@ -166,20 +166,14 @@ final class LocalProxyController {
             let httpServer = try ProxyHTTPServer(
                 port: UInt16(clamping: port),
                 requestValidator: { method, path in
-                    let matchedHandler: (any ProxyAPIHandler)?
-                    if anthropicHandler.acceptsRequest(method: method, path: path) {
-                        matchedHandler = anthropicHandler
-                    } else if openAIHandler.acceptsRequest(method: method, path: path) {
-                        matchedHandler = openAIHandler
-                    } else {
-                        matchedHandler = nil
-                    }
-
-                    if matchedHandler != nil {
+                    if anthropicHandler.acceptsRequest(method: method, path: path)
+                        || openAIHandler.acceptsRequest(method: method, path: path) {
                         return .accepted
                     }
 
-                    if Self.route(for: path, anthropicHandler: anthropicHandler, openAIHandler: openAIHandler) != nil {
+                    // Path matches a known route but method is wrong (e.g. GET /v1/messages).
+                    if anthropicHandler.acceptsRequest(method: "POST", path: path)
+                        || openAIHandler.acceptsRequest(method: "POST", path: path) {
                         return .rejected(
                             status: 405,
                             message: String(localized: "Method Not Allowed: only POST is supported")
@@ -227,7 +221,7 @@ final class LocalProxyController {
                         request.writer.writeHead(
                             status: 404,
                             headers: [
-                                (name: "Content-Type", value: Self.contentType(forPath: request.path)),
+                                (name: "Content-Type", value: Self.jsonContentType),
                                 (name: "Content-Length", value: "\(body.count)")
                             ]
                         )
@@ -539,10 +533,7 @@ final class LocalProxyController {
         }
     }
 
-    nonisolated private static func contentType(forPath path: String?) -> String {
-        _ = path
-        return "application/json"
-    }
+    nonisolated private static var jsonContentType: String { "application/json" }
 
     /// Refresh session activities immediately in response to a traffic event.
     /// Coalesces rapid calls: the first call schedules a refresh after a short delay;
