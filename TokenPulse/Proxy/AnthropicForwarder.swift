@@ -191,6 +191,7 @@ final class AnthropicForwarder: Sendable {
                 let lineageHeaders = await sessionStore.lineageRequestHeaders(for: sessionID)
                 await keepaliveManager?.startOrReset(sessionID: sessionID, headers: lineageHeaders)
             case .diverged(let reason):
+                await sessionStore.clearMainAgentFlag(requestID: requestID, sessionID: sessionID)
                 await keepaliveManager?.stop(sessionID: sessionID)
                 let shortSessionID = String(sessionID.prefix(8))
                 await eventLogger?.logKeepaliveDisabled(
@@ -205,7 +206,9 @@ final class AnthropicForwarder: Sendable {
                     )
                 }
             case .ignored, .pendingIdentification, .alreadyDisabled:
-                break
+                if isMainAgentShaped {
+                    await sessionStore.clearMainAgentFlag(requestID: requestID, sessionID: sessionID)
+                }
             }
         }
     }

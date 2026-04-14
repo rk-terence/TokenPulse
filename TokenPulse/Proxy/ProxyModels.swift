@@ -384,7 +384,7 @@ struct ProxyRequestActivity: Sendable, Identifiable {
     let promptDescriptor: String?
     /// Whether this request matches the main-agent shape (has tools, not schema-constrained).
     /// Main-agent done requests persist for the session lifetime; others expire after 5 minutes.
-    let isMainAgentShaped: Bool
+    var isMainAgentShaped: Bool
     /// Cumulative bytes sent to upstream so far.
     var bytesSent: Int
     /// Cumulative bytes received from upstream so far.

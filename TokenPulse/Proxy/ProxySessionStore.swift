@@ -295,15 +295,34 @@ actor ProxySessionStore {
         guard let tracked = currentSession.lineageFingerprint else { return .ignored }
         guard let incoming = ProxyRequestBody.lineageFingerprint(from: body) else { return .ignored }
 
-        // Check fingerprint divergence — compare all cache-key fields individually
-        // so we can report which field diverged.
+        // Step 1: Check if system + messages indicate a continuation of the
+        // main agent. If not, this is side traffic (e.g. a subagent with a
+        // different system prompt) — ignore it without disabling keepalive.
+        if incoming.systemCanonical != tracked.systemCanonical {
+            return .ignored
+        }
+
+        let incomingMessages = ProxyRequestBody.messagesDescriptor(from: body)
+        if let trackedMessages = currentSession.lineageMessagesDescriptor,
+           let incomingMsg = incomingMessages {
+            if !incomingMsg.hasPrefix(trackedMessages) {
+                let trackedCount = trackedMessages.components(separatedBy: "\nmessage:").count
+                let incomingCount = incomingMsg.components(separatedBy: "\nmessage:").count
+                if incomingCount < trackedCount {
+                    // Fewer messages — side traffic, not a divergence.
+                    return .ignored
+                }
+                let reason = String(localized: "messages not append-only")
+                disableKeepaliveWithReason(for: sessionID, reason: reason)
+                return .diverged(reason: reason)
+            }
+        }
+
+        // Step 2: System + messages match the main agent continuation. Now
+        // check cache-invalidating fields — if any changed, this is a true
+        // divergence that would break the prompt cache.
         if incoming.model != tracked.model {
             let reason = "model changed: \(tracked.model) → \(incoming.model)"
-            disableKeepaliveWithReason(for: sessionID, reason: reason)
-            return .diverged(reason: reason)
-        }
-        if incoming.systemCanonical != tracked.systemCanonical {
-            let reason = String(localized: "system prompt changed")
             disableKeepaliveWithReason(for: sessionID, reason: reason)
             return .diverged(reason: reason)
         }
@@ -321,23 +340,6 @@ actor ProxySessionStore {
             let reason = String(localized: "thinking config changed")
             disableKeepaliveWithReason(for: sessionID, reason: reason)
             return .diverged(reason: reason)
-        }
-
-        // Check append-only messages.
-        let incomingMessages = ProxyRequestBody.messagesDescriptor(from: body)
-        if let trackedMessages = currentSession.lineageMessagesDescriptor,
-           let incomingMsg = incomingMessages {
-            if !incomingMsg.hasPrefix(trackedMessages) {
-                // Count message lines to distinguish "shorter = side traffic" from "rewrite = divergence".
-                let trackedCount = trackedMessages.components(separatedBy: "\nmessage:").count
-                let incomingCount = incomingMsg.components(separatedBy: "\nmessage:").count
-                if incomingCount < trackedCount {
-                    return .ignored
-                }
-                let reason = String(localized: "messages not append-only")
-                disableKeepaliveWithReason(for: sessionID, reason: reason)
-                return .diverged(reason: reason)
-            }
         }
 
         // All checks pass — promote this request as the latest lineage point.
@@ -611,6 +613,16 @@ actor ProxySessionStore {
                 doneRequestsBySession[sessionID] = filtered
             }
         }
+    }
+
+    /// Clear the main-agent flag on a done request after lineage evaluation
+    /// determines it is not part of the tracked main-agent lineage.
+    func clearMainAgentFlag(requestID: UUID, sessionID: String) {
+        guard var doneRequests = doneRequestsBySession[sessionID] else { return }
+        guard let index = doneRequests.firstIndex(where: { $0.id == requestID }) else { return }
+        doneRequests[index].isMainAgentShaped = false
+        doneRequestsBySession[sessionID] = doneRequests
+        onTraffic?()
     }
 
     private func insertDoneRequest(_ activity: ProxyRequestActivity, for sessionID: String) {

@@ -658,6 +658,14 @@ private struct SessionActivityRow: View {
                 ForEach(activity.doneRequests) { request in
                     RequestActivityRow(request: request)
                         .padding(.leading, 10)
+                        .overlay(alignment: .leading) {
+                            if request.isMainAgentShaped {
+                                RoundedRectangle(cornerRadius: 1)
+                                    .fill(Color.accentColor)
+                                    .frame(width: 3)
+                                    .padding(.leading, 5)
+                            }
+                        }
                 }
             }
         }
@@ -713,143 +721,113 @@ private struct SessionActivityRow: View {
 private struct RequestActivityRow: View {
     let request: ProxyRequestActivity
 
-    // MARK: - Column widths
-
-    private static let modelWidth: CGFloat = 46
-    private static let uploadWidth: CGFloat = 58
-    private static let downloadWidth: CGFloat = 58
-    private static let timingWidth: CGFloat = 56
-    private static let costWidth: CGFloat = 52
-
     var body: some View {
-        HStack(spacing: 4) {
-            // Column 1: Model name
-            Text(compactModelName ?? "")
-                .font(.callout.monospaced())
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(width: Self.modelWidth, alignment: .leading)
-
-            // Column 2: Upload (↑ bytes or tokens, or "sending")
-            uploadColumn
-                .frame(width: Self.uploadWidth, alignment: .leading)
-
-            // Column 3: Download (↓ bytes or tokens, or "waiting…")
-            downloadColumn
-                .frame(width: Self.downloadWidth, alignment: .leading)
-
-            // Column 4: Timing (e2e / ttft / waiting)
-            timingColumn
-                .frame(width: Self.timingWidth, alignment: .leading)
-
-            // Column 5: Cost
-            costColumn
-                .frame(width: Self.costWidth, alignment: .leading)
-
-            Spacer(minLength: 0)
-
-            // Trailing: relative timestamp
+        HStack(spacing: 5) {
+            if let modelName = compactModelName {
+                Text(modelName)
+                    .font(.callout.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            leftStats
+            Spacer()
             Text(request.startedAt, style: .relative)
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.tertiary)
-                .lineLimit(1)
                 .contentTransition(.numericText())
                 .animation(nil, value: request.startedAt)
         }
     }
 
-    // MARK: - Column views
-
     @ViewBuilder
-    private var uploadColumn: some View {
+    private var leftStats: some View {
         switch request.state {
         case .uploading:
             if request.bytesSent > 0 {
-                metricPair("\u{2191}", formattedBytes(request.bytesSent),
-                           valueStyle: .secondary, italic: true)
+                Text("\u{2191}")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                Text(formattedBytes(request.bytesSent))
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .italic()
             } else {
                 Text(String(localized: "sending"))
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .italic()
             }
-        case .waiting:
-            metricPair("\u{2191}", formattedBytes(request.bytesSent),
-                       valueStyle: .tertiary)
-        case .receiving:
-            metricPair("\u{2191}", formattedBytes(request.bytesSent),
-                       valueStyle: .tertiary)
-        case .done:
-            if let promptK = request.promptTokens {
-                metricPair("\u{2191}", formattedTokenCount(promptK),
-                           valueStyle: .secondary)
-            }
-        }
-    }
 
-    @ViewBuilder
-    private var downloadColumn: some View {
-        switch request.state {
-        case .uploading:
-            EmptyView()
         case .waiting:
+            Text("\u{2191}")
+                .font(.callout)
+                .foregroundStyle(.tertiary)
+            Text(formattedBytes(request.bytesSent))
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.tertiary)
             Text(String(localized: "waiting\u{2026}"))
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .italic()
+
         case .receiving:
-            metricPair("\u{2193}", formattedBytes(request.bytesReceived),
-                       valueStyle: .secondary, italic: true)
-        case .done:
-            if let outputK = request.tokenUsage?.outputTokens, outputK > 0 {
-                metricPair("\u{2193}", formattedTokenCount(outputK),
-                           valueStyle: .secondary)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var timingColumn: some View {
-        switch request.state {
-        case .uploading, .waiting:
-            EmptyView()
-        case .receiving:
-            if let ttft = timeToFirstToken {
-                metricPair("ttft", formattedDuration(ttft),
-                           valueStyle: .secondary)
-            }
-        case .done:
-            if let e2e = endToEndDuration {
-                metricPair("e2e", formattedDuration(e2e),
-                           valueStyle: .secondary)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var costColumn: some View {
-        if request.state == .done, let cost = request.estimatedCost {
-            metricPair("$", formatCost(cost),
-                       valueStyle: .secondary)
-        }
-    }
-
-    /// Render a label + value pair used within fixed-width columns.
-    private func metricPair(
-        _ label: String,
-        _ value: String,
-        valueStyle: HierarchicalShapeStyle = .secondary,
-        italic: Bool = false
-    ) -> some View {
-        HStack(spacing: 2) {
-            Text(label)
+            // upload bytes, italic download bytes, and TTFT duration
+            Text("\u{2191}")
                 .font(.callout)
                 .foregroundStyle(.tertiary)
-            Text(value)
+            Text(formattedBytes(request.bytesSent))
                 .font(.callout.monospacedDigit())
-                .foregroundStyle(valueStyle)
-                .italic(italic)
+                .foregroundStyle(.tertiary)
+            Text("\u{2193}")
+                .font(.callout)
+                .foregroundStyle(.tertiary)
+            Text(formattedBytes(request.bytesReceived))
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .italic()
+            if let ttft = timeToFirstToken {
+                Text("ttft")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                Text(formattedDuration(ttft))
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+        case .done:
+            if let promptK = request.promptTokens {
+                Text("\u{2191}")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                Text(formattedTokenCount(promptK))
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            if let outputK = request.tokenUsage?.outputTokens, outputK > 0 {
+                Text("\u{2193}")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                Text(formattedTokenCount(outputK))
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            if let e2e = endToEndDuration {
+                Text("e2e")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                Text(formattedDuration(e2e))
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            if let cost = request.estimatedCost {
+                Text("$")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                Text(formatCost(cost))
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
