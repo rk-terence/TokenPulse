@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TokenPulse — Usage Subsystem Architecture</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@500;600;700&family=Work+Sans:wght@400;500;600&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#080c18;--bg-card:rgba(13,19,36,0.85);--bg-card-hover:rgba(18,26,50,0.95);
+  --border:#1a2444;--border-hover:rgba(255,255,255,0.12);
+  --text:#d4daf0;--text-dim:#7a86a8;--text-bright:#f0f4ff;
+  --claude:#f97316;--codex:#22c55e;--zenmux:#a78bfa;
+  --service:#3b82f6;--ui:#f472b6;--protocol:#fbbf24;--data:#67e8f9;
+  --external:#6b7280;
+  --glow-claude:rgba(249,115,22,0.25);--glow-codex:rgba(34,197,94,0.25);
+  --glow-zenmux:rgba(167,139,250,0.25);--glow-service:rgba(59,130,246,0.2);
+  --glow-ui:rgba(244,114,182,0.2);--glow-protocol:rgba(251,191,36,0.2);
+}
+html{font-size:14px;-webkit-font-smoothing:antialiased}
+body{
+  background:var(--bg);color:var(--text);font-family:'Work Sans',sans-serif;
+  min-height:100vh;overflow-x:hidden;
+  background-image:radial-gradient(circle,rgba(30,42,80,0.35) 1px,transparent 1px);
+  background-size:28px 28px;
+}
+/* Scan line */
+body::before{
+  content:'';position:fixed;top:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,var(--protocol),transparent);
+  opacity:0.4;z-index:1000;animation:scan 4s ease-in-out infinite;
+}
+@keyframes scan{0%,100%{transform:translateY(0);opacity:0.4}50%{transform:translateY(60px);opacity:0.1}}
+
+header{
+  text-align:center;padding:48px 24px 20px;position:relative;
+}
+header h1{
+  font-family:'Outfit',sans-serif;font-weight:700;font-size:2.2rem;
+  background:linear-gradient(135deg,var(--protocol),var(--claude),var(--zenmux));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+  background-clip:text;letter-spacing:0;
+}
+header .subtitle{color:var(--text-dim);margin-top:6px;font-size:0.92rem;letter-spacing:0.5px}
+
+/* Legend */
+.legend{
+  display:flex;flex-wrap:wrap;justify-content:center;gap:18px;
+  margin:16px auto 0;max-width:800px;
+}
+.legend-item{
+  display:flex;align-items:center;gap:6px;font-size:0.78rem;color:var(--text-dim);
+}
+.legend-swatch{
+  width:12px;height:12px;border-radius:3px;border:1px solid rgba(255,255,255,0.08);
+}
+.legend-line{width:28px;height:2px;border-radius:1px;position:relative}
+.legend-line.dashed{background:repeating-linear-gradient(90deg,var(--text-dim) 0 6px,transparent 6px 10px)}
+.legend-line.solid{background:var(--text-dim)}
+.legend-line.dotted{background:repeating-linear-gradient(90deg,var(--text-dim) 0 2px,transparent 2px 6px)}
+
+/* Diagram */
+#diagram{
+  position:relative;max-width:1280px;margin:0 auto;padding:20px 24px 60px;
+}
+#connections-svg{
+  position:absolute;top:0;left:0;width:100%;height:100%;
+  pointer-events:none;z-index:1;
+}
+.conn-path{
+  fill:none;stroke-width:1.5;opacity:0.55;
+  transition:opacity 0.3s,stroke-width 0.3s;
+}
+.conn-path.flow{
+  stroke-dasharray:8 5;animation:dash-flow 1s linear infinite;
+}
+.conn-path.impl{
+  stroke-dasharray:3 4;opacity:0.35;
+}
+.conn-path.read{
+  stroke-dasharray:2 3;opacity:0.4;
+}
+.conn-path.highlighted{opacity:1;stroke-width:2.5;filter:url(#conn-glow)}
+.conn-path.dimmed{opacity:0.06}
+@keyframes dash-flow{to{stroke-dashoffset:-13}}
+
+.conn-label{
+  font-family:'Fira Code',monospace;font-size:9.5px;fill:var(--text-dim);
+  pointer-events:none;transition:opacity 0.3s;
+}
+.conn-label.highlighted{fill:var(--text-bright);opacity:1}
+.conn-label.dimmed{opacity:0}
+.conn-label-bg{fill:var(--bg);opacity:0.85;rx:3}
+
+/* Layers */
+.layer{
+  display:flex;justify-content:center;gap:20px;padding:12px 0;
+  flex-wrap:wrap;position:relative;z-index:2;
+}
+.layer-label{
+  font-family:'Outfit',sans-serif;font-weight:600;font-size:0.7rem;
+  text-transform:uppercase;letter-spacing:2px;color:var(--text-dim);
+  text-align:center;margin:28px 0 4px;opacity:0.5;
+}
+.layer-label:first-of-type{margin-top:8px}
+
+/* Component cards */
+.component{
+  background:var(--bg-card);
+  border:1px solid var(--border);
+  border-radius:10px;padding:16px 18px;
+  min-width:200px;max-width:280px;
+  backdrop-filter:blur(10px);
+  box-shadow:0 4px 20px rgba(0,0,0,0.3);
+  cursor:default;transition:all 0.3s ease;
+  position:relative;
+}
+.component::before{
+  content:'';position:absolute;left:0;top:8px;bottom:8px;width:3px;
+  border-radius:0 2px 2px 0;transition:box-shadow 0.3s;
+}
+.component:hover{
+  background:var(--bg-card-hover);
+  border-color:var(--border-hover);
+  transform:translateY(-3px);
+  box-shadow:0 8px 32px rgba(0,0,0,0.4);
+}
+.component.highlighted{
+  border-color:var(--border-hover);
+  transform:translateY(-3px);
+  box-shadow:0 8px 32px rgba(0,0,0,0.4);
+}
+.component.dimmed{opacity:0.15;transform:scale(0.98)}
+
+/* Category borders */
+.component.protocol::before{background:var(--protocol);box-shadow:0 0 8px var(--glow-protocol)}
+.component.claude-prov::before{background:var(--claude);box-shadow:0 0 8px var(--glow-claude)}
+.component.codex-prov::before{background:var(--codex);box-shadow:0 0 8px var(--glow-codex)}
+.component.zenmux-prov::before{background:var(--zenmux);box-shadow:0 0 8px var(--glow-zenmux)}
+.component.svc::before{background:var(--service);box-shadow:0 0 8px var(--glow-service)}
+.component.ui-comp::before{background:var(--ui);box-shadow:0 0 8px var(--glow-ui)}
+.component.ext::before{background:var(--external)}
+.component.highlighted.protocol::before{box-shadow:0 0 16px var(--glow-protocol)}
+.component.highlighted.claude-prov::before{box-shadow:0 0 16px var(--glow-claude)}
+.component.highlighted.codex-prov::before{box-shadow:0 0 16px var(--glow-codex)}
+.component.highlighted.zenmux-prov::before{box-shadow:0 0 16px var(--glow-zenmux)}
+.component.highlighted.svc::before{box-shadow:0 0 16px var(--glow-service)}
+.component.highlighted.ui-comp::before{box-shadow:0 0 16px var(--glow-ui)}
+
+.comp-name{
+  font-family:'Outfit',sans-serif;font-weight:700;font-size:0.95rem;
+  color:var(--text-bright);margin-bottom:2px;
+}
+.comp-badge{
+  display:inline-block;font-family:'Fira Code',monospace;font-size:0.65rem;
+  padding:2px 7px;border-radius:4px;margin-bottom:8px;
+  background:rgba(255,255,255,0.05);color:var(--text-dim);
+  border:1px solid rgba(255,255,255,0.04);
+}
+.comp-detail{font-size:0.78rem;color:var(--text-dim);line-height:1.55;margin-top:4px}
+.comp-detail code{
+  font-family:'Fira Code',monospace;font-size:0.72rem;
+  background:rgba(255,255,255,0.04);padding:1px 5px;border-radius:3px;
+  color:var(--text);
+}
+.comp-list{list-style:none;margin-top:6px}
+.comp-list li{
+  font-family:'Fira Code',monospace;font-size:0.72rem;color:var(--text-dim);
+  padding:2px 0;position:relative;padding-left:14px;
+}
+.comp-list li::before{
+  content:'>';position:absolute;left:0;color:var(--protocol);font-weight:bold;
+}
+.comp-tag{
+  display:inline-block;font-size:0.65rem;padding:2px 8px;border-radius:10px;
+  margin-top:6px;margin-right:4px;font-weight:500;
+}
+
+/* Manager card — wider */
+.component.manager{min-width:100%;max-width:100%}
+
+/* State machine */
+.state-machine{
+  display:flex;flex-wrap:wrap;gap:8px;margin-top:14px;
+  padding:14px;background:rgba(0,0,0,0.25);border-radius:8px;
+  border:1px solid rgba(255,255,255,0.04);
+}
+.state-machine-title{
+  width:100%;font-family:'Outfit',sans-serif;font-size:0.72rem;
+  font-weight:600;color:var(--text-dim);letter-spacing:1px;
+  text-transform:uppercase;margin-bottom:4px;
+}
+.state-node{
+  display:flex;align-items:center;gap:6px;padding:6px 12px;
+  border-radius:6px;font-family:'Fira Code',monospace;font-size:0.7rem;
+  border:1px solid rgba(255,255,255,0.06);background:rgba(255,255,255,0.02);
+  transition:all 0.2s;position:relative;
+}
+.state-node .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.state-node.s-unconfig .dot{background:#6b7280}
+.state-node.s-pending .dot{background:#eab308;box-shadow:0 0 6px rgba(234,179,8,0.4)}
+.state-node.s-refresh .dot{background:#3b82f6;animation:pulse-dot 1.5s ease-in-out infinite}
+.state-node.s-ready .dot{background:#22c55e;box-shadow:0 0 6px rgba(34,197,94,0.4)}
+.state-node.s-stale .dot{background:#f97316;box-shadow:0 0 6px rgba(249,115,22,0.3)}
+.state-node.s-error .dot{background:#ef4444;box-shadow:0 0 6px rgba(239,68,68,0.4)}
+@keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:0.4}}
+
+.state-arrow{color:var(--text-dim);font-size:0.8rem;align-self:center;opacity:0.4}
+
+.manager-grid{
+  display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:10px;
+}
+.manager-feature{
+  font-size:0.75rem;color:var(--text-dim);line-height:1.5;
+  padding:8px 12px;background:rgba(255,255,255,0.02);border-radius:6px;
+  border:1px solid rgba(255,255,255,0.03);
+}
+.manager-feature strong{color:var(--text);font-weight:600;display:block;margin-bottom:2px}
+
+/* Data models sidebar */
+#data-models{
+  position:fixed;right:0;top:50%;transform:translateY(-50%);
+  width:240px;padding:16px;z-index:50;
+  display:flex;flex-direction:column;gap:12px;
+}
+.model-card{
+  background:var(--bg-card);border:1px solid var(--border);
+  border-left:3px solid var(--data);border-radius:8px;
+  padding:12px 14px;box-shadow:0 4px 16px rgba(0,0,0,0.3);
+  transition:all 0.3s;
+}
+.model-card:hover{
+  border-color:rgba(103,232,249,0.3);
+  box-shadow:0 4px 24px rgba(103,232,249,0.08);
+  transform:translateX(-4px);
+}
+.model-name{
+  font-family:'Outfit',sans-serif;font-weight:700;font-size:0.82rem;
+  color:var(--data);margin-bottom:6px;
+}
+.model-field{
+  font-family:'Fira Code',monospace;font-size:0.68rem;
+  color:var(--text-dim);padding:1.5px 0;line-height:1.45;
+}
+.model-field .type{color:var(--text);opacity:0.7}
+
+/* Detail tooltip */
+#detail-panel{
+  display:none;position:fixed;z-index:100;
+  background:rgba(8,12,24,0.96);border:1px solid var(--border-hover);
+  border-radius:10px;padding:16px 20px;max-width:340px;
+  box-shadow:0 12px 40px rgba(0,0,0,0.5);
+  backdrop-filter:blur(16px);
+  font-size:0.82rem;color:var(--text);line-height:1.6;
+}
+#detail-panel h3{
+  font-family:'Outfit',sans-serif;font-weight:700;font-size:0.95rem;
+  color:var(--text-bright);margin-bottom:6px;
+}
+#detail-panel code{
+  font-family:'Fira Code',monospace;font-size:0.72rem;
+  background:rgba(255,255,255,0.06);padding:1px 5px;border-radius:3px;
+}
+
+/* Responsive */
+@media(max-width:1200px){
+  #data-models{position:static;transform:none;width:100%;max-width:1280px;
+    margin:30px auto;flex-direction:row;flex-wrap:wrap;justify-content:center;padding:0 24px}
+  .model-card{flex:1;min-width:200px;max-width:260px}
+  .model-card:hover{transform:translateY(-3px)}
+}
+@media(max-width:800px){
+  .manager-grid{grid-template-columns:1fr}
+  .component{min-width:160px}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>TokenPulse Usage Subsystem</h1>
+  <p class="subtitle">Architecture &amp; Data Flow &mdash; macOS Menu Bar Quota Monitor</p>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-swatch" style="background:var(--protocol)"></div>Protocol</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:var(--claude)"></div>Claude</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:var(--codex)"></div>Codex</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:var(--zenmux)"></div>ZenMux</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:var(--service)"></div>Service</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:var(--ui)"></div>UI</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:var(--data)"></div>Data Model</div>
+    <div class="legend-item"><div class="legend-line dashed"></div>Data flow</div>
+    <div class="legend-item"><div class="legend-line solid"></div>Implements</div>
+    <div class="legend-item"><div class="legend-line dotted"></div>Reads</div>
+  </div>
+</header>
+
+<div id="diagram">
+  <svg id="connections-svg" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <filter id="conn-glow"><feGaussianBlur stdDeviation="3" result="g"/><feMerge><feMergeNode in="g"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+      <marker id="arrow-proto" viewBox="0 0 8 6" refX="8" refY="3" markerWidth="7" markerHeight="5" orient="auto"><path d="M0 0L8 3L0 6Z" fill="var(--protocol)" opacity="0.6"/></marker>
+      <marker id="arrow-service" viewBox="0 0 8 6" refX="8" refY="3" markerWidth="7" markerHeight="5" orient="auto"><path d="M0 0L8 3L0 6Z" fill="var(--service)" opacity="0.6"/></marker>
+      <marker id="arrow-claude" viewBox="0 0 8 6" refX="8" refY="3" markerWidth="7" markerHeight="5" orient="auto"><path d="M0 0L8 3L0 6Z" fill="var(--claude)" opacity="0.6"/></marker>
+      <marker id="arrow-codex" viewBox="0 0 8 6" refX="8" refY="3" markerWidth="7" markerHeight="5" orient="auto"><path d="M0 0L8 3L0 6Z" fill="var(--codex)" opacity="0.6"/></marker>
+      <marker id="arrow-zenmux" viewBox="0 0 8 6" refX="8" refY="3" markerWidth="7" markerHeight="5" orient="auto"><path d="M0 0L8 3L0 6Z" fill="var(--zenmux)" opacity="0.6"/></marker>
+      <marker id="arrow-ui" viewBox="0 0 8 6" refX="8" refY="3" markerWidth="7" markerHeight="5" orient="auto"><path d="M0 0L8 3L0 6Z" fill="var(--ui)" opacity="0.6"/></marker>
+      <marker id="arrow-ext" viewBox="0 0 8 6" refX="8" refY="3" markerWidth="7" markerHeight="5" orient="auto"><path d="M0 0L8 3L0 6Z" fill="var(--external)" opacity="0.6"/></marker>
+    </defs>
+  </svg>
+
+  <!-- LAYER: External Sources -->
+  <div class="layer-label">External Sources</div>
+  <div class="layer">
+    <div class="component ext" id="keychain-svc">
+      <div class="comp-name">KeychainService</div>
+      <div class="comp-badge">Security.framework</div>
+      <div class="comp-detail">Secure credential storage for OAuth tokens and API keys. Atomic read/write/delete via <code>kSecClassGenericPassword</code>.</div>
+    </div>
+    <div class="component ext" id="auth-file">
+      <div class="comp-name">~/.codex/auth.json</div>
+      <div class="comp-badge">File System</div>
+      <div class="comp-detail">Codex CLI auth file (or <code>$CODEX_HOME/auth.json</code> when set). Parsed for <code>access_token</code> and <code>account_id</code>. Validates <code>auth_mode: "chatgpt"</code>.</div>
+    </div>
+    <div class="component ext" id="chrome-cookies">
+      <div class="comp-name">ChromeCookieService</div>
+      <div class="comp-badge">Chrome Encrypted DB</div>
+      <div class="comp-detail">Extracts ZenMux session cookies via PBKDF2 + AES-128-CBC decryption. Optional &mdash; graceful degradation on failure.</div>
+    </div>
+  </div>
+
+  <!-- LAYER: Protocol -->
+  <div class="layer-label">Provider Abstraction</div>
+  <div class="layer">
+    <div class="component protocol" id="usage-provider">
+      <div class="comp-name">UsageProvider</div>
+      <div class="comp-badge">protocol: Sendable</div>
+      <ul class="comp-list">
+        <li>fetchUsage() async throws &rarr; UsageData</li>
+        <li>isConfigured() &rarr; Bool</li>
+        <li>classifyError(_:) &rarr; FailureDisposition</li>
+        <li>id, displayName, shortLabel, brandColor</li>
+      </ul>
+      <div class="comp-detail" style="margin-top:8px">
+        <code>FailureDisposition</code>: unconfigured | transient | auth | persistent
+      </div>
+    </div>
+  </div>
+
+  <!-- LAYER: Providers -->
+  <div class="layer-label">Provider Implementations</div>
+  <div class="layer">
+    <div class="component claude-prov" id="claude-provider">
+      <div class="comp-name">ClaudeProvider</div>
+      <div class="comp-badge">api.anthropic.com</div>
+      <div class="comp-detail">
+        <strong style="color:var(--claude)">Auth:</strong> OAuth token from Keychain<br>
+        <strong style="color:var(--claude)">Endpoint:</strong> <code>GET /api/oauth/usage</code><br>
+        <strong style="color:var(--claude)">Windows:</strong>
+        <span class="comp-tag" style="background:rgba(249,115,22,0.12);color:var(--claude)">5h</span>
+        <span class="comp-tag" style="background:rgba(249,115,22,0.12);color:var(--claude)">7d</span>
+        <span class="comp-tag" style="background:rgba(249,115,22,0.12);color:var(--claude)">Opus</span>
+      </div>
+    </div>
+    <div class="component codex-prov" id="codex-provider">
+      <div class="comp-name">CodexProvider</div>
+      <div class="comp-badge">chatgpt.com</div>
+      <div class="comp-detail">
+        <strong style="color:var(--codex)">Auth:</strong> ~/.codex/auth.json<br>
+        <strong style="color:var(--codex)">Endpoint:</strong> <code>GET /backend-api/wham/usage</code><br>
+        <strong style="color:var(--codex)">Windows:</strong>
+        <span class="comp-tag" style="background:rgba(34,197,94,0.12);color:var(--codex)">5h</span>
+        <span class="comp-tag" style="background:rgba(34,197,94,0.12);color:var(--codex)">7d</span>
+      </div>
+    </div>
+    <div class="component zenmux-prov" id="zenmux-provider">
+      <div class="comp-name">ZenMuxProvider</div>
+      <div class="comp-badge">Management API</div>
+      <div class="comp-detail">
+        <strong style="color:var(--zenmux)">Auth:</strong> API key from Keychain<br>
+        <strong style="color:var(--zenmux)">Fetch:</strong> Concurrent: mgmt + summary<br>
+        <strong style="color:var(--zenmux)">Windows:</strong>
+        <span class="comp-tag" style="background:rgba(167,139,250,0.12);color:var(--zenmux)">5h</span>
+        <span class="comp-tag" style="background:rgba(167,139,250,0.12);color:var(--zenmux)">7d</span>
+        <span class="comp-tag" style="background:rgba(167,139,250,0.12);color:var(--zenmux)">monthly</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- LAYER: Provider Manager -->
+  <div class="layer-label">Core Orchestration</div>
+  <div class="layer" style="max-width:920px;margin:0 auto">
+    <div class="component svc manager" id="provider-manager">
+      <div class="comp-name">ProviderManager</div>
+      <div class="comp-badge">@MainActor &middot; @Observable</div>
+      <div class="comp-detail">
+        Central orchestrator for provider lifecycle, refresh coordination, and state management. Manages <code>ProviderState</code> per provider with concurrency guards.
+      </div>
+      <div class="manager-grid">
+        <div class="manager-feature">
+          <strong>Refresh Race</strong>
+          30s timeout via <code>withThrowingTaskGroup</code>. Two racing tasks: fetch vs. sleep timer. First wins, other cancelled.
+        </div>
+        <div class="manager-feature">
+          <strong>Generation Guard</strong>
+          Each refresh gets unique <code>refreshGeneration</code> ID. Stale completions rejected on mismatch &mdash; prevents race conditions.
+        </div>
+        <div class="manager-feature">
+          <strong>In-Flight Tracking</strong>
+          <code>inFlightRefreshes[String: Task]</code>. Manual refresh cancels in-flight automatic. Prevents overlapping fetches per provider.
+        </div>
+      </div>
+      <div class="state-machine">
+        <div class="state-machine-title">ProviderStatus &mdash; 6-Case State Machine</div>
+        <div class="state-node s-unconfig"><div class="dot"></div>unconfigured</div>
+        <div class="state-arrow">&rarr;</div>
+        <div class="state-node s-pending"><div class="dot"></div>pendingFirstLoad</div>
+        <div class="state-arrow">&rarr;</div>
+        <div class="state-node s-refresh"><div class="dot"></div>refreshing(lastData?, lastMessage?)</div>
+        <div class="state-arrow">&rarr;</div>
+        <div class="state-node s-ready"><div class="dot"></div>ready(data)</div>
+        <div class="state-arrow" style="opacity:0.2">&nbsp;</div>
+        <div class="state-node s-stale"><div class="dot"></div>stale(data, reason, message)</div>
+        <div class="state-arrow" style="opacity:0.2">&nbsp;</div>
+        <div class="state-node s-error"><div class="dot"></div>error(message)</div>
+      </div>
+      <div class="comp-detail" style="margin-top:10px;font-size:0.72rem;line-height:1.6;opacity:0.7">
+        Transitions: <code>success &rarr; ready</code> &middot; <code>transient+data &rarr; stale(.transient)</code> &middot; <code>auth+data &rarr; stale(.auth)</code> &middot; <code>transient/auth+noData &rarr; error</code> &middot; <code>persistent &rarr; error</code> &middot; <code>unconfigured &rarr; unconfigured</code>
+      </div>
+    </div>
+  </div>
+
+  <!-- LAYER: Services -->
+  <div class="layer-label">Supporting Services</div>
+  <div class="layer">
+    <div class="component svc" id="polling-manager">
+      <div class="comp-name">PollingManager</div>
+      <div class="comp-badge">Timer-based</div>
+      <div class="comp-detail">
+        Periodic refresh orchestrator.<br>
+        Interval: configurable (min <code>60s</code>, default <code>120s</code>).<br>
+        Fires <code>requestRefresh(.automatic)</code> on each tick. Timer restarts on interval change.
+      </div>
+    </div>
+    <div class="component svc" id="notification-svc">
+      <div class="comp-name">NotificationService</div>
+      <div class="comp-badge">UNUserNotification</div>
+      <div class="comp-detail">
+        Evaluates threshold crossings and reset events via snapshot comparison.<br>
+        <span class="comp-tag" style="background:rgba(59,130,246,0.12);color:var(--service)">50% crossing</span>
+        <span class="comp-tag" style="background:rgba(59,130,246,0.12);color:var(--service)">80% crossing</span><br>
+        <span class="comp-tag" style="background:rgba(59,130,246,0.08);color:var(--text-dim)">5h reset (&gt;1hr jump)</span>
+        <span class="comp-tag" style="background:rgba(59,130,246,0.08);color:var(--text-dim)">7d reset (&gt;24hr jump)</span>
+      </div>
+    </div>
+    <div class="component svc" id="usage-exporter">
+      <div class="comp-name">UsageExporter</div>
+      <div class="comp-badge">enum (static)</div>
+      <div class="comp-detail">
+        Writes provider status + display data to disk for external tools.<br>
+        <code>~/.tokenpulse/raw_usage.json</code><br>
+        Exports <code>unconfigured</code>, <code>pending</code>, <code>refreshing</code>,
+        <code>ready</code>, <code>stale</code>, and <code>error</code> payloads.
+        Atomic write (write-then-rename). Best-effort &mdash; silently ignores failures.
+      </div>
+    </div>
+    <div class="component svc" id="config-service">
+      <div class="comp-name">ConfigService</div>
+      <div class="comp-badge">@Observable &middot; Schema v6</div>
+      <div class="comp-detail">
+        Persistent config at <code>~/.tokenpulse/config.json</code>.<br>
+        Stores: enabledProviders, pollInterval, proxy port, Anthropic/OpenAI upstream URLs,
+        keepalive UI settings, and logging flags. Auto-save on <code>didSet</code>. Auto-migration across schema versions.
+      </div>
+    </div>
+  </div>
+
+  <!-- LAYER: UI -->
+  <div class="layer-label">Presentation Layer</div>
+  <div class="layer">
+    <div class="component ui-comp" id="statusbar-ctrl">
+      <div class="comp-name">StatusBarController</div>
+      <div class="comp-badge">NSStatusItem &middot; NSPopover</div>
+      <div class="comp-detail">
+        Menu bar presence. Left-click toggles popover, right-click cycles active provider.<br>
+        <strong style="color:var(--ui)">Slash Animation:</strong><br>
+        <span style="font-family:'Fira Code',monospace;font-size:0.68rem">
+          idle &rarr; starting &rarr; bouncing &rarr; waitingForCenter &rarr; stopping
+        </span>
+      </div>
+    </div>
+    <div class="component ui-comp" id="popover-view">
+      <div class="comp-name">PopoverView</div>
+      <div class="comp-badge">SwiftUI</div>
+      <div class="comp-detail">
+        Main popover UI: provider rows with <code>QuotaGrid</code> (5h/7d bars + utilization %),
+        proxy status row, per-session proxy activity, optional manual keepalive controls,
+        refresh &amp; settings buttons. Width: 384pt.
+      </div>
+    </div>
+    <div class="component ui-comp" id="settings-view">
+      <div class="comp-name">SettingsView</div>
+      <div class="comp-badge">SwiftUI &middot; 3 Tabs</div>
+      <div class="comp-detail">
+        <span class="comp-tag" style="background:rgba(244,114,182,0.12);color:var(--ui)">General</span>
+        <span class="comp-tag" style="background:rgba(244,114,182,0.12);color:var(--ui)">Providers</span>
+        <span class="comp-tag" style="background:rgba(244,114,182,0.12);color:var(--ui)">Proxy</span><br>
+        Two-way bindings with ConfigService via <code>@Bindable</code>.
+      </div>
+    </div>
+    <div class="component ui-comp" id="bar-icon">
+      <div class="comp-name">BarIconRenderer</div>
+      <div class="comp-badge">Core Graphics</div>
+      <div class="comp-detail">
+        Diagonal split cell: 5h upper-left, 7d lower-right. Monospaced font 9.5pt. Slash morphs between idle (gray full-width) and active (orange runner segment).
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Data Models Sidebar -->
+<aside id="data-models">
+  <div class="model-card">
+    <div class="model-name">UsageData</div>
+    <div class="model-field">fiveHour: <span class="type">WindowUsage?</span></div>
+    <div class="model-field">sevenDay: <span class="type">WindowUsage?</span></div>
+    <div class="model-field">extras: <span class="type">[String: String]</span></div>
+    <div class="model-field">fetchedAt: <span class="type">Date</span></div>
+  </div>
+  <div class="model-card">
+    <div class="model-name">WindowUsage</div>
+    <div class="model-field">utilization: <span class="type">Double (0-100)</span></div>
+    <div class="model-field">resetsAt: <span class="type">Date?</span></div>
+  </div>
+  <div class="model-card">
+    <div class="model-name">ProviderEntry</div>
+    <div class="model-field">id: <span class="type">String</span></div>
+    <div class="model-field">displayName: <span class="type">String</span></div>
+    <div class="model-field">shortLabel: <span class="type">String</span></div>
+    <div class="model-field">status: <span class="type">ProviderStatus</span></div>
+    <div class="model-field">lastAttemptAt: <span class="type">Date?</span></div>
+    <div class="model-field">lastSuccessAt: <span class="type">Date?</span></div>
+  </div>
+  <div class="model-card">
+    <div class="model-name">StatusBarIconModel</div>
+    <div class="model-field">label: <span class="type">String</span></div>
+    <div class="model-field">utilization: <span class="type">Double?</span></div>
+    <div class="model-field">sevenDayUtil: <span class="type">Double?</span></div>
+    <div class="model-field">state: <span class="type">StatusBarIconState</span></div>
+  </div>
+</aside>
+
+<script>
+(function(){
+  const CONNS = [
+    // External → Providers
+    {from:'keychain-svc',to:'claude-provider',fromPort:'bottom',toPort:'top',label:'OAuth token',color:'var(--external)',marker:'arrow-ext',style:'flow'},
+    {from:'keychain-svc',to:'zenmux-provider',fromPort:'bottom',toPort:'top',label:'API key',color:'var(--external)',marker:'arrow-ext',style:'flow'},
+    {from:'auth-file',to:'codex-provider',fromPort:'bottom',toPort:'top',label:'access token',color:'var(--external)',marker:'arrow-ext',style:'flow'},
+    {from:'chrome-cookies',to:'zenmux-provider',fromPort:'bottom',toPort:'top',label:'cookies (opt.)',color:'var(--external)',marker:'arrow-ext',style:'flow'},
+    // Protocol → Providers (implements)
+    {from:'usage-provider',to:'claude-provider',fromPort:'bottom',toPort:'top',label:'',color:'var(--protocol)',marker:'arrow-proto',style:'impl'},
+    {from:'usage-provider',to:'codex-provider',fromPort:'bottom',toPort:'top',label:'',color:'var(--protocol)',marker:'arrow-proto',style:'impl'},
+    {from:'usage-provider',to:'zenmux-provider',fromPort:'bottom',toPort:'top',label:'',color:'var(--protocol)',marker:'arrow-proto',style:'impl'},
+    // Providers → ProviderManager
+    {from:'claude-provider',to:'provider-manager',fromPort:'bottom',toPort:'top',label:'fetchUsage()',color:'var(--claude)',marker:'arrow-claude',style:'flow'},
+    {from:'codex-provider',to:'provider-manager',fromPort:'bottom',toPort:'top',label:'fetchUsage()',color:'var(--codex)',marker:'arrow-codex',style:'flow'},
+    {from:'zenmux-provider',to:'provider-manager',fromPort:'bottom',toPort:'top',label:'fetchUsage()',color:'var(--zenmux)',marker:'arrow-zenmux',style:'flow'},
+    // ProviderManager → Services
+    {from:'provider-manager',to:'notification-svc',fromPort:'bottom',toPort:'top',label:'evaluate(entries)',color:'var(--service)',marker:'arrow-service',style:'flow'},
+    {from:'provider-manager',to:'usage-exporter',fromPort:'bottom',toPort:'top',label:'write(entries)',color:'var(--service)',marker:'arrow-service',style:'flow'},
+    // PollingManager → ProviderManager
+    {from:'polling-manager',to:'provider-manager',fromPort:'top',toPort:'bottom',label:'requestRefresh(.auto)',color:'var(--service)',marker:'arrow-service',style:'flow'},
+    // ConfigService → PollingManager
+    {from:'config-service',to:'polling-manager',fromPort:'left',toPort:'right',label:'interval change',color:'var(--service)',marker:'arrow-service',style:'flow'},
+    // ConfigService ↔ SettingsView
+    {from:'config-service',to:'settings-view',fromPort:'bottom',toPort:'top',label:'@Bindable two-way',color:'var(--ui)',marker:'arrow-ui',style:'flow',bidir:true},
+    // ProviderManager → StatusBarController
+    {from:'provider-manager',to:'statusbar-ctrl',fromPort:'bottom',toPort:'top',label:'onIconUpdate(model)',color:'var(--ui)',marker:'arrow-ui',style:'flow'},
+    // StatusBarController → BarIconRenderer
+    {from:'statusbar-ctrl',to:'bar-icon',fromPort:'right',toPort:'left',label:'renders',color:'var(--ui)',marker:'arrow-ui',style:'flow'},
+    // StatusBarController → ProviderManager (cycle)
+    {from:'statusbar-ctrl',to:'provider-manager',fromPort:'top',toPort:'bottom',label:'cycleActiveProvider',color:'var(--ui)',marker:'arrow-ui',style:'read'},
+    // PopoverView → ProviderManager (reads)
+    {from:'popover-view',to:'provider-manager',fromPort:'top',toPort:'bottom',label:'reads providerEntries',color:'var(--ui)',marker:'arrow-ui',style:'read'},
+  ];
+
+  const svg = document.getElementById('connections-svg');
+  const diagram = document.getElementById('diagram');
+
+  function getPort(el, port) {
+    const r = el.getBoundingClientRect();
+    const d = diagram.getBoundingClientRect();
+    const x = r.left - d.left, y = r.top - d.top;
+    switch(port) {
+      case 'top': return {x: x + r.width/2, y: y};
+      case 'bottom': return {x: x + r.width/2, y: y + r.height};
+      case 'left': return {x: x, y: y + r.height/2};
+      case 'right': return {x: x + r.width, y: y + r.height/2};
+    }
+  }
+
+  function buildPath(p1, p2, fp, tp) {
+    const dx = p2.x - p1.x, dy = p2.y - p1.y;
+    let c1, c2;
+    if ((fp==='bottom'&&tp==='top')||(fp==='top'&&tp==='bottom')) {
+      const off = Math.max(Math.abs(dy)*0.4, 30);
+      const dir1 = fp==='bottom'? 1 : -1;
+      const dir2 = tp==='top'? -1 : 1;
+      c1 = {x: p1.x, y: p1.y + off*dir1};
+      c2 = {x: p2.x, y: p2.y + off*dir2};
+    } else if ((fp==='left'&&tp==='right')||(fp==='right'&&tp==='left')) {
+      const off = Math.max(Math.abs(dx)*0.4, 30);
+      const dir1 = fp==='right'? 1 : -1;
+      const dir2 = tp==='left'? -1 : 1;
+      c1 = {x: p1.x + off*dir1, y: p1.y};
+      c2 = {x: p2.x + off*dir2, y: p2.y};
+    } else {
+      const off = Math.max(Math.abs(dy)*0.35, 25);
+      c1 = {x: p1.x, y: p1.y + (fp==='bottom'?off:fp==='top'?-off:0)};
+      c2 = {x: p2.x, y: p2.y + (tp==='top'?-off:tp==='bottom'?off:0)};
+    }
+    return `M${p1.x},${p1.y} C${c1.x},${c1.y} ${c2.x},${c2.y} ${p2.x},${p2.y}`;
+  }
+
+  function drawAll() {
+    // Remove old paths but keep defs
+    svg.querySelectorAll('.conn-group').forEach(g => g.remove());
+    const dRect = diagram.getBoundingClientRect();
+    svg.setAttribute('width', dRect.width);
+    svg.setAttribute('height', dRect.height);
+    svg.style.width = dRect.width + 'px';
+    svg.style.height = dRect.height + 'px';
+
+    CONNS.forEach(conn => {
+      const fromEl = document.getElementById(conn.from);
+      const toEl = document.getElementById(conn.to);
+      if (!fromEl || !toEl) return;
+      const p1 = getPort(fromEl, conn.fromPort);
+      const p2 = getPort(toEl, conn.toPort);
+      const d = buildPath(p1, p2, conn.fromPort, conn.toPort);
+
+      const g = document.createElementNS('http://www.w3.org/2000/svg','g');
+      g.classList.add('conn-group');
+      g.dataset.from = conn.from;
+      g.dataset.to = conn.to;
+
+      const path = document.createElementNS('http://www.w3.org/2000/svg','path');
+      path.setAttribute('d', d);
+      path.setAttribute('stroke', conn.color);
+      path.setAttribute('marker-end', `url(#${conn.marker})`);
+      path.classList.add('conn-path', conn.style);
+      g.appendChild(path);
+
+      if (conn.bidir) {
+        const path2 = document.createElementNS('http://www.w3.org/2000/svg','path');
+        const d2 = buildPath(p2, p1, conn.toPort, conn.fromPort);
+        path2.setAttribute('d', d2);
+        path2.setAttribute('stroke', conn.color);
+        path2.setAttribute('marker-end', `url(#${conn.marker})`);
+        path2.classList.add('conn-path', conn.style);
+        path2.style.strokeDashoffset = '7';
+        g.appendChild(path2);
+      }
+
+      // Label
+      if (conn.label) {
+        const mid = pathMidpoint(p1, p2);
+        const bg = document.createElementNS('http://www.w3.org/2000/svg','rect');
+        const txt = document.createElementNS('http://www.w3.org/2000/svg','text');
+        txt.textContent = conn.label;
+        txt.setAttribute('x', mid.x);
+        txt.setAttribute('y', mid.y);
+        txt.setAttribute('text-anchor', 'middle');
+        txt.setAttribute('dominant-baseline', 'central');
+        txt.classList.add('conn-label');
+        // Measure text for background
+        g.appendChild(txt);
+        // We'll set bg after first paint
+        setTimeout(() => {
+          try {
+            const bb = txt.getBBox();
+            bg.setAttribute('x', bb.x - 4);
+            bg.setAttribute('y', bb.y - 2);
+            bg.setAttribute('width', bb.width + 8);
+            bg.setAttribute('height', bb.height + 4);
+            bg.classList.add('conn-label-bg');
+            g.insertBefore(bg, txt);
+          } catch(e){}
+        }, 50);
+      }
+      svg.appendChild(g);
+    });
+  }
+
+  function pathMidpoint(p1, p2) {
+    return {x: (p1.x + p2.x)/2, y: (p1.y + p2.y)/2};
+  }
+
+  // Hover interactivity
+  document.querySelectorAll('.component').forEach(el => {
+    el.addEventListener('mouseenter', () => {
+      const id = el.id;
+      const related = CONNS.filter(c => c.from === id || c.to === id);
+      const relatedIds = new Set([id]);
+      related.forEach(c => {relatedIds.add(c.from); relatedIds.add(c.to)});
+
+      document.querySelectorAll('.component').forEach(c => {
+        c.classList.toggle('dimmed', !relatedIds.has(c.id));
+        c.classList.toggle('highlighted', relatedIds.has(c.id));
+      });
+      document.querySelectorAll('.conn-group').forEach(g => {
+        const isR = related.some(c => c.from===g.dataset.from && c.to===g.dataset.to);
+        g.querySelectorAll('.conn-path').forEach(p => {
+          p.classList.toggle('dimmed', !isR);
+          p.classList.toggle('highlighted', isR);
+        });
+        g.querySelectorAll('.conn-label').forEach(l => {
+          l.classList.toggle('dimmed', !isR);
+          l.classList.toggle('highlighted', isR);
+        });
+        g.querySelectorAll('.conn-label-bg').forEach(b => {
+          b.style.opacity = isR ? '0.9' : '0';
+        });
+      });
+    });
+    el.addEventListener('mouseleave', () => {
+      document.querySelectorAll('.component').forEach(c => {
+        c.classList.remove('dimmed','highlighted');
+      });
+      document.querySelectorAll('.conn-path,.conn-label').forEach(p => {
+        p.classList.remove('dimmed','highlighted');
+      });
+      document.querySelectorAll('.conn-label-bg').forEach(b => {b.style.opacity='0.85'});
+    });
+  });
+
+  // Draw on load and resize
+  function redraw() { requestAnimationFrame(drawAll); }
+  window.addEventListener('load', redraw);
+  window.addEventListener('resize', redraw);
+  // Also redraw after fonts load
+  document.fonts.ready.then(redraw);
+  // Fallback delayed redraw
+  setTimeout(redraw, 300);
+  setTimeout(redraw, 1000);
+})();
+</script>
+</body>
+</html>

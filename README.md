@@ -17,11 +17,11 @@ A macOS menu bar app that monitors AI platform token usage and optimizes API cos
 
 ### Local proxy
 
-- **Cache-warming keepalives** — Sends periodic lightweight requests per session to keep prompt caches warm, saving ~1.15x base input tokens per avoided cache miss at a cost of ~0.10x base input tokens per keepalive
+- **Manual cache-warming keepalives** — Lets you send lightweight Anthropic keepalive requests from the popover when a tracked session's cache would otherwise go cold
 - **Per-session cost tracking** — Tracks token usage, bytes transferred, and estimated cost per Claude Code session in real-time
 - **Streaming support** — Full HTTP/1.1 proxy with SSE streaming passthrough; parses token usage from both JSON and SSE responses
 - **Traffic indicator** — Menu bar slash animates with a bouncing glow when the proxy is forwarding requests
-- **Event logging** — Structured SQLite event log with 24-hour retention; optional gzip payload capture for debugging
+- **Event logging** — Structured SQLite event log with 24-hour retention; optional full request/response capture in SQLite for debugging
 - **Status snapshots** — Atomic JSON snapshots at `~/.tokenpulse/proxy_status.json` for external tooling
 
 ### General
@@ -107,12 +107,12 @@ The menu bar gauge shows remaining capacity for the active provider's primary wi
 
 ## Local proxy
 
-TokenPulse includes an optional local HTTP proxy that sits between your AI tools (e.g. Claude Code) and the upstream Anthropic-compatible API. It forwards requests transparently while adding two capabilities: **cache-warming keepalives** that reduce API costs, and **per-session observability** that tracks token usage, bytes, and estimated cost in real-time.
+TokenPulse includes an optional local HTTP proxy that sits between your AI tools and upstream APIs. It currently serves **Anthropic Messages** (`/v1/messages`) and **OpenAI Responses** (`/v1/responses`) on the same local port. It forwards requests transparently while adding two capabilities: **manual cache-warming keepalives** for tracked Anthropic sessions, and **per-session observability** that tracks token usage, bytes, and estimated cost in real time.
 
 ### Setup
 
 1. Open **Settings > Proxy** and toggle **Enable local proxy**
-2. Set the **upstream URL** (defaults to `https://zenmux.ai/api/anthropic`)
+2. Set the **Anthropic upstream URL** (defaults to `https://zenmux.ai/api/anthropic`). OpenAI Responses upstream defaults to `https://api.openai.com`
 3. Point your AI tool at the proxy:
 
 ```bash
@@ -123,23 +123,23 @@ The proxy listens on `127.0.0.1` only (IPv4 loopback) and never binds all interf
 
 ### How it works
 
-The proxy is a full HTTP/1.1 server built on Network.framework. It identifies sessions via `X-Claude-Code-Session-Id` headers and tracks each independently:
+The proxy is a full HTTP/1.1 server built on Network.framework. Anthropic Messages traffic uses `X-Claude-Code-Session-Id` for tracked sessions; OpenAI Responses traffic is currently grouped as `Other`.
 
 - **Forwarding** — Requests are forwarded to the upstream URL with streaming SSE passthrough. Token usage is parsed from both JSON responses and SSE `data:` chunks in real-time.
 - **Cost tracking** — Per-session counters track input/output/cache-read/cache-write tokens and estimate cost using per-model pricing tables. The popover shows active sessions with their request counts and running cost.
 - **Traffic indicator** — When the proxy forwards a request, the menu bar slash animates with a bouncing orange glow, settling back to gray when traffic stops.
 
-### Cache-warming keepalives
+### Manual keepalives
 
 Anthropic's prompt cache has a 5-minute TTL. If your next request arrives after the cache expires, the full prompt is re-cached at a cost of ~1.25x base input tokens. Keepalives prevent this by sending minimal requests (`max_tokens=1`) that read the cache at ~0.10x base input tokens — a net saving of ~1.15x per avoided cache write.
 
-Keepalives extract cache-relevant fields (system prompt, messages, tools, tool_choice, thinking config) from real requests and replay them periodically. They run per session (up to 5 concurrent), auto-disable after 5 cumulative failures or after the configured inactivity timeout, and stop when the proxy is turned off. The popover shows estimated net savings.
+When TokenPulse establishes Anthropic lineage for a session, the popover can expose a per-session **Manual** keepalive mode. Sending one keepalive replays cache-relevant fields (system prompt, messages, tools, tool_choice, thinking config) as a minimal `POST /v1/messages` request. The result is logged and counted in session metrics; there is no automatic background keepalive loop in the current implementation.
 
 ### Observability
 
 The proxy writes structured event logs to `~/.tokenpulse/proxy_events.sqlite` (SQLite, WAL mode) and atomic status snapshots to `~/.tokenpulse/proxy_status.json` (throttled to 1-second intervals). Events are pruned after 24 hours with 5-minute sweep cycles.
 
-Optional payload capture stores gzip-compressed request/response bodies to `~/.tokenpulse/proxy_payloads/` (disabled by default, 24-hour retention).
+Optional payload capture stores full request/response content in the `proxy_request_content` table inside `~/.tokenpulse/proxy_events.sqlite` (disabled by default).
 
 For the full proxy architecture, request flow, SQLite schema, and keepalive economics, see [docs/proxy.md](docs/proxy.md).
 
@@ -151,10 +151,11 @@ All fields are in `~/.tokenpulse/config.json`:
 |-------|---------|-------------|
 | `proxyEnabled` | `false` | Start the local proxy on launch |
 | `proxyPort` | `8080` | Listening port on 127.0.0.1 |
-| `proxyUpstreamURL` | `https://zenmux.ai/api/anthropic` | Upstream API to forward requests to |
-| `keepaliveEnabled` | `false` | Send cache-warming keepalives between requests |
-| `keepaliveIntervalSeconds` | `240` | Seconds between keepalive requests |
-| `proxyInactivityTimeoutSeconds` | `900` | Disable keepalives for a session after this many idle seconds |
+| `anthropicUpstreamURL` | `https://zenmux.ai/api/anthropic` | Anthropic Messages upstream base URL |
+| `openAIUpstreamURL` | `https://api.openai.com` | OpenAI Responses upstream base URL |
+| `keepaliveEnabled` | `false` | Show per-session manual keepalive controls in the popover |
+| `keepaliveIntervalSeconds` | `240` | Persisted compatibility field; currently unused by manual keepalive |
+| `proxyInactivityTimeoutSeconds` | `900` | Persisted compatibility field; currently unused by manual keepalive |
 | `saveProxyEventLog` | `true` | Write event metadata to SQLite |
 | `saveProxyPayloads` | `false` | Capture full request/response bodies (privacy-sensitive) |
 
@@ -193,7 +194,7 @@ TokenPulse/
 ├── Models/         # UsageData, ProviderStatus, ProviderConfig
 ├── Providers/      # UsageProvider protocol + Codex, Claude, ZenMux implementations
 ├── Services/       # KeychainService, ChromeCookieService, ConfigService, PollingManager, ProviderManager, NotificationService
-├── Proxy/          # HTTP server, request forwarder, keepalive manager, session store, event logger, metrics
+├── Proxy/          # HTTP server, route handlers, request forwarder, session store, event logger, metrics
 ├── Views/          # PopoverView, SettingsView (SwiftUI)
 └── Rendering/      # BarIconRenderer (Core Graphics)
 ```

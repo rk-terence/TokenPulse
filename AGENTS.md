@@ -35,12 +35,12 @@ Use conventional commit format: `type: short description` (e.g. `feat: add proxy
 - Minimum 60s polling interval for Claude /api/oauth/usage to avoid 429s
 - Always handle provider errors gracefully — dim icon + show stale data rather than crash
 - Each provider owns its error classification via `classifyError(_:) -> FailureDisposition`
-- ProviderStatus uses 6 cases: unconfigured, pendingFirstLoad, refreshing(lastData:), ready, stale(reason:), error
+- ProviderStatus uses 6 cases: unconfigured, pendingFirstLoad, refreshing(lastData:lastMessage:), ready, stale(data:reason:message:), error
 - Notifications fire when 5h utilization crosses 50% or 80%, and when quota windows reset (with jitter filtering)
 - Run `xcodebuild test` after any model or provider changes
 - File I/O (config, usage export) must use `.atomic` writes
 - Proxy listens on `127.0.0.1` only (IPv4 loopback) — never bind all interfaces
-- Max 5 concurrent keepalive loops; max 5 cumulative failures before auto-disable per session
+- Keepalive is manual-only in the current implementation: no background keepalive loops or auto-disable-on-failure policy
 - Event log uses SQLite with WAL mode; 24-hour retention with 5-minute prune sweeps
 - Status snapshots (`~/.tokenpulse/proxy_status.json`) throttled to 1-second minimum interval
 
@@ -66,8 +66,9 @@ TokenPulse/
 ├── Proxy/
 │   ├── LocalProxyController.swift  # Lifecycle owner: starts/stops server, manages subsystem
 │   ├── ProxyHTTPServer.swift       # Network.framework HTTP/1.1 listener on 127.0.0.1
-│   ├── AnthropicForwarder.swift    # Forwards requests to upstream, streaming support
-│   ├── KeepaliveManager.swift      # Per-session cache-warming keepalive loops
+│   ├── ProxyForwarder.swift        # Route-specific forwarding, streaming support, token parsing
+│   ├── AnthropicProxyAPIHandler.swift  # Anthropic Messages route semantics + keepalive body generation
+│   ├── OpenAIResponsesProxyAPIHandler.swift # OpenAI Responses route semantics + token parsing
 │   ├── ProxySessionStore.swift     # Session state, byte counters, traffic callbacks
 │   ├── ProxyEventLogger.swift      # SQLite event persistence (proxy_requests/keepalives/lifecycle tables) + status snapshots
 │   ├── ProxyMetricsStore.swift     # Aggregated counters and savings estimate
