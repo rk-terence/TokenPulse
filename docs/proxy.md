@@ -132,6 +132,18 @@ This conservative rule reflects empirical Codex/OpenAI observations rather than 
 
 Tracked sessions store normal request activity and token/cost aggregation. Only Anthropic sessions run lineage tracking and retain keepalive-specific context.
 
+### Empirical basis for Codex detection
+
+The OpenAI Responses detection rule above is based on local observations from 2026-04-14 rather than formal OpenAI API documentation.
+
+- Captured Codex traffic in this environment included the session-related headers `x-codex-turn-metadata`, `x-codex-window-id`, `x-client-request-id`, `session_id`, `originator: codex-tui`, and `User-Agent: codex-tui/...`.
+- The observed `x-codex-turn-metadata` value was JSON carrying at least `session_id` and `turn_id`.
+- The observed `x-codex-window-id` format was `{conversation_id}:{window_generation}`.
+- Local Codex source confirms that `session_id` is the conversation/thread identifier and that `x-codex-window-id` reuses that identifier with a `window_generation` suffix.
+- Local Codex tests indicate `window_generation` starts at `0`, advances after history compaction, persists on resume, and resets on fork.
+
+These observations are strong enough for conservative session identification, but not strong enough to infer OpenAI cache lifetime or to justify any automatic keepalive policy on the OpenAI route.
+
 ## Streaming path
 
 When the request body has `"stream": true`:
