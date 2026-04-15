@@ -89,6 +89,7 @@ final class ProxyForwarder: Sendable {
     ) async {
         // requestID is created below, after URL validation, so we only track
         // real upstream attempts (not proxy-side config errors).
+        let supportsKeepalive = apiFlavor.supportsKeepalive && supportsTrackedSession
         let upstreamPath = apiHandler.upstreamPath(for: request.path)
         let urlString = upstreamBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             + upstreamPath
@@ -188,9 +189,8 @@ final class ProxyForwarder: Sendable {
             metrics: metrics
         )
 
-        // Always evaluate lineage for non-errored requests so the tracked
-        // body is available for manual keepalive.
-        if !errored && supportsTrackedSession {
+        // Only Anthropic tracked sessions participate in lineage/keepalive.
+        if !errored && supportsKeepalive {
             let lineageResult = await sessionStore.evaluateAndTrackLineage(
                 body: request.body,
                 headers: request.headers,

@@ -1,6 +1,7 @@
 import Foundation
 
-/// Tracks active Claude Code sessions by their `X-Claude-Code-Session-Id`.
+/// Tracks active proxy sessions, including Anthropic and conservatively
+/// identified Codex/OpenAI sessions.
 actor ProxySessionStore {
 
     struct CostSnapshot: Sendable {

@@ -74,7 +74,7 @@ enum ProxySessionID {
     }
 
     static func supportsTrackedSession(_ sessionID: String) -> Bool {
-        flavor(for: sessionID)?.supportsKeepalive == true
+        flavor(for: sessionID) != nil
     }
 
     static func displayID(for sessionID: String) -> String {

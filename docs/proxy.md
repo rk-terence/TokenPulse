@@ -67,7 +67,7 @@ The proxy also provides visibility the upstream APIs do not surface directly in 
 
 The proxy keeps session state in memory longer than it keeps every session visible in the popover.
 
-- **Tracked Anthropic sessions**: evicted only when they have no in-flight requests and their most recent activity (`max(lastSeenAt, lastKeepaliveAt)`) is older than 24 hours.
+- **Tracked sessions**: evicted only when they have no in-flight requests and their most recent activity (`max(lastSeenAt, lastKeepaliveAt)`) is older than 24 hours. This includes Anthropic sessions identified by `X-Claude-Code-Session-Id` and OpenAI Responses sessions that pass the conservative Codex detection checks below.
 - **`other` traffic**: evicted after 60 seconds of inactivity when no requests are in flight.
 - **Tracked-session UI visibility**: shown when active within the last 10 minutes, or when there are still in-flight requests.
 - **`other` UI visibility**: shown only for the most recent 60 seconds, or while requests are in flight.
@@ -112,17 +112,25 @@ Normalization intentionally ignores differences that should not break same-linea
 9. Session is touched, request state is registered, metrics/logging begin
 10. Upstream request is forwarded via streaming or buffered path
 11. Token usage and estimated cost are recorded
-12. Request is marked done, lineage is evaluated, status snapshot is written
+12. Request is marked done, status snapshot is written, and keepalive-capable routes may evaluate lineage
 13. If Anthropic lineage is established, the session becomes eligible for later manual keepalive
 ```
 
 ## Session identity
 
 - **Anthropic Messages**: session ID comes from `X-Claude-Code-Session-Id`, normalized and stored as `anthropic:<id>`.
-- **OpenAI Responses**: currently grouped as `other`.
-- **Missing or empty Anthropic session header**: falls back to `other`.
+- **OpenAI Responses**: session ID is stored as `openai:<session_id>` only when all of these are true:
+  - `originator` is exactly `codex-tui`
+  - `User-Agent` starts with `codex-tui/`
+  - `session_id` is present and non-empty
+  - `x-client-request-id` exactly matches `session_id`
+  - `x-codex-window-id` parses as `<session_id>:<window_generation>` where `window_generation` is an integer
+  - `x-codex-turn-metadata` is valid JSON, includes the same `session_id`, and includes a non-empty `turn_id`
+- **Everything else**: falls back to `other`.
 
-Only tracked Anthropic sessions store request context for later keepalive use.
+This conservative rule reflects empirical Codex/OpenAI observations rather than a published OpenAI contract, so the proxy requires several independent headers to agree before it classifies a request as a tracked Codex session.
+
+Tracked sessions store normal request activity and token/cost aggregation. Only Anthropic sessions run lineage tracking and retain keepalive-specific context.
 
 ## Streaming path
 
@@ -177,7 +185,7 @@ A cumulative cost counter in `ProxySessionStore` survives session expiration unt
 
 # Manual keepalive behavior
 
-Manual keepalive applies only to Anthropic Messages traffic.
+Manual keepalive applies only to Anthropic Messages traffic. OpenAI Responses traffic may still be tracked per Codex session, but it does not participate in lineage evaluation or keepalive generation because the upstream cache TTL contract is not documented clearly enough.
 
 ## How lineage becomes available
 
@@ -189,7 +197,7 @@ After a successful tracked Anthropic request:
 
 The session is **not** eligible for keepalive when:
 
-- it is `other` / OpenAI Responses traffic
+- it is a tracked OpenAI Codex session or `other` traffic
 - lineage has not been established yet
 - lineage was disabled because no main-agent candidate appeared in the first two requests
 - lineage diverged (for example, messages stop being append-only)
@@ -226,7 +234,7 @@ Those disable reasons are shown in the popover and logged to `proxy_lifecycle`.
 
 ## Cost economics
 
-Each manual keepalive processes the full prompt through the cache but generates minimal output. The proxy uses the same high-level economics as before:
+Each manual keepalive processes the full Anthropic prompt through the cache but generates minimal output. The proxy uses the same high-level economics as before:
 
 - **keepalive cost**: about `0.10x` base input rate (cache read)
 - **avoided cache miss cost**: about `1.15x` base input rate versus paying another cache write
@@ -441,7 +449,7 @@ Legacy `proxyUpstreamURL` is still read during config migration and mapped to `a
 | Supported endpoints | `POST /v1/messages`, `POST /v1/responses` | `LocalProxyController.requestValidator` |
 | Max Content-Length | 50 MB (`50_000_000`) | `ProxyHTTPServer.processRequest()` |
 | Max header size | 64 KB (`65_536`) | `ProxyHTTPServer.readRequest()` |
-| Tracked session retention | 24 hours since last activity | `LocalProxyController.sessionRetentionSeconds` |
+| Tracked session retention | 24 hours since last activity for Anthropic and detected Codex/OpenAI sessions | `LocalProxyController.sessionRetentionSeconds` |
 | `other` session retention | 60 seconds since last activity | `LocalProxyController.otherTrafficRetentionSeconds` |
 | Tracked session UI visibility | 10 minutes since last activity, or any in-flight request | `LocalProxyController.visibleSessionActivities(...)` |
 | Non-main-agent done request retention | 5 minutes | `LocalProxyController.sideTrafficDoneRetentionSeconds` + `ProxySessionStore.pruneStaleDoneRequests(...)` |
@@ -459,7 +467,7 @@ Legacy `proxyUpstreamURL` is still read during config migration and mapped to `a
 | `Proxy/ProxyHTTPServer.swift` | Network.framework HTTP/1.1 listener; parser; validator; `NWResponseWriter` implementation |
 | `Proxy/ProxyForwarder.swift` | Route-specific forwarding, streaming/non-streaming handling, token parsing, request completion bookkeeping |
 | `Proxy/AnthropicProxyAPIHandler.swift` | Anthropic Messages route semantics, session identity, lineage support, keepalive body generation, Anthropic error bodies |
-| `Proxy/OpenAIResponsesProxyAPIHandler.swift` | OpenAI Responses route semantics, token parsing, OpenAI error bodies |
+| `Proxy/OpenAIResponsesProxyAPIHandler.swift` | OpenAI Responses route semantics, strict Codex session detection, token parsing, OpenAI error bodies |
 | `Proxy/ProxySessionStore.swift` | Actor; session lifecycle, lineage evaluation, request state machine, token accumulation, keepalive stats |
 | `Proxy/ProxyEventLogger.swift` | Actor; SQLite event persistence, optional content capture, status snapshots with throttling |
 | `Proxy/ProxyMetricsStore.swift` | Actor; aggregate counters and savings formula |

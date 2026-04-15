@@ -13,7 +13,10 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
     }
 
     func sessionID(for request: ProxyHTTPRequest) -> String {
-        ProxySessionID.other
+        guard let codexSessionID = codexSessionID(for: request) else {
+            return ProxySessionID.other
+        }
+        return ProxySessionID.make(codexSessionID, flavor: .openAIResponses)
     }
 
     func extractModel(from body: Data) -> String? {
@@ -64,6 +67,63 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
 
     private func jsonObject(from body: Data) -> [String: Any]? {
         try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+    }
+
+    /// OpenAI does not document a Codex-specific session header contract, so we
+    /// only classify traffic as a tracked Codex session when several observed
+    /// headers agree on the same identity. Anything less falls back to `other`.
+    private func codexSessionID(for request: ProxyHTTPRequest) -> String? {
+        guard normalizedHeaderValue("originator", in: request) == "codex-tui",
+              let userAgent = normalizedHeaderValue("user-agent", in: request),
+              userAgent.hasPrefix("codex-tui/"),
+              let sessionID = normalizedHeaderValue("session_id", in: request),
+              normalizedHeaderValue("x-client-request-id", in: request) == sessionID,
+              windowHeaderMatchesSessionID(request, sessionID: sessionID),
+              turnMetadataMatchesSessionID(request, sessionID: sessionID) else {
+            return nil
+        }
+
+        return sessionID
+    }
+
+    private func normalizedHeaderValue(_ name: String, in request: ProxyHTTPRequest) -> String? {
+        guard let value = request.headerValue(for: name)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+
+    private func windowHeaderMatchesSessionID(
+        _ request: ProxyHTTPRequest,
+        sessionID: String
+    ) -> Bool {
+        guard let windowID = normalizedHeaderValue("x-codex-window-id", in: request),
+              let separator = windowID.lastIndex(of: ":") else {
+            return false
+        }
+
+        let rawSessionID = String(windowID[..<separator])
+        let generation = String(windowID[windowID.index(after: separator)...])
+        return rawSessionID == sessionID && UInt64(generation) != nil
+    }
+
+    private func turnMetadataMatchesSessionID(
+        _ request: ProxyHTTPRequest,
+        sessionID: String
+    ) -> Bool {
+        guard let metadataHeader = normalizedHeaderValue("x-codex-turn-metadata", in: request),
+              let metadataData = metadataHeader.data(using: .utf8),
+              let metadata = try? JSONSerialization.jsonObject(with: metadataData) as? [String: Any],
+              let metadataSessionID = metadata["session_id"] as? String,
+              metadataSessionID.trimmingCharacters(in: .whitespacesAndNewlines) == sessionID,
+              let turnID = metadata["turn_id"] as? String,
+              !turnID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+
+        return true
     }
 
     private func parseTokenUsageFromJSON(_ data: Data) -> TokenUsage {
