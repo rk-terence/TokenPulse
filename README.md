@@ -133,7 +133,7 @@ The proxy is a full HTTP/1.1 server built on Network.framework. Anthropic Messag
 
 Anthropic's prompt cache has a 5-minute TTL. If your next request arrives after the cache expires, the full prompt is re-cached at a cost of ~1.25x base input tokens. Keepalives prevent this by sending minimal requests (`max_tokens=1`) that read the cache at ~0.10x base input tokens — a net saving of ~1.15x per avoided cache write.
 
-When TokenPulse establishes Anthropic lineage for a session, the popover can expose a per-session **Manual** keepalive mode. Sending one keepalive replays cache-relevant fields (system prompt, messages, tools, tool_choice, thinking config) as a minimal `POST /v1/messages` request. The result is logged and counted in session metrics; there is no automatic background keepalive loop in the current implementation.
+When TokenPulse establishes Anthropic lineage for a session, the popover can expose a per-session **Manual** keepalive mode. Sending one keepalive replays cache-relevant fields (system prompt, messages, tools, tool_choice, thinking config) as a minimal `POST /v1/messages` request. If a newer same-lineage request has already received an upstream `2xx` but is still streaming, TokenPulse may prefer that active request as the keepalive source on the working hypothesis that upstream acceptance usually means the cached prompt state was usable, even though Anthropic does not document `2xx` as a strict cache-hit signal. Otherwise it falls back to the last completed tracked request. The result is logged and counted in session metrics; there is no automatic background keepalive loop in the current implementation.
 
 ### Observability
 

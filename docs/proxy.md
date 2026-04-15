@@ -186,6 +186,7 @@ After a successful tracked Anthropic request:
 1. `ProxySessionStore.evaluateAndTrackLineage(...)` tries to identify the main agent.
 2. During the first two requests, the store looks for the first tools-bearing request and keeps the identification window open until request 2.
 3. Once lineage is established, later same-lineage requests update the stored lineage body and headers.
+4. If a newer same-lineage request has already received an upstream `2xx` but is still in flight, manual keepalive temporarily prefers that active request body and headers over the last completed lineage snapshot. This is a working hypothesis rather than a documented Anthropic guarantee: TokenPulse treats upstream acceptance as a reasonable signal that the cached prompt state was usable, but not as strict proof of a cache hit.
 
 The session is **not** eligible for keepalive when:
 
@@ -198,7 +199,9 @@ The session is **not** eligible for keepalive when:
 
 When the user enables keepalive controls and switches a session to `manual`, `LocalProxyController.sendManualKeepalive(for:)` may issue one keepalive request:
 
-1. Read the stored lineage body and headers from `ProxySessionStore`.
+1. Read the freshest keepalive source from `ProxySessionStore`:
+   - prefer an in-flight same-lineage Anthropic request that has already received upstream `2xx`, using the hypothesis above
+   - otherwise fall back to the last completed tracked lineage body and headers
 2. Use `KeepaliveRequestBuilder` to produce the cheapest valid Anthropic replay:
    - `stream = false`
    - `max_tokens = 1`, or `budget_tokens + 1` if thinking mode is enabled

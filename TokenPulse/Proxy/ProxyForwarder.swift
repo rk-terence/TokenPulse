@@ -158,12 +158,15 @@ final class ProxyForwarder: Sendable {
         if wantsStreaming {
             errored = await forwardStreaming(
                 urlRequest: urlRequest,
+                requestBody: request.body,
+                requestHeaders: request.headers,
                 writer: request.writer,
                 requestID: requestID,
                 sessionStore: sessionStore,
                 metrics: metrics,
                 sessionID: sessionID,
                 model: model,
+                supportsTrackedSession: supportsTrackedSession,
                 requestLog: requestLog,
                 requestStartedAt: requestStartedAt,
                 loggedRequestID: loggedRequestID
@@ -171,12 +174,15 @@ final class ProxyForwarder: Sendable {
         } else {
             errored = await forwardNonStreaming(
                 urlRequest: urlRequest,
+                requestBody: request.body,
+                requestHeaders: request.headers,
                 writer: request.writer,
                 requestID: requestID,
                 sessionStore: sessionStore,
                 metrics: metrics,
                 sessionID: sessionID,
                 model: model,
+                supportsTrackedSession: supportsTrackedSession,
                 requestLog: requestLog,
                 requestStartedAt: requestStartedAt,
                 loggedRequestID: loggedRequestID
@@ -226,12 +232,15 @@ final class ProxyForwarder: Sendable {
 
     private func forwardStreaming(
         urlRequest: URLRequest,
+        requestBody: Data,
+        requestHeaders: [(name: String, value: String)],
         writer: ResponseWriter,
         requestID: UUID,
         sessionStore: ProxySessionStore,
         metrics: ProxyMetricsStore,
         sessionID: String,
         model: String?,
+        supportsTrackedSession: Bool,
         requestLog: ProxyEventLogger.LoggedRequest,
         requestStartedAt: Date,
         loggedRequestID: Int64?
@@ -301,6 +310,15 @@ final class ProxyForwarder: Sendable {
                 writer.writeHead(status: httpResponse.statusCode, headers: responseHeaders)
                 // Headers received — transition to receiving state.
                 await sessionStore.markRequestReceiving(id: requestID)
+                if supportsTrackedSession, (200..<300).contains(httpResponse.statusCode) {
+                    await sessionStore.markAcceptedLineageRequestActive(
+                        id: requestID,
+                        body: requestBody,
+                        headers: requestHeaders,
+                        for: sessionID,
+                        using: apiHandler
+                    )
+                }
 
                 // Stream chunks through to the client.
                 for try await chunk in chunks {
@@ -394,12 +412,15 @@ final class ProxyForwarder: Sendable {
 
     private func forwardNonStreaming(
         urlRequest: URLRequest,
+        requestBody: Data,
+        requestHeaders: [(name: String, value: String)],
         writer: ResponseWriter,
         requestID: UUID,
         sessionStore: ProxySessionStore,
         metrics: ProxyMetricsStore,
         sessionID: String,
         model: String?,
+        supportsTrackedSession: Bool,
         requestLog: ProxyEventLogger.LoggedRequest,
         requestStartedAt: Date,
         loggedRequestID: Int64?
@@ -435,6 +456,15 @@ final class ProxyForwarder: Sendable {
                 // Await response headers — phase: .waiting -> .receiving
                 let httpResponse = try await taskContext.awaitResponse()
                 await sessionStore.markRequestReceiving(id: requestID)
+                if supportsTrackedSession, (200..<300).contains(httpResponse.statusCode) {
+                    await sessionStore.markAcceptedLineageRequestActive(
+                        id: requestID,
+                        body: requestBody,
+                        headers: requestHeaders,
+                        for: sessionID,
+                        using: apiHandler
+                    )
+                }
 
                 // Accumulate all response body chunks.
                 var responseData = Data()

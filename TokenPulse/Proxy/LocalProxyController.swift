@@ -396,14 +396,15 @@ final class LocalProxyController {
     ) async -> Bool {
         guard await sessionStore.canSendManualKeepalive(for: sessionID) else { return false }
 
-        guard let lineageBody = await sessionStore.lineageRequestBody(for: sessionID) else {
+        guard let keepaliveSource = await sessionStore.keepaliveRequestContext(for: sessionID) else {
             return false
         }
+        let lineageBody = keepaliveSource.body
         guard let keepaliveBody = apiHandler.buildKeepaliveBody(from: lineageBody) else {
             return false
         }
 
-        let lineageHeaders = await sessionStore.lineageRequestHeaders(for: sessionID)
+        let lineageHeaders = keepaliveSource.headers
         let urlString = upstreamBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             + apiHandler.keepaliveRequestPath
         guard let url = URL(string: urlString) else { return false }

@@ -8,6 +8,11 @@ actor ProxySessionStore {
         let estimatedCostUSDByAPI: [ProxyAPIFlavor: Double]
     }
 
+    struct KeepaliveRequestContext: Sendable {
+        let body: Data
+        let headers: [(name: String, value: String)]
+    }
+
     struct Session: Sendable {
         let sessionID: String
         var lastSeenAt: Date
@@ -39,6 +44,9 @@ actor ProxySessionStore {
         var lineageRequestHeaders: [(name: String, value: String)]
         var lineageEstablished: Bool
         var keepaliveDisabledReason: String?
+        var activeAcceptedLineageRequestID: UUID?
+        var activeAcceptedLineageRequestBody: Data?
+        var activeAcceptedLineageRequestHeaders: [(name: String, value: String)]
     }
 
     /// A snapshot of a session's stats and its currently active requests, for UI display.
@@ -139,7 +147,10 @@ actor ProxySessionStore {
                 lineageRequestBody: nil,
                 lineageRequestHeaders: [],
                 lineageEstablished: false,
-                keepaliveDisabledReason: nil
+                keepaliveDisabledReason: nil,
+                activeAcceptedLineageRequestID: nil,
+                activeAcceptedLineageRequestBody: nil,
+                activeAcceptedLineageRequestHeaders: []
             )
             sessions[sessionID] = session
             return session
@@ -232,7 +243,7 @@ actor ProxySessionStore {
         return session.keepaliveMode == .manual
             && !session.isKeepaliveDisabled
             && session.lineageEstablished
-            && session.lineageRequestBody != nil
+            && keepaliveRequestContext(for: session) != nil
     }
 
     // MARK: - Lineage tracking
@@ -374,14 +385,48 @@ actor ProxySessionStore {
         return .tracked
     }
 
-    /// Retrieve the lineage request body for keepalive use.
-    func lineageRequestBody(for sessionID: String) -> Data? {
-        sessions[sessionID]?.lineageRequestBody
+    /// Prefer an accepted in-flight main-agent continuation as the keepalive source,
+    /// falling back to the last completed tracked lineage request.
+    func keepaliveRequestContext(for sessionID: String) -> KeepaliveRequestContext? {
+        guard let session = sessions[sessionID] else { return nil }
+        return keepaliveRequestContext(for: session)
     }
 
-    /// Retrieve the lineage request headers for keepalive use.
-    func lineageRequestHeaders(for sessionID: String) -> [(name: String, value: String)] {
-        sessions[sessionID]?.lineageRequestHeaders ?? []
+    /// Track an accepted upstream request as the freshest keepalive source while it is still active.
+    func markAcceptedLineageRequestActive(
+        id: UUID,
+        body: Data,
+        headers: [(name: String, value: String)],
+        for sessionID: String,
+        using apiHandler: any ProxyAPIHandler
+    ) {
+        guard var session = sessions[sessionID] else { return }
+        guard session.lineageEstablished, !session.isKeepaliveDisabled else { return }
+        guard apiHandler.isMainAgentRequest(body: body) else { return }
+        guard let tracked = session.lineageFingerprint,
+              let incoming = apiHandler.lineageFingerprint(from: body) else {
+            return
+        }
+
+        guard incoming.systemCanonical == tracked.systemCanonical,
+              incoming.model == tracked.model,
+              incoming.toolsCanonical == tracked.toolsCanonical,
+              incoming.toolChoiceCanonical == tracked.toolChoiceCanonical,
+              incoming.thinkingCanonical == tracked.thinkingCanonical else {
+            return
+        }
+
+        let incomingMessages = apiHandler.messagesDescriptor(from: body)
+        if let trackedMessages = session.lineageMessagesDescriptor {
+            guard let incomingMessages, incomingMessages.hasPrefix(trackedMessages) else {
+                return
+            }
+        }
+
+        session.activeAcceptedLineageRequestID = id
+        session.activeAcceptedLineageRequestBody = body
+        session.activeAcceptedLineageRequestHeaders = headers
+        sessions[sessionID] = session
     }
 
     /// Disable keepalive with a human-readable reason for UI display.
@@ -592,6 +637,11 @@ actor ProxySessionStore {
         }
 
         if var session = sessions[entry.sessionID] {
+            if session.activeAcceptedLineageRequestID == id {
+                session.activeAcceptedLineageRequestID = nil
+                session.activeAcceptedLineageRequestBody = nil
+                session.activeAcceptedLineageRequestHeaders = []
+            }
             if isComplete {
                 session.completedRequestCount += 1
             } else {
@@ -700,6 +750,22 @@ actor ProxySessionStore {
     private func accumulateCost(_ cost: Double, for apiFlavor: ProxyAPIFlavor) {
         cumulativeEstimatedCostUSD += cost
         cumulativeEstimatedCostUSDByAPI[apiFlavor, default: 0] += cost
+    }
+
+    private func keepaliveRequestContext(for session: Session) -> KeepaliveRequestContext? {
+        if let body = session.activeAcceptedLineageRequestBody {
+            return KeepaliveRequestContext(
+                body: body,
+                headers: session.activeAcceptedLineageRequestHeaders
+            )
+        }
+        if let body = session.lineageRequestBody {
+            return KeepaliveRequestContext(
+                body: body,
+                headers: session.lineageRequestHeaders
+            )
+        }
+        return nil
     }
 
     private func replacementIndex(
