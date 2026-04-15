@@ -23,7 +23,8 @@ struct ZenMuxProvider: UsageProvider {
             throw ZenMuxProviderError.missingAPIKey
         }
 
-        // Fetch management API (primary) and subscription summary (optional) concurrently
+        // Keep these requests sequential. A user report tied the async-let path here
+        // to a Swift concurrency runtime crash during app startup.
         let cookies: ZenMuxCookies?
         let cookieError: String?
         do {
@@ -34,11 +35,8 @@ struct ZenMuxProvider: UsageProvider {
             cookieError = error.localizedDescription
         }
 
-        async let primaryFetch = fetchManagementAPI(apiKey: apiKey)
-        async let summaryFetch = fetchSubscriptionSummary(cookies: cookies)
-
-        let primaryData = try await primaryFetch
-        let (summaryData, summaryError) = await summaryFetch
+        let primaryData = try await fetchManagementAPI(apiKey: apiKey)
+        let (summaryData, summaryError) = await fetchSubscriptionSummary(cookies: cookies)
 
         let summaryIssue = summaryData == nil ? (cookieError ?? summaryError) : nil
         return buildUsageData(primary: primaryData, summary: summaryData, summaryIssue: summaryIssue)
