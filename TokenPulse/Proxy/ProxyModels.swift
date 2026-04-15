@@ -77,6 +77,37 @@ enum ProxySessionID {
         flavor(for: sessionID) != nil
     }
 
+    static func usesShortRetentionWindow(for sessionID: String, lineageEstablished: Bool) -> Bool {
+        guard !isOther(sessionID) else {
+            return true
+        }
+        guard let flavor = flavor(for: sessionID) else {
+            return true
+        }
+        if !flavor.supportsKeepalive {
+            return false
+        }
+        return !lineageEstablished
+    }
+
+    static func usesShortDoneRequestRetentionWindow(
+        for sessionID: String,
+        lineageEstablished: Bool
+    ) -> Bool {
+        guard !isOther(sessionID) else {
+            return true
+        }
+        guard let flavor = flavor(for: sessionID) else {
+            return true
+        }
+        switch flavor {
+        case .openAIResponses:
+            return true
+        case .anthropicMessages:
+            return !lineageEstablished
+        }
+    }
+
     static func displayID(for sessionID: String) -> String {
         if isOther(sessionID) {
             return String(localized: "Other")

@@ -817,6 +817,8 @@ private struct SessionActivityRow: View {
 private struct RequestActivityRow: View {
     let request: ProxyRequestActivity
 
+    private var rowFont: Font { .callout.monospaced() }
+
     var body: some View {
         HStack(spacing: 5) {
             if request.isKeepalive {
@@ -827,18 +829,17 @@ private struct RequestActivityRow: View {
             }
             if let modelName = compactModelName {
                 Text(modelName)
-                    .font(.callout.monospaced())
+                    .font(rowFont)
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
             leftStats
             Spacer()
-            Text(request.startedAt, style: .relative)
-                .font(.callout.monospacedDigit())
+            Text(request.startedAt, style: .timer)
+                .font(rowFont)
                 .foregroundStyle(.tertiary)
                 .contentTransition(.numericText())
-                .animation(nil, value: request.startedAt)
         }
     }
 
@@ -848,86 +849,86 @@ private struct RequestActivityRow: View {
         case .uploading:
             if request.bytesSent > 0 {
                 Text("\u{2191}")
-                    .font(.callout)
+                    .font(rowFont)
                     .foregroundStyle(.tertiary)
                 Text(formattedBytes(request.bytesSent))
-                    .font(.callout.monospacedDigit())
+                    .font(rowFont)
                     .foregroundStyle(.secondary)
                     .italic()
             } else {
                 Text(String(localized: "sending"))
-                    .font(.callout)
+                    .font(rowFont)
                     .foregroundStyle(.secondary)
                     .italic()
             }
 
         case .waiting:
             Text("\u{2191}")
-                .font(.callout)
+                .font(rowFont)
                 .foregroundStyle(.tertiary)
             Text(formattedBytes(request.bytesSent))
-                .font(.callout.monospacedDigit())
+                .font(rowFont)
                 .foregroundStyle(.tertiary)
             Text(String(localized: "waiting\u{2026}"))
-                .font(.callout)
+                .font(rowFont)
                 .foregroundStyle(.secondary)
                 .italic()
 
         case .receiving:
             // upload bytes, italic download bytes, and TTFT duration
             Text("\u{2191}")
-                .font(.callout)
+                .font(rowFont)
                 .foregroundStyle(.tertiary)
             Text(formattedBytes(request.bytesSent))
-                .font(.callout.monospacedDigit())
+                .font(rowFont)
                 .foregroundStyle(.tertiary)
             Text("\u{2193}")
-                .font(.callout)
+                .font(rowFont)
                 .foregroundStyle(.tertiary)
             Text(formattedBytes(request.bytesReceived))
-                .font(.callout.monospacedDigit())
+                .font(rowFont)
                 .foregroundStyle(.secondary)
                 .italic()
             if let ttft = timeToFirstToken {
-                Text("ttft")
-                    .font(.callout)
+                Text(paddedLabel("ttft", width: 4))
+                    .font(rowFont)
                     .foregroundStyle(.tertiary)
                 Text(formattedDuration(ttft))
-                    .font(.callout.monospacedDigit())
+                    .font(rowFont)
                     .foregroundStyle(.secondary)
             }
 
         case .done:
             if let promptK = request.promptTokens {
                 Text("\u{2191}")
-                    .font(.callout)
+                    .font(rowFont)
                     .foregroundStyle(.tertiary)
                 Text(formattedTokenCount(promptK))
-                    .font(.callout.monospacedDigit())
+                    .font(rowFont)
                     .foregroundStyle(.secondary)
             }
             if let outputK = request.tokenUsage?.outputTokens, outputK > 0 {
                 Text("\u{2193}")
-                    .font(.callout)
+                    .font(rowFont)
                     .foregroundStyle(.tertiary)
                 Text(formattedTokenCount(outputK))
-                    .font(.callout.monospacedDigit())
+                    .font(rowFont)
                     .foregroundStyle(.secondary)
             }
             if let e2e = endToEndDuration {
-                Text("e2e")
-                    .font(.callout)
+                Text(paddedLabel("e2e", width: 4))
+                    .font(rowFont)
                     .foregroundStyle(.tertiary)
                 Text(formattedDuration(e2e))
-                    .font(.callout.monospacedDigit())
+                    .font(rowFont)
                     .foregroundStyle(.secondary)
             }
             if let cost = request.estimatedCost {
                 Text("$")
-                    .font(.callout)
+                    .font(rowFont)
                     .foregroundStyle(.tertiary)
                 Text(formatCost(cost))
-                    .font(.callout.monospacedDigit())
+                    .font(rowFont)
                     .foregroundStyle(.secondary)
             }
         }
@@ -1013,36 +1014,147 @@ private struct RequestActivityRow: View {
     // MARK: - Formatting
 
     private func formattedBytes(_ bytes: Int) -> String {
-        if bytes < 1024 {
-            return "\(bytes) B"
-        } else {
-            return String(format: "%.1f KB", Double(bytes) / 1024)
-        }
+        formattedScaledField(
+            value: Double(max(0, bytes)),
+            units: ["B", "KB", "MB", "GB", "TB", "PB"],
+            totalWidth: 6,
+            allowFractionInBaseUnit: false
+        )
     }
 
     private func formattedTokenCount(_ tokens: Int) -> String {
-        if tokens >= 1000 {
-            return "\(tokens / 1000)K"
-        }
-        return "\(tokens)"
+        formattedScaledField(
+            value: Double(max(0, tokens)),
+            units: ["", "K", "M", "B", "T", "P", "E"],
+            totalWidth: 6,
+            allowFractionInBaseUnit: false
+        )
     }
 
     private func formattedDuration(_ seconds: TimeInterval) -> String {
-        if seconds < 10 {
-            return String(format: "%.1fs", seconds)
-        } else {
-            return "\(Int(seconds))s"
-        }
+        formattedCompactDuration(seconds, width: 4)
     }
 
     private func formatCost(_ cost: Double) -> String {
-        if cost < 0.01 {
-            return String(format: "%.4f", cost)
-        } else if cost < 1 {
-            return String(format: "%.3f", cost)
-        } else {
-            return String(format: "%.2f", cost)
+        formattedFixedWidthNumber(max(0, cost), width: 5)
+    }
+
+    private func formattedScaledField(
+        value: Double,
+        units: [String],
+        totalWidth: Int,
+        allowFractionInBaseUnit: Bool
+    ) -> String {
+        let base = 1000.0  // KB/MB/GB are decimal units; 1024 would be KiB/MiB/GiB.
+        var scaled = value
+        var unitIndex = 0
+
+        while unitIndex < units.count - 1 && scaled >= base {
+            scaled /= base
+            unitIndex += 1
         }
+
+        while true {
+            let unit = units[unitIndex]
+            let numericWidth = max(1, totalWidth - unit.count)
+            if unitIndex > 0,
+               unitIndex < units.count - 1,
+               roundedValueForWidth(scaled, width: numericWidth) >= base {
+                scaled /= base
+                unitIndex += 1
+                continue
+            }
+
+            let numeric: String
+            if unitIndex == 0 && !allowFractionInBaseUnit {
+                numeric = String(Int(scaled.rounded(.down)))
+            } else {
+                numeric = formattedFixedWidthNumber(scaled, width: numericWidth)
+            }
+
+            if numeric.count <= numericWidth || unitIndex == units.count - 1 {
+                return leftPadded(numeric, to: numericWidth) + unit
+            }
+
+            scaled /= base
+            unitIndex += 1
+        }
+    }
+
+    private func formattedFixedWidthNumber(_ value: Double, width: Int) -> String {
+        var decimals = max(0, width - integerDigitCount(of: value) - 1)
+
+        while true {
+            let rounded = roundedValue(value, decimals: decimals)
+            let digits = integerDigitCount(of: rounded)
+            let maxDecimals = max(0, width - digits - 1)
+            if decimals > maxDecimals {
+                decimals = maxDecimals
+                continue
+            }
+
+            if decimals > 0 {
+                return String(
+                    format: "%.\(decimals)f",
+                    locale: Locale(identifier: "en_US_POSIX"),
+                    rounded
+                )
+            }
+
+            let integerString = String(Int(rounded))
+            if integerString.count < width {
+                return integerString + "."
+            }
+            return integerString
+        }
+    }
+
+    private func integerDigitCount(of value: Double) -> Int {
+        String(Int(max(0, value.rounded(.down)))).count
+    }
+
+    private func roundedValue(_ value: Double, decimals: Int) -> Double {
+        let factor = pow(10.0, Double(decimals))
+        return (value * factor).rounded() / factor
+    }
+
+    private func roundedValueForWidth(_ value: Double, width: Int) -> Double {
+        let decimals = max(0, width - integerDigitCount(of: value) - 1)
+        return roundedValue(value, decimals: decimals)
+    }
+
+    private func leftPadded(_ string: String, to width: Int) -> String {
+        let padding = max(0, width - string.count)
+        return String(repeating: " ", count: padding) + string
+    }
+
+    private func paddedLabel(_ label: String, width: Int) -> String {
+        let padding = max(0, width - label.count)
+        return label + String(repeating: " ", count: padding)
+    }
+
+    private func formattedCompactDuration(_ seconds: TimeInterval, width: Int) -> String {
+        let clamped = max(0, seconds)
+        let wholeSeconds = Int(clamped.rounded(.down))
+        let rendered: String
+
+        if clamped < 10 {
+            rendered = String(
+                format: "%.1fs",
+                locale: Locale(identifier: "en_US_POSIX"),
+                clamped
+            )
+        } else if wholeSeconds < 1000 {
+            rendered = "\(wholeSeconds)s"
+        } else if wholeSeconds < 3600 {
+            rendered = "\(wholeSeconds / 60)m"
+        } else if wholeSeconds < 86_400 {
+            rendered = "\(wholeSeconds / 3600)h"
+        } else {
+            rendered = "\(wholeSeconds / 86_400)d"
+        }
+
+        return leftPadded(rendered, to: width)
     }
 }
 

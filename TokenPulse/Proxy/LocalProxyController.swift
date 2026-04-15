@@ -728,7 +728,7 @@ final class LocalProxyController {
             doneRequests.append(lastKeepaliveRequest)
         }
 
-        if usesShortRetentionWindow(for: snapshot) {
+        if usesShortDoneRequestRetentionWindow(for: snapshot) {
             let cutoff = now.addingTimeInterval(-otherTrafficRetentionSeconds)
             doneRequests = doneRequests.filter {
                 ($0.completedAt ?? $0.startedAt) >= cutoff
@@ -743,7 +743,19 @@ final class LocalProxyController {
     private static func usesShortRetentionWindow(
         for snapshot: ProxySessionStore.SessionSnapshot
     ) -> Bool {
-        ProxySessionID.isOther(snapshot.sessionID) || !snapshot.lineageEstablished
+        ProxySessionID.usesShortRetentionWindow(
+            for: snapshot.sessionID,
+            lineageEstablished: snapshot.lineageEstablished
+        )
+    }
+
+    private static func usesShortDoneRequestRetentionWindow(
+        for snapshot: ProxySessionStore.SessionSnapshot
+    ) -> Bool {
+        ProxySessionID.usesShortDoneRequestRetentionWindow(
+            for: snapshot.sessionID,
+            lineageEstablished: snapshot.lineageEstablished
+        )
     }
 
     /// Compute cache read percentage from a keepalive token usage response.

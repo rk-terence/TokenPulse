@@ -717,7 +717,7 @@ actor ProxySessionStore {
         for (sessionID, requests) in doneRequestsBySession {
             let session = sessions[sessionID]
             let filtered = requests.filter { request in
-                if let session, usesShortRetentionWindow(for: sessionID, session: session) {
+                if let session, usesShortDoneRequestRetentionWindow(for: sessionID, session: session) {
                     return (request.completedAt ?? request.startedAt) >= otherCutoff
                 }
                 return request.isMainAgentShaped || (request.completedAt ?? request.startedAt) >= cutoff
@@ -750,7 +750,17 @@ actor ProxySessionStore {
     }
 
     private func usesShortRetentionWindow(for sessionID: String, session: Session) -> Bool {
-        ProxySessionID.isOther(sessionID) || !session.lineageEstablished
+        ProxySessionID.usesShortRetentionWindow(
+            for: sessionID,
+            lineageEstablished: session.lineageEstablished
+        )
+    }
+
+    private func usesShortDoneRequestRetentionWindow(for sessionID: String, session: Session) -> Bool {
+        ProxySessionID.usesShortDoneRequestRetentionWindow(
+            for: sessionID,
+            lineageEstablished: session.lineageEstablished
+        )
     }
 
     private func accumulateCost(_ cost: Double, for apiFlavor: ProxyAPIFlavor) {

@@ -68,7 +68,7 @@ The proxy also provides visibility the upstream APIs do not surface directly in 
 The proxy keeps session state in memory longer than it keeps every session visible in the popover.
 
 - **Sessions with established Anthropic lineage**: evicted only when they have no in-flight requests and their most recent activity (`max(lastSeenAt, lastKeepaliveAt)`) is older than 24 hours.
-- **Sessions without established lineage**: use the short-path retention rules, even if they have a tracked session ID. This includes `other` traffic, tracked OpenAI Responses sessions, and Anthropic sessions that never established lineage.
+- **Sessions without established lineage**: tracked Anthropic sessions use the short-path retention rules until lineage is established. Tracked OpenAI Responses sessions still keep their session summary on the tracked-session retention window even though they do not support lineage/keepalive. `other` traffic always uses the short path.
 - **Short-path session eviction**: 60 seconds of inactivity when no requests are in flight.
 - **Lineage-tracked UI visibility**: shown when active within the last 10 minutes, or when there are still in-flight requests.
 - **Short-path UI visibility**: shown only for the most recent 60 seconds, or while requests are in flight.
@@ -78,6 +78,7 @@ Done requests have asymmetric retention:
 - **Main-agent-shaped requests in lineage-tracked Anthropic sessions** persist until replaced by a newer superset prompt or until the session expires.
 - **Non-main-agent done requests in lineage-tracked sessions** are pruned after 5 minutes.
 - **Done requests in short-path sessions** follow the 60-second cutoff.
+- **Done requests in tracked OpenAI Responses sessions** follow the 60-second cutoff even though the session row and its cumulative token/cost totals still persist on the tracked-session retention window.
 
 Replacement uses a normalized prompt descriptor built from request-shaping fields:
 
