@@ -18,7 +18,7 @@ A macOS menu bar app that monitors AI platform token usage and optimizes API cos
 ### Local proxy
 
 - **Manual cache-warming keepalives** — Lets you send lightweight Anthropic keepalive requests from the popover when a tracked session's cache would otherwise go cold
-- **Per-session cost tracking** — Tracks token usage, bytes transferred, and estimated cost per Claude Code session in real-time
+- **Per-session cost tracking** — Tracks token usage, bytes transferred, and estimated cost per tracked proxy session in real-time
 - **Streaming support** — Full HTTP/1.1 proxy with SSE streaming passthrough; parses token usage from both JSON and SSE responses
 - **Traffic indicator** — Menu bar slash animates with a bouncing glow when the proxy is forwarding requests
 - **Event logging** — Structured SQLite event log with 24-hour retention; optional full request/response capture in SQLite for debugging
@@ -123,7 +123,7 @@ The proxy listens on `127.0.0.1` only (IPv4 loopback) and never binds all interf
 
 ### How it works
 
-The proxy is a full HTTP/1.1 server built on Network.framework. Anthropic Messages traffic uses `X-Claude-Code-Session-Id` for tracked sessions; OpenAI Responses traffic is currently grouped as `Other`.
+The proxy is a full HTTP/1.1 server built on Network.framework. Anthropic Messages traffic uses `X-Claude-Code-Session-Id` for tracked sessions; OpenAI Responses traffic is tracked per session only when multiple Codex-specific headers agree on the same conversation identity, otherwise it is grouped as `Other`.
 
 - **Forwarding** — Requests are forwarded to the upstream URL with streaming SSE passthrough. Token usage is parsed from both JSON responses and SSE `data:` chunks in real-time.
 - **Cost tracking** — Per-session counters track input/output/cache-read/cache-write tokens and estimate cost using per-model pricing tables. The popover shows active sessions with their request counts and running cost.
