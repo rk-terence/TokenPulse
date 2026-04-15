@@ -9,18 +9,17 @@ The diagonal slash between the 5-hour and weekly utilization numbers in the menu
 
 The animation is driven by a five-state machine in `StatusBarController`:
 
-```
-         traffic event
-  idle ───────────────► starting
-   ▲                       │
-   │                       │ morph reaches 1.0
-   │ morph reaches 0.0     ▼
-stopping ◄──────────── bouncing ◄─┐
-   ▲        at center      │     │ traffic event
-   │                       │     │
-   │        timer expires  ▼     │
-   └────────────────── waitingForCenter
-        at center
+```mermaid
+stateDiagram-v2
+    [*] --> idle
+    idle --> starting: traffic event
+    starting --> bouncing: morph reaches 1.0
+    bouncing --> waitingForCenter: timer expires
+    bouncing --> bouncing: traffic event
+    waitingForCenter --> bouncing: traffic event
+    waitingForCenter --> stopping: at center
+    stopping --> starting: traffic event
+    stopping --> idle: morph reaches 0.0
 ```
 
 | State | What happens | Exit condition |

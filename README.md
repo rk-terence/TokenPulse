@@ -188,15 +188,16 @@ Notifications are sent per provider. Grant notification permission when prompted
 
 ## Project structure
 
-```
-TokenPulse/
-├── App/            # AppDelegate, StatusBarController, entry point
-├── Models/         # UsageData, ProviderStatus, ProviderConfig
-├── Providers/      # UsageProvider protocol + Codex, Claude, ZenMux implementations
-├── Services/       # KeychainService, ChromeCookieService, ConfigService, PollingManager, ProviderManager, NotificationService
-├── Proxy/          # HTTP server, route handlers, request forwarder, session store, event logger, metrics
-├── Views/          # PopoverView, SettingsView (SwiftUI)
-└── Rendering/      # BarIconRenderer (Core Graphics)
+```mermaid
+flowchart TD
+    root["TokenPulse/"]
+    root --> app["App/<br/>AppDelegate, StatusBarController, entry point"]
+    root --> models["Models/<br/>UsageData, ProviderStatus, ProviderConfig"]
+    root --> providers["Providers/<br/>UsageProvider protocol + Codex, Claude, ZenMux implementations"]
+    root --> services["Services/<br/>KeychainService, ChromeCookieService, ConfigService,<br/>PollingManager, ProviderManager, NotificationService"]
+    root --> proxy["Proxy/<br/>HTTP server, route handlers, request forwarder,<br/>session store, event logger, metrics"]
+    root --> views["Views/<br/>PopoverView, SettingsView (SwiftUI)"]
+    root --> rendering["Rendering/<br/>BarIconRenderer (Core Graphics)"]
 ```
 
 See also: [docs/proxy.md](docs/proxy.md) (proxy architecture), [docs/providers.md](docs/providers.md) (API specs), [docs/animation.md](docs/animation.md) (icon animation).

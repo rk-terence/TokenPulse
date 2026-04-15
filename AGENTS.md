@@ -46,36 +46,50 @@ Use conventional commit format: `type: short description` (e.g. `feat: add proxy
 
 ## Architecture quick ref
 
-```
-TokenPulse/
-├── App/                        # Entry point, AppDelegate, StatusBarController
-├── Models/                     # UsageData, ProviderStatus (6-case enum), WindowUsage
-├── Providers/                  # UsageProvider protocol + per-provider implementations
-│   ├── UsageProvider.swift     # Protocol: fetchUsage(), classifyError() → FailureDisposition
-│   ├── ClaudeProvider.swift    # Keychain OAuth → /api/oauth/usage
-│   ├── CodexProvider.swift     # ~/.codex/auth.json → chatgpt.com/backend-api/wham/usage
-│   └── ZenMuxProvider.swift    # Management API key → /api/v1/management/subscription/detail
-├── Services/
-│   ├── KeychainService.swift   # Security.framework wrapper
-│   ├── ConfigService.swift     # ~/.tokenpulse/config.json read/write
-│   ├── ChromeCookieService.swift # Chrome encrypted cookie extraction (PBKDF2 + AES-128-CBC)
-│   ├── PollingManager.swift    # Timer-based refresh
-│   ├── ProviderManager.swift   # Per-provider refresh, state machine, icon model
-│   ├── NotificationService.swift # UNUserNotification for threshold/reset alerts
-│   └── UsageExporter.swift     # ~/.tokenpulse/raw_usage.json export
-├── Proxy/
-│   ├── LocalProxyController.swift  # Lifecycle owner: starts/stops server, manages subsystem
-│   ├── ProxyHTTPServer.swift       # Network.framework HTTP/1.1 listener on 127.0.0.1
-│   ├── ProxyForwarder.swift        # Route-specific forwarding, streaming support, token parsing
-│   ├── AnthropicProxyAPIHandler.swift  # Anthropic Messages route semantics + keepalive body generation
-│   ├── OpenAIResponsesProxyAPIHandler.swift # OpenAI Responses route semantics + token parsing
-│   ├── ProxySessionStore.swift     # Session state, byte counters, traffic callbacks
-│   ├── ProxyEventLogger.swift      # SQLite event persistence (proxy_requests/keepalives/lifecycle tables) + status snapshots
-│   ├── ProxyMetricsStore.swift     # Aggregated counters and savings estimate
-│   └── ProxyModels.swift           # Shared data types (request, activity, utils)
-├── Views/                      # SwiftUI: PopoverView, SettingsView
-└── Rendering/
-    └── BarIconRenderer.swift   # Core Graphics battery bar icon
+```mermaid
+flowchart TD
+    root["TokenPulse/"]
+
+    root --> app["App/<br/>Entry point, AppDelegate, StatusBarController"]
+    root --> models["Models/<br/>UsageData, ProviderStatus (6-case enum), WindowUsage"]
+    root --> providersDir
+    root --> servicesDir
+    root --> proxyDir
+    root --> views["Views/<br/>SwiftUI: PopoverView, SettingsView"]
+    root --> renderingDir
+
+    subgraph providersDir["Providers/"]
+        usageProvider["UsageProvider.swift<br/>Protocol: fetchUsage(), classifyError() -> FailureDisposition"]
+        claudeProvider["ClaudeProvider.swift<br/>Keychain OAuth -> /api/oauth/usage"]
+        codexProvider["CodexProvider.swift<br/>~/.codex/auth.json -> chatgpt.com/backend-api/wham/usage"]
+        zenmuxProvider["ZenMuxProvider.swift<br/>Management API key -> /api/v1/management/subscription/detail"]
+    end
+
+    subgraph servicesDir["Services/"]
+        keychainService["KeychainService.swift<br/>Security.framework wrapper"]
+        configService["ConfigService.swift<br/>~/.tokenpulse/config.json read/write"]
+        chromeCookieService["ChromeCookieService.swift<br/>Chrome encrypted cookie extraction (PBKDF2 + AES-128-CBC)"]
+        pollingManager["PollingManager.swift<br/>Timer-based refresh"]
+        providerManager["ProviderManager.swift<br/>Per-provider refresh, state machine, icon model"]
+        notificationService["NotificationService.swift<br/>UNUserNotification for threshold/reset alerts"]
+        usageExporter["UsageExporter.swift<br/>~/.tokenpulse/raw_usage.json export"]
+    end
+
+    subgraph proxyDir["Proxy/"]
+        localProxyController["LocalProxyController.swift<br/>Lifecycle owner: starts/stops server, manages subsystem"]
+        proxyHTTPServer["ProxyHTTPServer.swift<br/>Network.framework HTTP/1.1 listener on 127.0.0.1"]
+        proxyForwarder["ProxyForwarder.swift<br/>Route-specific forwarding, streaming support, token parsing"]
+        anthropicHandler["AnthropicProxyAPIHandler.swift<br/>Anthropic Messages route semantics + keepalive body generation"]
+        openAIHandler["OpenAIResponsesProxyAPIHandler.swift<br/>OpenAI Responses route semantics + token parsing"]
+        proxySessionStore["ProxySessionStore.swift<br/>Session state, byte counters, traffic callbacks"]
+        proxyEventLogger["ProxyEventLogger.swift<br/>SQLite event persistence (proxy_requests/keepalives/lifecycle tables) + status snapshots"]
+        proxyMetricsStore["ProxyMetricsStore.swift<br/>Aggregated counters and savings estimate"]
+        proxyModels["ProxyModels.swift<br/>Shared data types (request, activity, utils)"]
+    end
+
+    subgraph renderingDir["Rendering/"]
+        barIconRenderer["BarIconRenderer.swift<br/>Core Graphics battery bar icon"]
+    end
 ```
 
 ## Sources of truth

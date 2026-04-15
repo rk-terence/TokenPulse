@@ -21,34 +21,31 @@ The proxy also provides visibility the upstream APIs do not surface directly in 
 
 # Architecture
 
-```
-                           +---------------------------+
-                           | LocalProxyController      |
-                           | @MainActor, @Observable   |
-                           | lifecycle, UI snapshots,  |
-                           | manual keepalive dispatch |
-                           +-----+-----+-----+---------+
-                                 |     |     |
-              +------------------+     |     +------------------+
-              |                        |                        |
-   +----------v-----------+  +---------v----------+  +---------v-----------+
-   | ProxyHTTPServer       |  | ProxySessionStore  |  | ProxyMetricsStore   |
-   | Sendable (locks)      |  | actor              |  | actor               |
-   | Network.framework     |  | sessions, lineage, |  | aggregate counters  |
-   | 127.0.0.1 listener    |  | request activity   |  | savings formula     |
-   +----------+------------+  +----------+---------+  +----------+----------+
-              |                          |                       |
-   +----------v--------------------------v-----------------------v----------+
-   | ProxyForwarder                                                         |
-   | Sendable (immutable config)                                            |
-   | per-route forwarding, streaming/non-streaming handling, token parsing  |
-   +----------+-------------------------------------------------------------+
-              |
-   +----------v-----------+  +----------------------+  +---------------------+
-   | Proxy API Handlers    |  | ProxyEventLogger     |  | ProxyModels.swift    |
-   | Anthropic + OpenAI    |  | actor, SQLite + JSON |  | shared value types,  |
-   | route semantics       |  | status snapshots     |  | pricing, builders    |
-   +----------------------+  +----------------------+  +---------------------+
+```mermaid
+flowchart TD
+    local["LocalProxyController<br/>@MainActor, @Observable<br/>lifecycle, UI snapshots,<br/>manual keepalive dispatch"]
+
+    server["ProxyHTTPServer<br/>Sendable (locks)<br/>Network.framework<br/>127.0.0.1 listener"]
+    sessions["ProxySessionStore<br/>actor<br/>sessions, lineage,<br/>request activity"]
+    metrics["ProxyMetricsStore<br/>actor<br/>aggregate counters<br/>savings formula"]
+
+    forwarder["ProxyForwarder<br/>Sendable (immutable config)<br/>per-route forwarding,<br/>streaming/non-streaming handling,<br/>token parsing"]
+
+    handlers["Proxy API Handlers<br/>Anthropic + OpenAI<br/>route semantics"]
+    logger["ProxyEventLogger<br/>actor, SQLite + JSON<br/>status snapshots"]
+    models["ProxyModels.swift<br/>shared value types,<br/>pricing, builders"]
+
+    local --> server
+    local --> sessions
+    local --> metrics
+
+    server --> forwarder
+    sessions --> forwarder
+    metrics --> forwarder
+
+    forwarder --> handlers
+    forwarder --> logger
+    forwarder --> models
 ```
 
 ## Isolation model
@@ -97,6 +94,35 @@ Normalization intentionally ignores differences that should not break same-linea
 # Request flow
 
 ## High-level flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant ProxyHTTPServer
+    participant ProxyForwarder
+    participant ProxyAPIHandlers as Proxy API Handlers
+    participant ProxySessionStore
+    participant ProxyMetricsStore
+    participant UpstreamAPI as Upstream API
+    participant ProxyEventLogger
+
+    Client->>ProxyHTTPServer: Connects and sends request
+    alt Unknown route or wrong method
+        ProxyHTTPServer-->>Client: Return 404 or 405
+    else Matched proxy route
+        ProxyHTTPServer->>ProxyForwarder: Accept, parse, validate, dispatch
+        ProxyForwarder->>ProxySessionStore: Touch session and register request
+        ProxyForwarder->>ProxyMetricsStore: Start aggregate tracking
+        ProxyForwarder->>ProxyAPIHandlers: Apply route semantics
+        ProxyForwarder->>UpstreamAPI: Forward streaming or buffered request
+        UpstreamAPI-->>ProxyForwarder: Return streamed or buffered response
+        ProxyForwarder->>ProxyAPIHandlers: Parse usage and estimate cost
+        ProxyForwarder->>ProxySessionStore: Record tokens and mark request done
+        ProxyForwarder->>ProxyMetricsStore: Update aggregate totals
+        ProxyForwarder->>ProxyEventLogger: Write status snapshot and event log
+        ProxyForwarder-->>Client: Return streamed or buffered response
+    end
+```
 
 ```
 1. Client connects to 127.0.0.1:<port>
