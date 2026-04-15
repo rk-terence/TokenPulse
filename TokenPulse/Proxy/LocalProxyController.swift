@@ -5,7 +5,7 @@ import Foundation
 @MainActor
 @Observable
 final class LocalProxyController {
-    private static let sessionExpirationSweepInterval: TimeInterval = 60
+    private static let sessionExpirationSweepInterval: TimeInterval = 10
     private static let sessionRetentionSeconds: TimeInterval = 24 * 60 * 60
     private static let sessionVisibilitySeconds: TimeInterval = 10 * 60
     private static let sideTrafficDoneRetentionSeconds: TimeInterval = 5 * 60
@@ -690,12 +690,12 @@ final class LocalProxyController {
 
         return snapshots
             .filter {
-                let cutoff = ProxySessionID.isOther($0.sessionID) ? otherCutoff : sessionCutoff
+                let cutoff = usesShortRetentionWindow(for: $0) ? otherCutoff : sessionCutoff
                 return max($0.lastSeenAt, $0.lastKeepaliveAt ?? .distantPast) >= cutoff
                     || !$0.activeRequests.isEmpty
             }
             .map { snap in
-                let doneRequests = Self.visibleDoneRequests(from: snap)
+                let doneRequests = Self.visibleDoneRequests(from: snap, now: now)
                 return SessionActivity(
                     sessionID: snap.sessionID,
                     completedRequests: snap.completedRequestCount,
@@ -720,15 +720,30 @@ final class LocalProxyController {
     }
 
     private static func visibleDoneRequests(
-        from snapshot: ProxySessionStore.SessionSnapshot
+        from snapshot: ProxySessionStore.SessionSnapshot,
+        now: Date
     ) -> [ProxyRequestActivity] {
         var doneRequests = snapshot.doneRequests
         if let lastKeepaliveRequest = snapshot.lastKeepaliveRequest {
             doneRequests.append(lastKeepaliveRequest)
         }
+
+        if usesShortRetentionWindow(for: snapshot) {
+            let cutoff = now.addingTimeInterval(-otherTrafficRetentionSeconds)
+            doneRequests = doneRequests.filter {
+                ($0.completedAt ?? $0.startedAt) >= cutoff
+            }
+        }
+
         return doneRequests.sorted {
             ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt)
         }
+    }
+
+    private static func usesShortRetentionWindow(
+        for snapshot: ProxySessionStore.SessionSnapshot
+    ) -> Bool {
+        ProxySessionID.isOther(snapshot.sessionID) || !snapshot.lineageEstablished
     }
 
     /// Compute cache read percentage from a keepalive token usage response.

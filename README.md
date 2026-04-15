@@ -1,6 +1,6 @@
 # TokenPulse
 
-A macOS menu bar app that monitors AI platform token usage and optimizes API costs through a local caching proxy. A battery-style gauge in the menu bar shows your remaining capacity at a glance, while the optional proxy keeps prompt caches warm between requests to reduce cache-write costs.
+A macOS menu bar app that monitors AI platform token usage and optimizes API costs through a local caching proxy. A compact two-number menu bar icon shows your primary and secondary quota utilization at a glance, while the optional proxy keeps prompt caches warm between requests to reduce cache-write costs.
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-blue) ![Swift 5.9](https://img.shields.io/badge/Swift-5.9-orange)
 
@@ -8,20 +8,20 @@ A macOS menu bar app that monitors AI platform token usage and optimizes API cos
 
 ### Usage monitoring
 
-- **Menu bar gauge** — Battery-style horizontal bar showing remaining capacity, with color coding (green/amber/red)
+- **Menu bar icon** — Compact 5-hour / secondary-window utilization display with a diagonal slash traffic indicator
 - **Multiple providers** — Right-click the icon to cycle between providers
 - **Click for details** — Left-click opens a popover with per-provider breakdown, quota windows, reset timers, and more
 - **Usage notifications** — macOS notifications when a provider's primary window crosses 50% or 80%, and when quota windows reset
 - **Graceful degradation** — Shows stale data on transient errors, surfaces auth guidance on credential issues, dims icon when refreshing
-- **Machine-readable export** — Every poll writes raw provider data to `~/.tokenpulse/raw_usage.json` for shell scripts and external tools
+- **Machine-readable export** — Every poll writes a normalized provider status snapshot to `~/.tokenpulse/raw_usage.json` for shell scripts and external tools
 
 ### Local proxy
 
 - **Manual cache-warming keepalives** — Lets you send lightweight Anthropic keepalive requests from the popover when a tracked session's cache would otherwise go cold
-- **Per-session cost tracking** — Tracks token usage, bytes transferred, and estimated cost per tracked proxy session in real-time
+- **Per-session cost tracking** — Tracks token usage, bytes transferred, and estimated cost per tracked proxy session
 - **Streaming support** — Full HTTP/1.1 proxy with SSE streaming passthrough; parses token usage from both JSON and SSE responses
 - **Traffic indicator** — Menu bar slash animates with a bouncing glow when the proxy is forwarding requests
-- **Event logging** — Structured SQLite event log with 24-hour retention; optional full request/response capture in SQLite for debugging
+- **Event logging** — Structured SQLite event log with 24-hour retention; optional request/response capture in SQLite for debugging
 - **Status snapshots** — Atomic JSON snapshots at `~/.tokenpulse/proxy_status.json` for external tooling
 
 ### General
@@ -44,9 +44,9 @@ A macOS menu bar app that monitors AI platform token usage and optimizes API cos
 
 - **Local caching proxy** — TokenPulse can sit between your AI tools and the upstream API, keeping prompt caches warm between requests. This is a cost optimization layer that no usage tracker offers — it actively saves you money rather than just reporting what you've spent.
 - **ZenMux support** — TokenPulse supports ZenMux out of the box via their official Management API. ZenMux is a niche provider that CodexBar doesn't cover, and likely too niche for them to want to maintain.
-- **One gauge, one glance** — CodexBar shows two stacked bars per provider with multiple display modes. TokenPulse shows a single battery gauge with the remaining percentage right in the icon — you get your answer without interpreting bar heights or switching modes.
+- **One glance, no mode switch** — CodexBar shows two stacked bars per provider with multiple display modes. TokenPulse shows the primary and secondary window percentages directly in the icon, so you can read current utilization without opening a detail view.
 - **Minimal by design** — TokenPulse is ~28 source files with a simple `UsageProvider` protocol and an actor-based proxy subsystem. No SwiftSyntax macros, no helper processes, no multi-strategy fallback chains. The entire codebase is easy to audit, fork, and modify.
-- **Machine-readable output** — Every poll cycle writes raw provider data to `~/.tokenpulse/raw_usage.json`, and the proxy writes status snapshots to `~/.tokenpulse/proxy_status.json`. Shell scripts and external tools can consume both without scraping or IPC.
+- **Machine-readable output** — Every poll cycle writes a normalized provider snapshot to `~/.tokenpulse/raw_usage.json`, and the proxy writes status snapshots to `~/.tokenpulse/proxy_status.json`. Shell scripts and external tools can consume both without scraping or IPC.
 
 If you use many AI providers and want comprehensive coverage, use CodexBar. If you use Codex, Claude, and/or ZenMux and want something small and direct — especially with cost optimization through cache-warming — TokenPulse is for you.
 
@@ -74,7 +74,7 @@ xcodebuild -scheme TokenPulse -configuration Debug build
 
 ### Claude provider
 
-TokenPulse reads your Claude Code OAuth credentials from the macOS Keychain automatically. If you're signed into [Claude Code](https://claude.ai/claude-code), it should work out of the box — no configuration needed.
+TokenPulse reads your Claude Code OAuth credentials from the macOS Keychain automatically. If you're signed into [Claude Code](https://claude.ai/claude-code), you usually only need to enable the Claude provider in **Settings > Providers**.
 
 ### Codex provider
 
@@ -100,14 +100,14 @@ If your Codex CLI is currently using API key billing, run `codex login` to switc
 - **Right-click** to switch between providers
 - Click the **gear icon** in the popover to open Settings
 
-The menu bar gauge shows remaining capacity for the active provider's primary window:
-- **Green** — more than 50% remaining
-- **Amber** — 20–50% remaining
-- **Red** — less than 20% remaining
+The menu bar icon shows utilization for the active provider:
+- **Top-left number** — primary window utilization, typically the 5-hour window
+- **Bottom-right number** — secondary window utilization when available
+- **Slash** — proxy traffic indicator when the local proxy is forwarding requests
 
 ## Local proxy
 
-TokenPulse includes an optional local HTTP proxy that sits between your AI tools and upstream APIs. It currently serves **Anthropic Messages** (`/v1/messages`) and **OpenAI Responses** (`/v1/responses`) on the same local port. It forwards requests transparently while adding two capabilities: **manual cache-warming keepalives** for tracked Anthropic sessions, and **per-session observability** that tracks token usage, bytes, and estimated cost in real time.
+TokenPulse includes an optional local HTTP proxy that sits between your AI tools and upstream APIs. It currently serves **Anthropic Messages** (`/v1/messages`) and **OpenAI Responses** (`/v1/responses`) on the same local port. It forwards requests transparently while adding two capabilities: **manual cache-warming keepalives** for tracked Anthropic sessions, and **per-session observability** that tracks token usage, bytes, and estimated cost.
 
 ### Setup
 
@@ -116,7 +116,7 @@ TokenPulse includes an optional local HTTP proxy that sits between your AI tools
 3. Point your AI tool at the proxy:
 
 ```bash
-export ANTHROPIC_BASE_URL=http://localhost:8080
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
 ```
 
 The proxy listens on `127.0.0.1` only (IPv4 loopback) and never binds all interfaces.
@@ -125,7 +125,7 @@ The proxy listens on `127.0.0.1` only (IPv4 loopback) and never binds all interf
 
 The proxy is a full HTTP/1.1 server built on Network.framework. Anthropic Messages traffic uses `X-Claude-Code-Session-Id` for tracked sessions; OpenAI Responses traffic is tracked per session only when multiple Codex-specific headers agree on the same conversation identity, otherwise it is grouped as `Other`.
 
-- **Forwarding** — Requests are forwarded to the upstream URL with streaming SSE passthrough. Token usage is parsed from both JSON responses and SSE `data:` chunks in real-time.
+- **Forwarding** — Requests are forwarded to the upstream URL with streaming SSE passthrough. Token usage is parsed from JSON responses and from terminal usage events in SSE streams.
 - **Cost tracking** — Per-session counters track input/output/cache-read/cache-write tokens and estimate cost using per-model pricing tables. The popover shows active sessions with their request counts and running cost.
 - **Traffic indicator** — When the proxy forwards a request, the menu bar slash animates with a bouncing orange glow, settling back to gray when traffic stops.
 
@@ -139,7 +139,7 @@ When TokenPulse establishes Anthropic lineage for a session, the popover can exp
 
 The proxy writes structured event logs to `~/.tokenpulse/proxy_events.sqlite` (SQLite, WAL mode) and atomic status snapshots to `~/.tokenpulse/proxy_status.json` (throttled to 1-second intervals). Events are pruned after 24 hours with 5-minute sweep cycles.
 
-Optional payload capture stores full request/response content in the `proxy_request_content` table inside `~/.tokenpulse/proxy_events.sqlite` (disabled by default).
+Optional payload capture stores full request bodies plus response bodies in the `proxy_request_content` table inside `~/.tokenpulse/proxy_events.sqlite` (disabled by default). Streaming response capture is truncated to 4 MB per request.
 
 For the full proxy architecture, request flow, SQLite schema, and keepalive economics, see [docs/proxy.md](docs/proxy.md).
 
@@ -157,11 +157,11 @@ All fields are in `~/.tokenpulse/config.json`:
 | `keepaliveIntervalSeconds` | `240` | Persisted compatibility field; currently unused by manual keepalive |
 | `proxyInactivityTimeoutSeconds` | `900` | Persisted compatibility field; currently unused by manual keepalive |
 | `saveProxyEventLog` | `true` | Write event metadata to SQLite |
-| `saveProxyPayloads` | `false` | Capture full request/response bodies (privacy-sensitive) |
+| `saveProxyPayloads` | `false` | Capture request/response bodies for debugging; streaming responses are truncated to 4 MB |
 
 ## Data export
 
-TokenPulse writes raw provider data to `~/.tokenpulse/raw_usage.json` after every poll. Example:
+TokenPulse writes a normalized provider status snapshot to `~/.tokenpulse/raw_usage.json` after every poll. Example:
 
 ```bash
 # Get Claude 5-hour utilization

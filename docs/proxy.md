@@ -67,16 +67,17 @@ The proxy also provides visibility the upstream APIs do not surface directly in 
 
 The proxy keeps session state in memory longer than it keeps every session visible in the popover.
 
-- **Tracked sessions**: evicted only when they have no in-flight requests and their most recent activity (`max(lastSeenAt, lastKeepaliveAt)`) is older than 24 hours. This includes Anthropic sessions identified by `X-Claude-Code-Session-Id` and OpenAI Responses sessions that pass the conservative Codex detection checks below.
-- **`other` traffic**: evicted after 60 seconds of inactivity when no requests are in flight.
-- **Tracked-session UI visibility**: shown when active within the last 10 minutes, or when there are still in-flight requests.
-- **`other` UI visibility**: shown only for the most recent 60 seconds, or while requests are in flight.
+- **Sessions with established Anthropic lineage**: evicted only when they have no in-flight requests and their most recent activity (`max(lastSeenAt, lastKeepaliveAt)`) is older than 24 hours.
+- **Sessions without established lineage**: use the short-path retention rules, even if they have a tracked session ID. This includes `other` traffic, tracked OpenAI Responses sessions, and Anthropic sessions that never established lineage.
+- **Short-path session eviction**: 60 seconds of inactivity when no requests are in flight.
+- **Lineage-tracked UI visibility**: shown when active within the last 10 minutes, or when there are still in-flight requests.
+- **Short-path UI visibility**: shown only for the most recent 60 seconds, or while requests are in flight.
 
 Done requests have asymmetric retention:
 
-- **Main-agent-shaped tracked requests** persist until replaced by a newer superset prompt or until the session expires.
-- **Non-main-agent tracked done requests** are pruned after 5 minutes.
-- **`other` done requests** follow the 60-second cutoff.
+- **Main-agent-shaped requests in lineage-tracked Anthropic sessions** persist until replaced by a newer superset prompt or until the session expires.
+- **Non-main-agent done requests in lineage-tracked sessions** are pruned after 5 minutes.
+- **Done requests in short-path sessions** follow the 60-second cutoff.
 
 Replacement uses a normalized prompt descriptor built from request-shaping fields:
 
@@ -157,7 +158,7 @@ When the request body has `"stream": true`:
 7. Each upstream chunk:
    - updates byte counters
    - is forwarded to the client immediately
-   - is accumulated up to 4 MB for token parsing / optional logging
+   - is accumulated up to 4 MB for terminal token parsing and optional logging
 8. The terminal chunk `0\r\n\r\n` is sent after upstream completion.
 
 ## Non-streaming path
@@ -176,14 +177,14 @@ Token parsing is route-specific and owned by the matched `ProxyAPIHandler`.
 ## Anthropic Messages
 
 - **Non-streaming JSON**: parse the top-level `usage` object.
-- **Streaming SSE**:
+- **Streaming SSE**: parse the final accumulated SSE payload after completion:
   - `message_start.message.usage` contributes input/cache tokens
   - `message_delta.usage` contributes output tokens
 
 ## OpenAI Responses
 
 - **Non-streaming JSON**: parse `usage.input_tokens`, `usage.output_tokens`, and `usage.input_tokens_details.cached_tokens`.
-- **Streaming SSE**: scan `response.completed` / `response.incomplete` events and parse `response.usage`.
+- **Streaming SSE**: scan the final accumulated SSE payload for `response.completed` / `response.incomplete` and parse `response.usage`.
 
 ## Accumulation
 
@@ -370,7 +371,7 @@ Stores lifecycle events:
 
 ### `proxy_request_content`
 
-Optional full request/response capture table enabled by `saveProxyPayloads`.
+Optional request/response capture table enabled by `saveProxyPayloads`. Request bodies are stored in full; streaming response bodies are truncated to 4 MB.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -403,7 +404,7 @@ If the initial insert fails, the logger falls back to a standalone insert with t
 
 # Status snapshots
 
-The proxy writes an atomic JSON snapshot to `~/.tokenpulse/proxy_status.json` after each request completion and each manual keepalive completion.
+The proxy writes an atomic JSON snapshot to `~/.tokenpulse/proxy_status.json` after each request completion and during proxy shutdown. The writes are throttled, so multiple completions inside the throttle window may collapse into one later snapshot.
 
 ## Format
 

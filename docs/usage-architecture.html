@@ -460,8 +460,9 @@ header .subtitle{color:var(--text-dim);margin-top:6px;font-size:0.92rem;letter-s
       <div class="comp-detail">
         Writes provider status + display data to disk for external tools.<br>
         <code>~/.tokenpulse/raw_usage.json</code><br>
-        Exports <code>unconfigured</code>, <code>pending</code>, <code>refreshing</code>,
-        <code>ready</code>, <code>stale</code>, and <code>error</code> payloads.
+        Exports <code>unconfigured</code>, <code>pending_first_load</code>,
+        <code>refreshing</code>, <code>ready</code>, <code>stale</code>,
+        <code>auth_stale</code>, and <code>error</code> payloads.
         Atomic write (write-then-rename). Best-effort &mdash; silently ignores failures.
       </div>
     </div>

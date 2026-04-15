@@ -696,7 +696,7 @@ actor ProxySessionStore {
     func expireSessions(olderThan date: Date, otherOlderThan otherDate: Date) -> [String] {
         var expired: [String] = []
         for (id, session) in sessions {
-            let cutoff = ProxySessionID.isOther(id) ? otherDate : date
+            let cutoff = usesShortRetentionWindow(for: id, session: session) ? otherDate : date
             guard max(session.lastSeenAt, session.lastKeepaliveAt ?? .distantPast) < cutoff,
                   session.inFlightRequestCount == 0 else {
                 continue
@@ -715,8 +715,9 @@ actor ProxySessionStore {
     /// Main-agent requests persist for the session lifetime.
     func pruneStaleDoneRequests(olderThan cutoff: Date, otherOlderThan otherCutoff: Date) {
         for (sessionID, requests) in doneRequestsBySession {
+            let session = sessions[sessionID]
             let filtered = requests.filter { request in
-                if ProxySessionID.isOther(sessionID) {
+                if let session, usesShortRetentionWindow(for: sessionID, session: session) {
                     return (request.completedAt ?? request.startedAt) >= otherCutoff
                 }
                 return request.isMainAgentShaped || (request.completedAt ?? request.startedAt) >= cutoff
@@ -746,6 +747,10 @@ actor ProxySessionStore {
         }
         doneRequests.append(activity)
         doneRequestsBySession[sessionID] = doneRequests
+    }
+
+    private func usesShortRetentionWindow(for sessionID: String, session: Session) -> Bool {
+        ProxySessionID.isOther(sessionID) || !session.lineageEstablished
     }
 
     private func accumulateCost(_ cost: Double, for apiFlavor: ProxyAPIFlavor) {

@@ -39,11 +39,13 @@ Passed from `StatusBarController` to `BarIconRenderer.drawSlash()` each frame:
 
 ```swift
 struct SlashAnimation {
-    let flow: SlashFlow       // .idle | .upstream | .downstream
+    let flow: SlashFlow       // currently .idle or .downstream in production use
     let phase: CGFloat        // [0, 2) — ping-pong position along the slash
     let transition: CGFloat   // 0 = idle (full-width gray), 1 = active (short glowing segment)
 }
 ```
+
+`flow` is currently informational only; the renderer uses `phase` and `transition` for the visual behavior.
 
 `phase` is converted to a ping-pong value in [0, 1] via `raw <= 1 ? raw : 2 - raw`, so 0 -> 1 -> 0 maps to one full back-and-forth cycle.
 
