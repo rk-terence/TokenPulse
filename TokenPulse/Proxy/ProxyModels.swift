@@ -474,6 +474,12 @@ enum KeepaliveRequestBuilder {
 
 // MARK: - Real-time request activity
 
+/// The source of a request shown in the proxy activity UI.
+enum ProxyRequestKind: Sendable {
+    case request
+    case keepalive
+}
+
 /// The state of an in-flight proxy request as seen by the UI.
 enum ProxyRequestState: Sendable {
     /// Request body is being sent to the upstream server.
@@ -489,6 +495,7 @@ enum ProxyRequestState: Sendable {
 /// Live snapshot of a single proxy request (in-flight or recently completed).
 struct ProxyRequestActivity: Sendable, Identifiable {
     let id: UUID
+    let kind: ProxyRequestKind
     var state: ProxyRequestState
     /// Model ID from the request body, used for done-request replacement matching.
     let modelID: String?
@@ -525,6 +532,8 @@ struct ProxyRequestActivity: Sendable, Identifiable {
                   + (usage.cacheCreationInputTokens ?? 0)
         return total > 0 ? total : nil
     }
+
+    var isKeepalive: Bool { kind == .keepalive }
 }
 
 // MARK: - Token usage

@@ -51,6 +51,7 @@ actor ProxySessionStore {
         let keepaliveTotalCount: Int
         let activeRequests: [ProxyRequestActivity]
         let doneRequests: [ProxyRequestActivity]
+        let lastKeepaliveRequest: ProxyRequestActivity?
         let totalInputTokens: Int
         let totalOutputTokens: Int
         let totalCacheReadInputTokens: Int
@@ -82,6 +83,8 @@ actor ProxySessionStore {
     private var activeRequests: [UUID: (sessionID: String, activity: ProxyRequestActivity)] = [:]
     /// Recently completed requests shown in the session's done section.
     private var doneRequestsBySession: [String: [ProxyRequestActivity]] = [:]
+    /// Only the most recent completed keepalive is shown per session.
+    private var lastKeepaliveRequestBySession: [String: ProxyRequestActivity] = [:]
 
     // Byte counters for throughput and one-shot upload display.
     private var totalBytesReceived: Int = 0
@@ -472,9 +475,17 @@ actor ProxySessionStore {
     // MARK: - Request activity tracking
 
     /// Register a new in-flight request. Call immediately before starting the upstream fetch.
-    func startRequest(id: UUID, sessionID: String, model: String?, promptDescriptor: String?, isMainAgentShaped: Bool) {
+    func startRequest(
+        id: UUID,
+        sessionID: String,
+        model: String?,
+        promptDescriptor: String?,
+        isMainAgentShaped: Bool,
+        kind: ProxyRequestKind = .request
+    ) {
         let activity = ProxyRequestActivity(
             id: id,
+            kind: kind,
             state: .uploading,
             modelID: model,
             promptDescriptor: promptDescriptor,
@@ -489,6 +500,12 @@ actor ProxySessionStore {
             tokenUsage: nil,
             estimatedCost: nil
         )
+        if kind == .keepalive {
+            activeRequests = activeRequests.filter { key, value in
+                key == id || value.sessionID != sessionID || !value.activity.isKeepalive
+            }
+            lastKeepaliveRequestBySession.removeValue(forKey: sessionID)
+        }
         activeRequests[id] = (sessionID: sessionID, activity: activity)
         onTraffic?()
     }
@@ -568,7 +585,9 @@ actor ProxySessionStore {
         // We don't require stopReason because the streaming capture buffer
         // may be truncated (4 MB cap) and miss the final message_delta event.
         let isComplete = !errored
-        if isComplete {
+        if isComplete && entry.activity.isKeepalive {
+            lastKeepaliveRequestBySession[entry.sessionID] = entry.activity
+        } else if isComplete {
             insertDoneRequest(entry.activity, for: entry.sessionID)
         }
 
@@ -600,6 +619,7 @@ actor ProxySessionStore {
                 keepaliveTotalCount: session.keepaliveSuccessCount + session.keepaliveFailureCount,
                 activeRequests: activeRequestsBySession[session.sessionID] ?? [],
                 doneRequests: doneRequestsBySession[session.sessionID] ?? [],
+                lastKeepaliveRequest: lastKeepaliveRequestBySession[session.sessionID],
                 totalInputTokens: session.totalInputTokens,
                 totalOutputTokens: session.totalOutputTokens,
                 totalCacheReadInputTokens: session.totalCacheReadInputTokens,
@@ -635,6 +655,7 @@ actor ProxySessionStore {
         for id in expired {
             sessions.removeValue(forKey: id)
             doneRequestsBySession.removeValue(forKey: id)
+            lastKeepaliveRequestBySession.removeValue(forKey: id)
         }
         return expired
     }

@@ -627,50 +627,96 @@ private struct SessionActivityRow: View {
                 sessionStats
             }
 
-            // Per-session keepalive controls — shown when global keepalive is enabled
-            if ConfigService.shared.keepaliveEnabled,
-               activity.supportsKeepalive {
-                HStack(spacing: 6) {
-                    Picker("", selection: keepaliveModeBinding) {
-                        Text(String(localized: "Off")).tag(KeepaliveMode.off)
-                        Text(String(localized: "Manual")).tag(KeepaliveMode.manual)
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(width: 120)
-                    .controlSize(.mini)
+            // In-flight requests
+            if !activity.activeRequests.isEmpty {
+                Text(String(localized: "Active"))
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .padding(.leading, 10)
 
-                    if activity.keepaliveMode == .manual {
-                        if isInFlight {
-                            ProgressView()
-                                .controlSize(.mini)
-                        } else if let result = lastResult {
-                            Image(systemName: result ? "checkmark.circle.fill" : "xmark.circle.fill")
-                                .foregroundStyle(result ? .green : .red)
-                                .font(.caption)
-                        } else {
-                            Button(String(localized: "Send")) {
-                                proxyController?.sendManualKeepalive(for: activity.sessionID)
+                ForEach(activity.activeRequests) { request in
+                    RequestActivityRow(request: request)
+                        .padding(.leading, 10)
+                        .overlay(alignment: .leading) {
+                            if let highlightColor = rowHighlightColor(for: request) {
+                                RoundedRectangle(cornerRadius: 1)
+                                    .fill(highlightColor)
+                                    .frame(width: 3)
+                                    .padding(.leading, 5)
                             }
-                            .controlSize(.mini)
-                            .disabled(!activity.canSendKeepalive)
-                            .help(activity.canSendKeepalive
-                                ? String(localized: "Send a cache-warming keepalive request")
-                                : String(localized: "Waiting for lineage to be established"))
                         }
-                    }
+                }
+            }
 
-                    if let reason = activity.keepaliveDisabledReason {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange)
-                            .font(.caption2)
-                        Text(reason)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
+            if !activity.doneRequests.isEmpty {
+                Text(String(localized: "Done"))
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .padding(.leading, 10)
+
+                ForEach(activity.doneRequests) { request in
+                    RequestActivityRow(request: request)
+                        .padding(.leading, 10)
+                        .overlay(alignment: .leading) {
+                            if let highlightColor = rowHighlightColor(for: request) {
+                                RoundedRectangle(cornerRadius: 1)
+                                    .fill(highlightColor)
+                                    .frame(width: 3)
+                                    .padding(.leading, 5)
+                            }
+                        }
+                }
+            }
+
+            keepaliveSection
+        }
+    }
+
+    @ViewBuilder
+    private var keepaliveSection: some View {
+        if ConfigService.shared.keepaliveEnabled,
+           activity.supportsKeepalive {
+            // Per-session keepalive controls
+            HStack(spacing: 6) {
+                Picker("", selection: keepaliveModeBinding) {
+                    Text(String(localized: "Off")).tag(KeepaliveMode.off)
+                    Text(String(localized: "Manual")).tag(KeepaliveMode.manual)
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 120)
+                .controlSize(.mini)
+
+                if activity.keepaliveMode == .manual {
+                    if isInFlight {
+                        ProgressView()
+                            .controlSize(.mini)
+                    } else if let result = lastResult {
+                        Image(systemName: result ? "checkmark.circle.fill" : "xmark.circle.fill")
+                            .foregroundStyle(result ? .green : .red)
+                            .font(.caption)
+                    } else {
+                        Button(String(localized: "Send")) {
+                            proxyController?.sendManualKeepalive(for: activity.sessionID)
+                        }
+                        .controlSize(.mini)
+                        .disabled(!activity.canSendKeepalive)
+                        .help(activity.canSendKeepalive
+                            ? String(localized: "Send a cache-warming keepalive request")
+                            : String(localized: "Waiting for lineage to be established"))
                     }
                 }
-                .padding(.leading, 10)
+
+                if let reason = activity.keepaliveDisabledReason {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .font(.caption2)
+                    Text(reason)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
+            .padding(.leading, 10)
 
             // Per-session keepalive stats
             if activity.keepaliveCount > 0,
@@ -696,39 +742,6 @@ private struct SessionActivityRow: View {
                     }
                 }
                 .padding(.leading, 10)
-            }
-
-            // In-flight requests
-            if !activity.activeRequests.isEmpty {
-                Text(String(localized: "Active"))
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .padding(.leading, 10)
-
-                ForEach(activity.activeRequests) { request in
-                    RequestActivityRow(request: request)
-                        .padding(.leading, 10)
-                }
-            }
-
-            if !activity.doneRequests.isEmpty {
-                Text(String(localized: "Done"))
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .padding(.leading, 10)
-
-                ForEach(activity.doneRequests) { request in
-                    RequestActivityRow(request: request)
-                        .padding(.leading, 10)
-                        .overlay(alignment: .leading) {
-                            if request.isMainAgentShaped {
-                                RoundedRectangle(cornerRadius: 1)
-                                    .fill(Color.accentColor)
-                                    .frame(width: 3)
-                                    .padding(.leading, 5)
-                            }
-                        }
-                }
             }
         }
     }
@@ -787,6 +800,16 @@ private struct SessionActivityRow: View {
             return "\(seconds / 3600)h"
         }
     }
+
+    private func rowHighlightColor(for request: ProxyRequestActivity) -> Color? {
+        if request.isKeepalive {
+            return .green
+        }
+        if request.isMainAgentShaped {
+            return .accentColor
+        }
+        return nil
+    }
 }
 
 // MARK: - Request Activity Row
@@ -796,6 +819,12 @@ private struct RequestActivityRow: View {
 
     var body: some View {
         HStack(spacing: 5) {
+            if request.isKeepalive {
+                Image(systemName: "bolt.fill")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+                    .help(String(localized: "Keepalive request"))
+            }
             if let modelName = compactModelName {
                 Text(modelName)
                     .font(.callout.monospaced())

@@ -408,6 +408,19 @@ final class LocalProxyController {
             + apiHandler.keepaliveRequestPath
         guard let url = URL(string: urlString) else { return false }
 
+        let model = apiHandler.extractModel(from: lineageBody)
+        let requestID = UUID()
+        await sessionStore.startRequest(
+            id: requestID,
+            sessionID: sessionID,
+            model: model,
+            promptDescriptor: nil,
+            isMainAgentShaped: false,
+            kind: .keepalive
+        )
+        await sessionStore.updateRequestBytesSent(id: requestID, totalBytesSent: keepaliveBody.count)
+        await sessionStore.markRequestWaiting(id: requestID)
+
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.httpBody = keepaliveBody
@@ -426,16 +439,28 @@ final class LocalProxyController {
             let (data, response) = try await URLSession.shared.data(for: request)
             let httpResponse = response as? HTTPURLResponse
             let statusCode = httpResponse?.statusCode ?? 0
+            await sessionStore.markRequestReceiving(id: requestID)
+            if !data.isEmpty {
+                await sessionStore.markFirstDataReceived(id: requestID)
+                await sessionStore.updateRequestBytes(id: requestID, additionalBytes: data.count)
+            }
 
             await metricsStore.recordKeepaliveSent()
 
             if statusCode >= 200 && statusCode < 300 {
                 let tokenUsage = apiHandler.parseTokenUsage(from: data, streaming: false)
+                let requestCost = ModelPricingTable.pricing(for: model).map { tokenUsage.cost(for: $0) }
                 await sessionStore.recordKeepaliveResult(
                     for: sessionID,
                     success: true,
                     tokenUsage: tokenUsage,
                     apiFlavor: .anthropicMessages
+                )
+                await sessionStore.markRequestDone(
+                    id: requestID,
+                    errored: false,
+                    tokenUsage: tokenUsage,
+                    estimatedCost: requestCost
                 )
                 await eventLogger?.logKeepaliveCompleted(
                     keepaliveID: keepaliveID,
@@ -456,6 +481,7 @@ final class LocalProxyController {
                     tokenUsage: .empty,
                     apiFlavor: .anthropicMessages
                 )
+                await sessionStore.markRequestDone(id: requestID, errored: true, tokenUsage: nil, estimatedCost: nil)
                 await eventLogger?.logKeepaliveCompleted(
                     keepaliveID: keepaliveID,
                     session: sessionID,
@@ -476,6 +502,7 @@ final class LocalProxyController {
                 tokenUsage: .empty,
                 apiFlavor: .anthropicMessages
             )
+            await sessionStore.markRequestDone(id: requestID, errored: true, tokenUsage: nil, estimatedCost: nil)
             await eventLogger?.logKeepaliveCompleted(
                 keepaliveID: keepaliveID,
                 session: sessionID,
@@ -667,15 +694,14 @@ final class LocalProxyController {
                     || !$0.activeRequests.isEmpty
             }
             .map { snap in
-                SessionActivity(
+                let doneRequests = Self.visibleDoneRequests(from: snap)
+                return SessionActivity(
                     sessionID: snap.sessionID,
                     completedRequests: snap.completedRequestCount,
                     erroredRequests: snap.erroredRequestCount,
                     keepaliveCount: snap.keepaliveTotalCount,
                     activeRequests: snap.activeRequests.sorted { $0.startedAt > $1.startedAt },
-                    doneRequests: snap.doneRequests.sorted {
-                        ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt)
-                    },
+                    doneRequests: doneRequests,
                     totalInputTokens: snap.totalInputTokens,
                     totalOutputTokens: snap.totalOutputTokens,
                     totalCacheReadInputTokens: snap.totalCacheReadInputTokens,
@@ -690,6 +716,18 @@ final class LocalProxyController {
                     lastKeepaliveOutputTokens: snap.lastKeepaliveTokenUsage?.outputTokens
                 )
             }
+    }
+
+    private static func visibleDoneRequests(
+        from snapshot: ProxySessionStore.SessionSnapshot
+    ) -> [ProxyRequestActivity] {
+        var doneRequests = snapshot.doneRequests
+        if let lastKeepaliveRequest = snapshot.lastKeepaliveRequest {
+            doneRequests.append(lastKeepaliveRequest)
+        }
+        return doneRequests.sorted {
+            ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt)
+        }
     }
 
     /// Compute cache read percentage from a keepalive token usage response.
