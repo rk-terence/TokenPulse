@@ -979,6 +979,8 @@ private struct RequestActivityRow: View {
     }
 
     private var compactModelName: String? {
+        let maxModelNameCharacters = 8
+
         guard let rawModelID = request.modelID?
             .replacingOccurrences(of: #"\s*\([^)]*\)"#, with: "", options: .regularExpression)
             .split(separator: "/")
@@ -997,47 +999,77 @@ private struct RequestActivityRow: View {
 
         let normalized = modelID.lowercased()
 
-        if normalized.contains("sonnet") {
-            return "Sonnet"
-        }
-        if normalized.contains("opus") {
-            return "Opus"
-        }
-        if normalized.contains("haiku") {
-            return "Haiku"
-        }
-        if normalized.contains("gpt-5.4") {
-            return "GPT-5.4"
-        }
-        if normalized.contains("gpt-5.3") {
-            return "GPT-5.3"
-        }
-        if normalized.contains("gpt-5.2") {
-            return "GPT-5.2"
-        }
-        if normalized.contains("gpt-5.1") {
-            return "GPT-5.1"
-        }
-        if normalized.contains("gpt-5") {
-            return "GPT-5"
-        }
-        if normalized.contains("gpt-4.1") {
-            return "GPT-4.1"
-        }
-        if normalized.contains("gpt-4o") {
-            return "GPT-4o"
-        }
-        if normalized.contains("o4-mini") {
-            return "o4-mini"
-        }
-        if normalized.contains("o3") {
-            return "o3"
-        }
-        if normalized.contains("o1") {
-            return "o1"
+        let compactPrefixes: [(prefix: String, label: String)] = [
+            ("gpt-5.4-mini", "GPT-5.4-mini"),
+            ("gpt-5.4-nano", "GPT-5.4-nano"),
+            ("gpt-4.1-mini", "GPT-4.1-mini"),
+            ("gpt-4.1-nano", "GPT-4.1-nano"),
+            ("gpt-5.4", "GPT-5.4"),
+            ("gpt-5.3", "GPT-5.3"),
+            ("gpt-5.2", "GPT-5.2"),
+            ("gpt-5.1", "GPT-5.1"),
+            ("gpt-5-mini", "GPT-5-mini"),
+            ("gpt-5-nano", "GPT-5-nano"),
+            ("gpt-4.1", "GPT-4.1"),
+            ("gpt-4o", "GPT-4o"),
+            ("gpt-5", "GPT-5"),
+            ("o4-mini", "o4-mini"),
+            ("o3", "o3"),
+            ("o1", "o1")
+        ]
+
+        for entry in compactPrefixes where normalized.hasPrefix(entry.prefix) {
+            let suffix = String(modelID.dropFirst(entry.prefix.count))
+            return shortenedModelLabel(entry.label + suffix, maxCharacters: maxModelNameCharacters)
         }
 
-        return modelID.isEmpty ? rawModelID : modelID
+        let compactLabels: [(needle: String, label: String)] = [
+            ("sonnet", "Sonnet"),
+            ("opus", "Opus"),
+            ("haiku", "Haiku")
+        ]
+
+        for entry in compactLabels where normalized.contains(entry.needle) {
+            return shortenedModelLabel(entry.label, maxCharacters: maxModelNameCharacters)
+        }
+
+        return shortenedModelLabel(modelID.isEmpty ? rawModelID : modelID, maxCharacters: maxModelNameCharacters)
+    }
+
+    private func shortenedModelLabel(_ label: String, maxCharacters: Int) -> String {
+        guard label.count > maxCharacters else { return label }
+
+        let suffixCompactions: [(source: String, replacement: String)] = [
+            ("-codex-spark", "cs"),
+            ("_codex_spark", "cs"),
+            ("-mini", "m"),
+            ("_mini", "m"),
+            ("-nano", "n"),
+            ("_nano", "n"),
+            ("-codex", "c"),
+            ("_codex", "c"),
+            ("-spark", "s"),
+            ("_spark", "s")
+        ]
+
+        let abbreviated = suffixCompactions.reduce(label) { partial, entry in
+            partial.replacingOccurrences(of: entry.source, with: entry.replacement, options: .caseInsensitive)
+        }
+
+        if abbreviated.count <= maxCharacters {
+            return abbreviated
+        }
+
+        let separatorStripped = abbreviated
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: " ", with: "")
+
+        if separatorStripped.count <= maxCharacters {
+            return separatorStripped
+        }
+
+        return String(separatorStripped.prefix(maxCharacters))
     }
 
     // MARK: - Formatting

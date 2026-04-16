@@ -80,19 +80,23 @@ final class ProviderManager {
     func openSettings() {
         NSApp.activate(ignoringOtherApps: true)
 
-        if let window = settingsWindow, window.isVisible {
-            window.orderFrontRegardless()
+        if let window = settingsWindow {
+            if window.isMiniaturized {
+                window.deminiaturize(nil)
+            }
+            window.makeKeyAndOrderFront(nil)
             return
         }
         let view = SettingsView(manager: self, config: ConfigService.shared, proxyController: proxyController)
         let hostingController = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: hostingController)
-        window.title = "TokenPulse Settings"
-        window.styleMask = [.titled, .closable]
-        window.setContentSize(NSSize(width: 400, height: 300))
+        window.title = String(localized: "TokenPulse Settings")
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        window.minSize = NSSize(width: 820, height: 620)
+        window.setContentSize(NSSize(width: 920, height: 700))
         window.center()
-        window.level = .floating
-        window.orderFrontRegardless()
+        window.level = .normal
+        window.makeKeyAndOrderFront(nil)
         settingsWindow = window
     }
 

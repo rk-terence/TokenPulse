@@ -599,11 +599,13 @@ struct ProxyRequestActivity: Sendable, Identifiable {
     /// Estimated cost (USD) for this single request, populated when state transitions to `.done`.
     var estimatedCost: Double?
 
-    /// Total prompt tokens (input + cache read + cache creation) for display. Nil when unavailable.
+    /// Total prompt tokens for display. Some providers report cache-read tokens as a
+    /// subset of input tokens, while others report them separately.
     var promptTokens: Int? {
         guard let usage = tokenUsage else { return nil }
+        let cacheReadTokens = usage.inputTokensIncludeCacheReads ? 0 : (usage.cacheReadInputTokens ?? 0)
         let total = (usage.inputTokens ?? 0)
-                  + (usage.cacheReadInputTokens ?? 0)
+                  + cacheReadTokens
                   + (usage.cacheCreationInputTokens ?? 0)
         return total > 0 ? total : nil
     }
