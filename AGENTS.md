@@ -21,6 +21,12 @@ xcodebuild -scheme TokenPulse -configuration Debug test
 
 Use conventional commit format: `type: short description` (e.g. `feat: add proxy subsystem`, `fix: correct upstream URL default`). Common types: `feat`, `fix`, `chore`, `refactor`, `docs`, `test`.
 
+## Multi-agent workflow
+
+- This repo maintains role separation for Codex in `.agents/skills/lead`, `.agents/skills/developer`, and `.agents/skills/reviewer`
+- Treat those Codex skills as the single source of truth for leader/developer/reviewer behavior
+- Do not create or maintain parallel Claude-specific copies of those role definitions in this repo unless the team explicitly decides to support both again
+
 ## Code style
 
 - Swift strict concurrency checking enabled — resolve all warnings, not just errors
