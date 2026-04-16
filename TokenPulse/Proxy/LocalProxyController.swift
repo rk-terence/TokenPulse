@@ -10,6 +10,10 @@ final class LocalProxyController {
     private static let sessionVisibilitySeconds: TimeInterval = 10 * 60
     private static let sideTrafficDoneRetentionSeconds: TimeInterval = 5 * 60
     private static let otherTrafficRetentionSeconds: TimeInterval = 60
+    private static let restartAttempts = 3
+    private static let restartStopDelay: Duration = .milliseconds(150)
+    private static let restartStartupTimeout: Duration = .milliseconds(900)
+    private static let restartPollInterval: Duration = .milliseconds(50)
 
     // MARK: - Per-session activity snapshot for UI
 
@@ -84,6 +88,7 @@ final class LocalProxyController {
     }
 
     private(set) var isRunning = false
+    private(set) var isRestarting = false
     private(set) var listeningPort: Int = 0
     private(set) var proxyStatus: ProxyStatus = .empty
     private(set) var sessionActivities: [SessionActivity] = []
@@ -105,6 +110,7 @@ final class LocalProxyController {
     private var eventLogger: ProxyEventLogger?
     private var refreshTask: Task<Void, Never>?
     private var trafficRefreshTask: Task<Void, Never>?
+    private var restartTask: Task<Void, Never>?
     private var trafficRefreshPending = false
     private var currentAnthropicUpstreamURL: String?
 
@@ -275,6 +281,29 @@ final class LocalProxyController {
 
     /// Stop the proxy server.
     func stop() {
+        stopInternal(cancelRestartTask: true)
+    }
+
+    /// Stop then start the proxy using the latest settings, with retry to avoid restart races.
+    func restart(port: Int, anthropicUpstreamURL: String, openAIUpstreamURL: String) {
+        restartTask?.cancel()
+        restartTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.performRestart(
+                port: port,
+                anthropicUpstreamURL: anthropicUpstreamURL,
+                openAIUpstreamURL: openAIUpstreamURL
+            )
+        }
+    }
+
+    private func stopInternal(cancelRestartTask: Bool) {
+        if cancelRestartTask {
+            restartTask?.cancel()
+            restartTask = nil
+            isRestarting = false
+        }
+
         refreshTask?.cancel()
         refreshTask = nil
         trafficRefreshTask?.cancel()
@@ -315,6 +344,52 @@ final class LocalProxyController {
         manualKeepaliveInFlight.removeAll()
         manualKeepaliveLastResult.removeAll()
         ProxyLogger.log("Proxy controller stopped")
+    }
+
+    private func performRestart(port: Int, anthropicUpstreamURL: String, openAIUpstreamURL: String) async {
+        guard !isRestarting else { return }
+        isRestarting = true
+        defer {
+            isRestarting = false
+            restartTask = nil
+        }
+
+        for attempt in 1...Self.restartAttempts {
+            stopInternal(cancelRestartTask: false)
+            guard !Task.isCancelled else { return }
+
+            try? await Task.sleep(for: Self.restartStopDelay)
+            guard !Task.isCancelled else { return }
+
+            start(
+                port: port,
+                anthropicUpstreamURL: anthropicUpstreamURL,
+                openAIUpstreamURL: openAIUpstreamURL
+            )
+
+            if await waitForRunning(timeout: Self.restartStartupTimeout) {
+                ProxyLogger.log("Proxy restart succeeded on attempt \(attempt)")
+                return
+            }
+
+            ProxyLogger.log("Proxy restart attempt \(attempt) did not reach running state")
+        }
+
+        ProxyLogger.log("Proxy restart failed after \(Self.restartAttempts) attempts")
+    }
+
+    private func waitForRunning(timeout: Duration) async -> Bool {
+        let clock = ContinuousClock()
+        let start = clock.now
+
+        while clock.now - start < timeout {
+            if isRunning { return true }
+            if server == nil { return false }
+            guard !Task.isCancelled else { return false }
+            try? await Task.sleep(for: Self.restartPollInterval)
+        }
+
+        return isRunning
     }
 
     /// Reset the cumulative proxy cost estimate to zero.

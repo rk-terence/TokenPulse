@@ -79,7 +79,7 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 20) {
             VStack(alignment: .leading, spacing: 6) {
                 Text(String(localized: "Settings"))
-                    .font(.system(size: 28, weight: .semibold, design: .rounded))
+                    .font(.system(size: 28, weight: .semibold))
 
                 Text(String(localized: "Adjust providers, refresh behavior, and local proxy tools without feeling boxed in."))
                     .font(.subheadline)
@@ -107,6 +107,8 @@ struct SettingsView: View {
 
                             Spacer(minLength: 0)
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
                         .padding(.horizontal, 14)
                         .padding(.vertical, 12)
                     }
@@ -118,7 +120,6 @@ struct SettingsView: View {
         }
         .frame(width: 240, alignment: .topLeading)
         .padding(20)
-        .background(Color(nsColor: .underPageBackgroundColor))
     }
 
     @ViewBuilder
@@ -462,29 +463,18 @@ private struct ProxyTab: View {
                         }
                     }
 
-                    HStack(alignment: .center, spacing: 16) {
-                        Text(String(
-                            format: NSLocalizedString(
-                                "proxy.settings.restartRoute",
-                                value: "Restart the proxy to apply upstream URL changes. The proxy serves %@ and %@ on the same local port.",
-                                comment: ""
-                            ),
-                            ProxyAPIFlavor.anthropicMessages.supportedRouteDescription,
-                            ProxyAPIFlavor.openAIResponses.supportedRouteDescription
-                        ))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-
-                        Spacer(minLength: 0)
-
-                        Button {
-                            restartProxy()
-                        } label: {
-                            Label(String(localized: "Restart Proxy"), systemImage: "arrow.clockwise")
-                        }
-                        .disabled(!canRestartProxy)
-                    }
+                    Text(String(
+                        format: NSLocalizedString(
+                            "proxy.settings.restartRoute",
+                            value: "Restart the proxy to apply upstream URL changes. The proxy serves %@ and %@ on the same local port.",
+                            comment: ""
+                        ),
+                        ProxyAPIFlavor.anthropicMessages.supportedRouteDescription,
+                        ProxyAPIFlavor.openAIResponses.supportedRouteDescription
+                    ))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
@@ -555,6 +545,13 @@ private struct ProxyTab: View {
                     )
                 }
             }
+        } footer: {
+            Button {
+                restartProxy()
+            } label: {
+                Label(String(localized: "Restart Proxy"), systemImage: "arrow.clockwise")
+            }
+            .disabled(!canRestartProxy)
         }
         .onAppear {
             portText = String(config.proxyPort)
@@ -570,7 +567,8 @@ private struct ProxyTab: View {
     }
 
     private var canRestartProxy: Bool {
-        config.proxyEnabled && proxyController != nil
+        guard let proxyController else { return false }
+        return config.proxyEnabled && !proxyController.isRestarting
     }
 
     private func startProxy() {
@@ -586,43 +584,73 @@ private struct ProxyTab: View {
     }
 
     private func restartProxy() {
-        guard canRestartProxy else { return }
-        stopProxy()
-        startProxy()
+        guard canRestartProxy, let proxyController else { return }
+        proxyController.restart(
+            port: config.proxyPort,
+            anthropicUpstreamURL: config.anthropicUpstreamURL,
+            openAIUpstreamURL: config.openAIUpstreamURL
+        )
     }
 }
 
 // MARK: - Shared Views
 
-private struct SettingsPage<Content: View>: View {
+private struct SettingsPage<Content: View, Footer: View>: View {
     let title: String
     let subtitle: String
     let content: Content
+    let footer: Footer?
 
-    init(title: String, subtitle: String, @ViewBuilder content: () -> Content) {
+    init(title: String, subtitle: String, @ViewBuilder content: () -> Content) where Footer == EmptyView {
         self.title = title
         self.subtitle = subtitle
         self.content = content()
+        self.footer = nil
+    }
+
+    init(
+        title: String,
+        subtitle: String,
+        @ViewBuilder content: () -> Content,
+        @ViewBuilder footer: () -> Footer
+    ) {
+        self.title = title
+        self.subtitle = subtitle
+        self.content = content()
+        self.footer = footer()
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(title)
-                        .font(.system(size: 30, weight: .semibold, design: .rounded))
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(title)
+                            .font(.system(size: 30, weight: .semibold))
 
-                    Text(subtitle)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                        Text(subtitle)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    content
                 }
-
-                content
+                .frame(maxWidth: 760, alignment: .leading)
+                .padding(.horizontal, 30)
+                .padding(.vertical, 28)
             }
-            .frame(maxWidth: 760, alignment: .leading)
-            .padding(.horizontal, 30)
-            .padding(.vertical, 28)
+            if let footer {
+                Divider()
+
+                HStack {
+                    Spacer(minLength: 0)
+                    footer
+                }
+                .padding(.horizontal, 30)
+                .padding(.vertical, 14)
+                .background(Color(nsColor: .windowBackgroundColor))
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color(nsColor: .windowBackgroundColor))

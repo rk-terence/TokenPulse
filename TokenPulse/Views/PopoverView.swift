@@ -839,6 +839,7 @@ private struct RequestActivityRow: View {
     let request: ProxyRequestActivity
 
     private enum StatField {
+        static let modelLabelWidth = 8
         static let timingLabelWidth = 4
         static let valueWidth = 6
         static let outputValueWidth = 5
@@ -857,7 +858,7 @@ private struct RequestActivityRow: View {
                     .help(String(localized: "Keepalive request"))
             }
             if let modelName = compactModelName {
-                Text(modelName)
+                Text(verbatim: paddedLabel(modelName, width: StatField.modelLabelWidth))
                     .font(rowFont)
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
@@ -979,8 +980,6 @@ private struct RequestActivityRow: View {
     }
 
     private var compactModelName: String? {
-        let maxModelNameCharacters = 8
-
         guard let rawModelID = request.modelID?
             .replacingOccurrences(of: #"\s*\([^)]*\)"#, with: "", options: .regularExpression)
             .split(separator: "/")
@@ -1020,7 +1019,7 @@ private struct RequestActivityRow: View {
 
         for entry in compactPrefixes where normalized.hasPrefix(entry.prefix) {
             let suffix = String(modelID.dropFirst(entry.prefix.count))
-            return shortenedModelLabel(entry.label + suffix, maxCharacters: maxModelNameCharacters)
+            return shortenedModelLabel(entry.label + suffix, maxCharacters: StatField.modelLabelWidth)
         }
 
         let compactLabels: [(needle: String, label: String)] = [
@@ -1030,10 +1029,10 @@ private struct RequestActivityRow: View {
         ]
 
         for entry in compactLabels where normalized.contains(entry.needle) {
-            return shortenedModelLabel(entry.label, maxCharacters: maxModelNameCharacters)
+            return shortenedModelLabel(entry.label, maxCharacters: StatField.modelLabelWidth)
         }
 
-        return shortenedModelLabel(modelID.isEmpty ? rawModelID : modelID, maxCharacters: maxModelNameCharacters)
+        return shortenedModelLabel(modelID.isEmpty ? rawModelID : modelID, maxCharacters: StatField.modelLabelWidth)
     }
 
     private func shortenedModelLabel(_ label: String, maxCharacters: Int) -> String {
