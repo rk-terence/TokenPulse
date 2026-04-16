@@ -12,11 +12,8 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
         requestPath
     }
 
-    func sessionID(for request: ProxyHTTPRequest) -> String {
-        guard let codexSessionID = codexSessionID(for: request) else {
-            return ProxySessionID.other
-        }
-        return ProxySessionID.make(codexSessionID, flavor: .openAIResponses)
+    func sessionIdentity(for request: ProxyHTTPRequest) -> ProxySessionIdentity {
+        codexSessionIdentity(for: request) ?? .other
     }
 
     func extractModel(from body: Data) -> String? {
@@ -69,21 +66,21 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
         try? JSONSerialization.jsonObject(with: body) as? [String: Any]
     }
 
-    /// OpenAI does not document a Codex-specific session header contract, so we
-    /// only classify traffic as a tracked Codex session when several observed
-    /// headers agree on the same identity. Anything less falls back to `other`.
-    private func codexSessionID(for request: ProxyHTTPRequest) -> String? {
-        guard normalizedHeaderValue("originator", in: request) == "codex-tui",
-              let userAgent = normalizedHeaderValue("user-agent", in: request),
-              userAgent.hasPrefix("codex-tui/"),
-              let sessionID = normalizedHeaderValue("session_id", in: request),
-              normalizedHeaderValue("x-client-request-id", in: request) == sessionID,
-              windowHeaderMatchesSessionID(request, sessionID: sessionID),
-              turnMetadataMatchesSessionID(request, sessionID: sessionID) else {
+    /// Local Codex traffic consistently carries `session_id` (thread ID) plus
+    /// `x-codex-window-id`, and subagents add `x-codex-parent-thread-id`.
+    /// We use that header trio to identify Codex sessions and let the session
+    /// store collapse child threads into the root Codex session.
+    private func codexSessionIdentity(for request: ProxyHTTPRequest) -> ProxySessionIdentity? {
+        guard let sessionID = normalizedHeaderValue("session_id", in: request),
+              windowHeaderMatchesSessionID(request, sessionID: sessionID) else {
             return nil
         }
 
-        return sessionID
+        return .tracked(
+            rawSessionID: sessionID,
+            flavor: .openAIResponses,
+            parentRawSessionID: normalizedHeaderValue("x-codex-parent-thread-id", in: request)
+        )
     }
 
     private func normalizedHeaderValue(_ name: String, in request: ProxyHTTPRequest) -> String? {
@@ -108,24 +105,6 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
         let generation = String(windowID[windowID.index(after: separator)...])
         return rawSessionID == sessionID && UInt64(generation) != nil
     }
-
-    private func turnMetadataMatchesSessionID(
-        _ request: ProxyHTTPRequest,
-        sessionID: String
-    ) -> Bool {
-        guard let metadataHeader = normalizedHeaderValue("x-codex-turn-metadata", in: request),
-              let metadataData = metadataHeader.data(using: .utf8),
-              let metadata = try? JSONSerialization.jsonObject(with: metadataData) as? [String: Any],
-              let metadataSessionID = metadata["session_id"] as? String,
-              metadataSessionID.trimmingCharacters(in: .whitespacesAndNewlines) == sessionID,
-              let turnID = metadata["turn_id"] as? String,
-              !turnID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return false
-        }
-
-        return true
-    }
-
     private func parseTokenUsageFromJSON(_ data: Data) -> TokenUsage {
         guard let json = jsonObject(from: data) else { return .empty }
         return parseUsage(from: json["usage"] as? [String: Any], stopReason: json["status"] as? String)

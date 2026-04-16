@@ -123,7 +123,7 @@ The proxy listens on `127.0.0.1` only (IPv4 loopback) and never binds all interf
 
 ### How it works
 
-The proxy is a full HTTP/1.1 server built on Network.framework. Anthropic Messages traffic uses `X-Claude-Code-Session-Id` for tracked sessions; OpenAI Responses traffic is tracked per session only when multiple Codex-specific headers agree on the same conversation identity, otherwise it is grouped as `Other`.
+The proxy is a full HTTP/1.1 server built on Network.framework. Anthropic Messages traffic uses `X-Claude-Code-Session-Id` for tracked sessions; OpenAI Responses traffic is tracked when Codex session headers are present, and Codex subagent threads are recursively folded back into the root Codex session when parent thread metadata is available. Non-Codex OpenAI traffic is grouped as `Other`.
 
 - **Forwarding** — Requests are forwarded to the upstream URL with streaming SSE passthrough. Token usage is parsed from JSON responses and from terminal usage events in SSE streams.
 - **Cost tracking** — Per-session counters track input/output/cache-read/cache-write tokens and estimate cost using per-model pricing tables. The popover shows active sessions with their request counts and running cost.

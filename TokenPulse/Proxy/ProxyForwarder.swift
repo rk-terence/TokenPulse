@@ -46,50 +46,33 @@ final class ProxyForwarder: Sendable {
         sessionStore: ProxySessionStore,
         metrics: ProxyMetricsStore
     ) async {
-        // 1. Extract session ID and update session store.
-        let sessionID = apiHandler.sessionID(for: request)
-        let supportsTrackedSession = ProxySessionID.supportsTrackedSession(sessionID)
-        await sessionStore.touch(sessionID)
-        await sessionStore.incrementInFlight(sessionID)
-
-        // Store generic request context (used by done-request replacement etc.).
+        let sessionIdentity = apiHandler.sessionIdentity(for: request)
         let model = apiHandler.extractModel(from: request.body)
+        let supportsTrackedSession = sessionIdentity.flavor != nil
         let promptDescriptor = supportsTrackedSession ? apiHandler.promptDescriptor(from: request.body) : nil
-        if supportsTrackedSession {
-            await sessionStore.storeRequestContext(
-                body: request.body,
-                headers: request.headers,
-                model: model,
-                for: sessionID
-            )
-        }
 
         await forwardRequest(
             request: request,
-            sessionID: sessionID,
+            sessionIdentity: sessionIdentity,
             model: model,
             promptDescriptor: promptDescriptor,
-            supportsTrackedSession: supportsTrackedSession,
             sessionStore: sessionStore,
             metrics: metrics
         )
-        await sessionStore.decrementInFlight(sessionID)
     }
 
     // MARK: - Streaming forwarding
 
     private func forwardRequest(
         request: ProxyHTTPRequest,
-        sessionID: String,
+        sessionIdentity: ProxySessionIdentity,
         model: String?,
         promptDescriptor: String?,
-        supportsTrackedSession: Bool,
         sessionStore: ProxySessionStore,
         metrics: ProxyMetricsStore
     ) async {
         // requestID is created below, after URL validation, so we only track
         // real upstream attempts (not proxy-side config errors).
-        let supportsKeepalive = apiFlavor.supportsKeepalive && supportsTrackedSession
         let upstreamPath = apiHandler.upstreamPath(for: request.path)
         let urlString = upstreamBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             + upstreamPath
@@ -103,23 +86,16 @@ final class ProxyForwarder: Sendable {
             body: request.body,
             streaming: wantsStreaming
         )
-        let loggedRequestID = await eventLogger?.logRequestStarted(
-            session: sessionID,
-            model: model,
-            method: request.method,
-            path: request.path,
-            upstreamURL: urlString,
-            streaming: wantsStreaming
-        )
 
         guard let url = URL(string: urlString) else {
+            let sessionID = await sessionStore.resolveSessionID(for: sessionIdentity)
             await metrics.recordFailed()
             let response = proxyErrorResponse(
                 status: 502,
                 message: String(localized: "Bad Gateway: invalid upstream URL")
             )
             await eventLogger?.logRequestFailed(
-                requestID: loggedRequestID,
+                requestID: nil,
                 session: sessionID,
                 model: model,
                 request: requestLog,
@@ -145,13 +121,25 @@ final class ProxyForwarder: Sendable {
 
         // Register the in-flight request in the session store for real-time UI display.
         let requestID = UUID()
-        let isMainAgentShaped = supportsTrackedSession && apiHandler.isMainAgentRequest(body: request.body)
-        await sessionStore.startRequest(
+        let isMainAgentShaped = sessionIdentity.flavor != nil && apiHandler.isMainAgentRequest(body: request.body)
+        let sessionID = await sessionStore.beginRequest(
+            identity: sessionIdentity,
             id: requestID,
-            sessionID: sessionID,
+            body: request.body,
+            headers: request.headers,
             model: model,
             promptDescriptor: promptDescriptor,
             isMainAgentShaped: isMainAgentShaped
+        )
+        let supportsTrackedSession = ProxySessionID.supportsTrackedSession(sessionID)
+        let supportsKeepalive = apiFlavor.supportsKeepalive && supportsTrackedSession
+        let loggedRequestID = await eventLogger?.logRequestStarted(
+            session: sessionID,
+            model: model,
+            method: request.method,
+            path: request.path,
+            upstreamURL: urlString,
+            streaming: wantsStreaming
         )
         await sessionStore.recordBytesSent(request.body.count)
 
@@ -228,6 +216,9 @@ final class ProxyForwarder: Sendable {
                 }
             }
         }
+
+        let currentSessionID = await sessionStore.currentSessionID(for: sessionID)
+        await sessionStore.decrementInFlight(currentSessionID)
     }
 
     private func forwardStreaming(
@@ -350,19 +341,21 @@ final class ProxyForwarder: Sendable {
                 bodyTruncated: capturedResponseBytes > capturedResponseBody.count
             )
             let tokenUsage = apiHandler.parseTokenUsage(from: capturedResponseBody, streaming: true)
+            let currentSessionID = await sessionStore.currentSessionID(forRequest: requestID, fallback: sessionID)
             await metrics.recordTokenUsage(tokenUsage)
             await sessionStore.recordTokenUsage(
                 tokenUsage,
                 model: model,
-                for: sessionID,
+                for: currentSessionID,
                 apiFlavor: apiFlavor
             )
             let requestCost = ModelPricingTable.pricing(for: model).map { tokenUsage.cost(for: $0) }
             let isUpstreamError = upstreamStatusCode >= 400
             await sessionStore.markRequestDone(id: requestID, errored: isUpstreamError, tokenUsage: tokenUsage, estimatedCost: requestCost)
+            let eventLogSessionID = await sessionStore.currentSessionID(for: sessionID)
             await eventLogger?.logRequestCompleted(
                 requestID: loggedRequestID,
-                session: sessionID,
+                session: eventLogSessionID,
                 model: model,
                 request: requestLog,
                 response: responseLog,
@@ -377,9 +370,10 @@ final class ProxyForwarder: Sendable {
             // Client disconnected — no error response needed.
             await sessionStore.markRequestDone(id: requestID, errored: true, tokenUsage: nil, estimatedCost: nil)
             ProxyLogger.log("Streaming request cancelled (client disconnect)")
+            let currentSessionID = await sessionStore.currentSessionID(for: sessionID)
             await eventLogger?.logRequestFailed(
                 requestID: loggedRequestID,
-                session: sessionID,
+                session: currentSessionID,
                 model: model,
                 request: requestLog,
                 response: nil,
@@ -394,9 +388,10 @@ final class ProxyForwarder: Sendable {
                 status: 502,
                 message: String(localized: "Bad Gateway: upstream error: \(error.localizedDescription)")
             )
+            let currentSessionID = await sessionStore.currentSessionID(for: sessionID)
             await eventLogger?.logRequestFailed(
                 requestID: loggedRequestID,
-                session: sessionID,
+                session: currentSessionID,
                 model: model,
                 request: requestLog,
                 response: response.loggedResponse,
@@ -486,17 +481,19 @@ final class ProxyForwarder: Sendable {
                 await metrics.recordForwarded()
 
                 let tokenUsage = apiHandler.parseTokenUsage(from: responseData, streaming: false)
+                let currentSessionID = await sessionStore.currentSessionID(forRequest: requestID, fallback: sessionID)
                 await metrics.recordTokenUsage(tokenUsage)
                 await sessionStore.recordTokenUsage(
                     tokenUsage,
                     model: model,
-                    for: sessionID,
+                    for: currentSessionID,
                     apiFlavor: apiFlavor
                 )
                 let requestCost = ModelPricingTable.pricing(for: model).map { tokenUsage.cost(for: $0) }
                 let isUpstreamError = httpResponse.statusCode >= 400
                 errored = isUpstreamError
                 await sessionStore.markRequestDone(id: requestID, errored: isUpstreamError, tokenUsage: tokenUsage, estimatedCost: requestCost)
+                let eventLogSessionID = await sessionStore.currentSessionID(for: sessionID)
                 let responseLog = ProxyEventLogger.LoggedResponse(
                     statusCode: httpResponse.statusCode,
                     headers: ProxyHTTPUtils.allHeaders(from: httpResponse),
@@ -505,7 +502,7 @@ final class ProxyForwarder: Sendable {
                 )
                 await eventLogger?.logRequestCompleted(
                     requestID: loggedRequestID,
-                    session: sessionID,
+                    session: eventLogSessionID,
                     model: model,
                     request: requestLog,
                     response: responseLog,
@@ -521,9 +518,10 @@ final class ProxyForwarder: Sendable {
         } catch is CancellationError {
             await sessionStore.markRequestDone(id: requestID, errored: true, tokenUsage: nil, estimatedCost: nil)
             ProxyLogger.log("Non-streaming request cancelled (client disconnect)")
+            let currentSessionID = await sessionStore.currentSessionID(for: sessionID)
             await eventLogger?.logRequestFailed(
                 requestID: loggedRequestID,
-                session: sessionID,
+                session: currentSessionID,
                 model: model,
                 request: requestLog,
                 response: nil,
@@ -537,9 +535,10 @@ final class ProxyForwarder: Sendable {
                 status: 502,
                 message: String(localized: "Bad Gateway: upstream error: \(error.localizedDescription)")
             )
+            let currentSessionID = await sessionStore.currentSessionID(for: sessionID)
             await eventLogger?.logRequestFailed(
                 requestID: loggedRequestID,
-                session: sessionID,
+                session: currentSessionID,
                 model: model,
                 request: requestLog,
                 response: response.loggedResponse,

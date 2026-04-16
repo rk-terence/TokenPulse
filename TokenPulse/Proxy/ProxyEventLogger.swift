@@ -147,7 +147,7 @@ actor ProxyEventLogger {
             if let requestID {
                 let sql = """
                     UPDATE proxy_requests SET
-                        completed_at = ?, status_code = ?, duration_ms = ?,
+                        session = ?, completed_at = ?, status_code = ?, duration_ms = ?,
                         upstream_request_id = ?,
                         input_tokens = ?, output_tokens = ?,
                         cache_read_tokens = ?, cache_creation_tokens = ?,
@@ -159,16 +159,17 @@ actor ProxyEventLogger {
                     throw LoggerStorageError.prepareFailed(message: errorMessage(from: database))
                 }
                 defer { sqlite3_finalize(statement) }
-                bind(isoFormatter.string(from: Date()), to: 1, in: statement)
-                bind(statusCode, to: 2, in: statement)
-                bind(durationMs, to: 3, in: statement)
-                bind(extractUpstreamRequestID(from: response.headers), to: 4, in: statement)
-                bind(tokenUsage.inputTokens, to: 5, in: statement)
-                bind(tokenUsage.outputTokens, to: 6, in: statement)
-                bind(tokenUsage.cacheReadInputTokens, to: 7, in: statement)
-                bind(tokenUsage.cacheCreationInputTokens, to: 8, in: statement)
-                bind(errored, to: 9, in: statement)
-                bind(requestID, to: 10, in: statement)
+                bind(session, to: 1, in: statement)
+                bind(isoFormatter.string(from: Date()), to: 2, in: statement)
+                bind(statusCode, to: 3, in: statement)
+                bind(durationMs, to: 4, in: statement)
+                bind(extractUpstreamRequestID(from: response.headers), to: 5, in: statement)
+                bind(tokenUsage.inputTokens, to: 6, in: statement)
+                bind(tokenUsage.outputTokens, to: 7, in: statement)
+                bind(tokenUsage.cacheReadInputTokens, to: 8, in: statement)
+                bind(tokenUsage.cacheCreationInputTokens, to: 9, in: statement)
+                bind(errored, to: 10, in: statement)
+                bind(requestID, to: 11, in: statement)
                 guard sqlite3_step(statement) == SQLITE_DONE else {
                     throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
                 }
@@ -246,7 +247,7 @@ actor ProxyEventLogger {
                 // UPDATE existing row
                 let sql = """
                     UPDATE proxy_requests SET
-                        completed_at = ?, status_code = ?, duration_ms = ?,
+                        session = ?, completed_at = ?, status_code = ?, duration_ms = ?,
                         upstream_request_id = ?, error = ?, errored = 1
                     WHERE id = ?
                     """
@@ -255,12 +256,13 @@ actor ProxyEventLogger {
                     throw LoggerStorageError.prepareFailed(message: errorMessage(from: database))
                 }
                 defer { sqlite3_finalize(statement) }
-                bind(isoFormatter.string(from: Date()), to: 1, in: statement)
-                bind(statusCode, to: 2, in: statement)
-                bind(durationMs, to: 3, in: statement)
-                bind(upstreamRequestID, to: 4, in: statement)
-                bind(error, to: 5, in: statement)
-                bind(requestID, to: 6, in: statement)
+                bind(session, to: 1, in: statement)
+                bind(isoFormatter.string(from: Date()), to: 2, in: statement)
+                bind(statusCode, to: 3, in: statement)
+                bind(durationMs, to: 4, in: statement)
+                bind(upstreamRequestID, to: 5, in: statement)
+                bind(error, to: 6, in: statement)
+                bind(requestID, to: 7, in: statement)
                 guard sqlite3_step(statement) == SQLITE_DONE else {
                     throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
                 }

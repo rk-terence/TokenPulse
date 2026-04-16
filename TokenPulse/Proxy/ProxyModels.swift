@@ -56,7 +56,7 @@ enum ProxySessionID {
     static let other = "other"
 
     static func make(_ rawID: String, flavor: ProxyAPIFlavor) -> String {
-        "\(flavor.sessionPrefix):\(normalized(rawID))"
+        "\(flavor.sessionPrefix):\(normalizedRawID(rawID))"
     }
 
     static func flavor(for sessionID: String) -> ProxyAPIFlavor? {
@@ -129,9 +129,44 @@ enum ProxySessionID {
         return String(displayID(for: sessionID).prefix(8))
     }
 
-    private static func normalized(_ rawID: String) -> String {
+    static func normalizedOptionalRawID(_ rawID: String?) -> String? {
+        guard let rawID else { return nil }
+        let trimmed = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    static func normalizedRawID(_ rawID: String) -> String {
         let trimmed = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "unknown" : trimmed
+    }
+}
+
+struct ProxySessionIdentity: Sendable {
+    let flavor: ProxyAPIFlavor?
+    let rawSessionID: String?
+    let parentRawSessionID: String?
+
+    static let other = ProxySessionIdentity(
+        flavor: nil,
+        rawSessionID: nil,
+        parentRawSessionID: nil
+    )
+
+    static func tracked(
+        rawSessionID: String,
+        flavor: ProxyAPIFlavor,
+        parentRawSessionID: String? = nil
+    ) -> ProxySessionIdentity {
+        guard let normalizedRawSessionID = ProxySessionID.normalizedOptionalRawID(rawSessionID) else {
+            return .other
+        }
+
+        let normalizedParent = ProxySessionID.normalizedOptionalRawID(parentRawSessionID)
+        return ProxySessionIdentity(
+            flavor: flavor,
+            rawSessionID: normalizedRawSessionID,
+            parentRawSessionID: normalizedParent == normalizedRawSessionID ? nil : normalizedParent
+        )
     }
 }
 

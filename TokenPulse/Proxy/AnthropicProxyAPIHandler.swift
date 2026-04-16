@@ -5,7 +5,7 @@ protocol ProxyAPIHandler: Sendable {
 
     func acceptsRequest(method: String, path: String) -> Bool
     func upstreamPath(for requestPath: String) -> String
-    func sessionID(for request: ProxyHTTPRequest) -> String
+    func sessionIdentity(for request: ProxyHTTPRequest) -> ProxySessionIdentity
     func extractModel(from body: Data) -> String?
     func isStreamingRequest(body: Data) -> Bool
     func promptDescriptor(from body: Data) -> String?
@@ -29,13 +29,11 @@ struct AnthropicProxyAPIHandler: ProxyAPIHandler {
         requestPath
     }
 
-    func sessionID(for request: ProxyHTTPRequest) -> String {
-        guard let rawSessionID = request.headerValue(for: "X-Claude-Code-Session-Id")?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-            !rawSessionID.isEmpty else {
-            return ProxySessionID.other
+    func sessionIdentity(for request: ProxyHTTPRequest) -> ProxySessionIdentity {
+        guard let rawSessionID = request.headerValue(for: "X-Claude-Code-Session-Id") else {
+            return .other
         }
-        return ProxySessionID.make(rawSessionID, flavor: .anthropicMessages)
+        return .tracked(rawSessionID: rawSessionID, flavor: .anthropicMessages)
     }
 
     func extractModel(from body: Data) -> String? {

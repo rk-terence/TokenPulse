@@ -14,8 +14,13 @@ actor ProxySessionStore {
         let headers: [(name: String, value: String)]
     }
 
+    private struct OpenAIThreadRecord: Sendable {
+        var parentThreadID: String?
+        var sessionID: String
+    }
+
     struct Session: Sendable {
-        let sessionID: String
+        var sessionID: String
         var lastSeenAt: Date
         var inFlightRequestCount: Int
         // Phase 2 additions:
@@ -88,6 +93,8 @@ actor ProxySessionStore {
     }
 
     private var sessions: [String: Session] = [:]
+    private var openAIThreadRecords: [String: OpenAIThreadRecord] = [:]
+    private var openAISessionAliases: [String: String] = [:]
     /// In-flight requests keyed by their UUID, with the owning session ID stored alongside.
     private var activeRequests: [UUID: (sessionID: String, activity: ProxyRequestActivity)] = [:]
     /// Recently completed requests shown in the session's done section.
@@ -113,17 +120,81 @@ actor ProxySessionStore {
         onTraffic = callback
     }
 
+    /// Resolve an incoming request identity into the session bucket used by the UI and metrics.
+    func resolveSessionID(for identity: ProxySessionIdentity) -> String {
+        guard let flavor = identity.flavor,
+              let rawSessionID = identity.rawSessionID else {
+            return ProxySessionID.other
+        }
+
+        switch flavor {
+        case .anthropicMessages:
+            return ProxySessionID.make(rawSessionID, flavor: flavor)
+        case .openAIResponses:
+            return resolveOpenAISessionID(
+                threadID: rawSessionID,
+                parentThreadID: identity.parentRawSessionID
+            )
+        }
+    }
+
+    func currentSessionID(for sessionID: String) -> String {
+        canonicalSessionID(sessionID)
+    }
+
+    func currentSessionID(forRequest requestID: UUID, fallback sessionID: String) -> String {
+        if let activeSessionID = activeRequests[requestID]?.sessionID {
+            return canonicalSessionID(activeSessionID)
+        }
+        return canonicalSessionID(sessionID)
+    }
+
+    /// Atomically resolve a request into its canonical session bucket and
+    /// register the in-flight request against that bucket.
+    func beginRequest(
+        identity: ProxySessionIdentity,
+        id: UUID,
+        body: Data,
+        headers: [(name: String, value: String)],
+        model: String?,
+        promptDescriptor: String?,
+        isMainAgentShaped: Bool,
+        kind: ProxyRequestKind = .request
+    ) -> String {
+        let sessionID = resolveSessionID(for: identity)
+        touch(sessionID)
+        incrementInFlight(sessionID)
+        if ProxySessionID.supportsTrackedSession(sessionID) {
+            storeRequestContext(
+                body: body,
+                headers: headers,
+                model: model,
+                for: sessionID
+            )
+        }
+        startRequest(
+            id: id,
+            sessionID: sessionID,
+            model: model,
+            promptDescriptor: promptDescriptor,
+            isMainAgentShaped: isMainAgentShaped,
+            kind: kind
+        )
+        return sessionID
+    }
+
     /// Record that a session was seen (creates it if new) and return its state.
     @discardableResult
     func touch(_ sessionID: String) -> Session {
+        let resolvedSessionID = canonicalSessionID(sessionID)
         let now = Date()
-        if var existing = sessions[sessionID] {
+        if var existing = sessions[resolvedSessionID] {
             existing.lastSeenAt = now
-            sessions[sessionID] = existing
+            sessions[resolvedSessionID] = existing
             return existing
         } else {
             let session = Session(
-                sessionID: sessionID,
+                sessionID: resolvedSessionID,
                 lastSeenAt: now,
                 inFlightRequestCount: 0,
                 lastRequestBody: nil,
@@ -153,22 +224,24 @@ actor ProxySessionStore {
                 activeAcceptedLineageRequestBody: nil,
                 activeAcceptedLineageRequestHeaders: []
             )
-            sessions[sessionID] = session
+            sessions[resolvedSessionID] = session
             return session
         }
     }
 
     func incrementInFlight(_ sessionID: String) {
-        if var session = sessions[sessionID] {
+        let resolvedSessionID = canonicalSessionID(sessionID)
+        if var session = sessions[resolvedSessionID] {
             session.inFlightRequestCount += 1
-            sessions[sessionID] = session
+            sessions[resolvedSessionID] = session
         }
     }
 
     func decrementInFlight(_ sessionID: String) {
-        if var session = sessions[sessionID] {
+        let resolvedSessionID = canonicalSessionID(sessionID)
+        if var session = sessions[resolvedSessionID] {
             session.inFlightRequestCount = max(0, session.inFlightRequestCount - 1)
-            sessions[sessionID] = session
+            sessions[resolvedSessionID] = session
         }
     }
 
@@ -188,20 +261,21 @@ actor ProxySessionStore {
 
     /// Look up a single session by ID.
     func session(for sessionID: String) -> Session? {
-        sessions[sessionID]
+        sessions[canonicalSessionID(sessionID)]
     }
 
     /// Mark a session's keepalive as permanently disabled (e.g. after cumulative failures).
     func disableKeepalive(for sessionID: String) {
-        if var session = sessions[sessionID] {
+        let resolvedSessionID = canonicalSessionID(sessionID)
+        if var session = sessions[resolvedSessionID] {
             session.isKeepaliveDisabled = true
-            sessions[sessionID] = session
+            sessions[resolvedSessionID] = session
         }
     }
 
     /// Whether keepalive has been disabled for a session.
     func isKeepaliveDisabled(for sessionID: String) -> Bool {
-        sessions[sessionID]?.isKeepaliveDisabled ?? false
+        sessions[canonicalSessionID(sessionID)]?.isKeepaliveDisabled ?? false
     }
 
     // MARK: - Phase 2 keepalive support
@@ -213,34 +287,36 @@ actor ProxySessionStore {
         model: String?,
         for sessionID: String
     ) {
-        if var session = sessions[sessionID] {
+        let resolvedSessionID = canonicalSessionID(sessionID)
+        if var session = sessions[resolvedSessionID] {
             session.lastRequestBody = body
             session.lastRequestHeaders = headers
             session.lastKnownModel = model
-            sessions[sessionID] = session
+            sessions[resolvedSessionID] = session
         }
     }
 
     /// Retrieve the last stored request body for keepalive use.
     func lastRequestBody(for sessionID: String) -> Data? {
-        sessions[sessionID]?.lastRequestBody
+        sessions[canonicalSessionID(sessionID)]?.lastRequestBody
     }
 
     /// Set the keepalive mode for a session. Clears the disabled reason when switching to `.off`.
     func setKeepaliveMode(_ mode: KeepaliveMode, for sessionID: String) {
-        if var session = sessions[sessionID] {
+        let resolvedSessionID = canonicalSessionID(sessionID)
+        if var session = sessions[resolvedSessionID] {
             session.keepaliveMode = mode
             if mode == .off {
                 session.isKeepaliveDisabled = false
                 session.keepaliveDisabledReason = nil
             }
-            sessions[sessionID] = session
+            sessions[resolvedSessionID] = session
         }
     }
 
     /// Whether a manual keepalive can be sent for a session right now.
     func canSendManualKeepalive(for sessionID: String) -> Bool {
-        guard let session = sessions[sessionID] else { return false }
+        guard let session = sessions[canonicalSessionID(sessionID)] else { return false }
         return session.keepaliveMode == .manual
             && !session.isKeepaliveDisabled
             && session.lineageEstablished
@@ -259,7 +335,8 @@ actor ProxySessionStore {
         for sessionID: String,
         using apiHandler: any ProxyAPIHandler
     ) -> LineageEvaluation {
-        guard var session = sessions[sessionID] else { return .ignored }
+        let resolvedSessionID = canonicalSessionID(sessionID)
+        guard var session = sessions[resolvedSessionID] else { return .ignored }
 
         // Already disabled — nothing to do.
         if session.isKeepaliveDisabled {
@@ -267,7 +344,7 @@ actor ProxySessionStore {
         }
 
         session.totalRequestsSeen += 1
-        sessions[sessionID] = session
+        sessions[resolvedSessionID] = session
 
         // Classify the incoming request.
         let isMainAgentShaped = apiHandler.isMainAgentRequest(body: body)
@@ -291,20 +368,20 @@ actor ProxySessionStore {
                     if session.totalRequestsSeen >= 2 {
                         session.lineageEstablished = true
                     }
-                    sessions[sessionID] = session
+                    sessions[resolvedSessionID] = session
                     return .tracked
                 } else {
                     // Second main-agent-shaped request in window — close the
                     // window and fall through to the continuation check below.
                     session.lineageEstablished = true
-                    sessions[sessionID] = session
+                    sessions[resolvedSessionID] = session
                 }
             } else {
                 // Not main-agent-shaped.
                 if session.totalRequestsSeen >= 2 && session.lineageFingerprint == nil {
                     // Past identification window without finding a main agent.
                     disableKeepaliveWithReason(
-                        for: sessionID,
+                        for: resolvedSessionID,
                         reason: String(localized: "no main-agent candidate in first 2 requests")
                     )
                     return .diverged(reason: "no main-agent candidate in first 2 requests")
@@ -312,14 +389,14 @@ actor ProxySessionStore {
                 if session.totalRequestsSeen >= 2 && session.lineageFingerprint != nil {
                     // Window closed with a candidate already stored — establish it.
                     session.lineageEstablished = true
-                    sessions[sessionID] = session
+                    sessions[resolvedSessionID] = session
                 }
                 return session.lineageEstablished ? .ignored : .pendingIdentification
             }
         }
 
         // Reload session after potential updates above.
-        guard let currentSession = sessions[sessionID] else { return .ignored }
+        guard let currentSession = sessions[resolvedSessionID] else { return .ignored }
 
         // Phase 2: Lineage established — classify against tracked fingerprint.
         if !isMainAgentShaped {
@@ -347,7 +424,7 @@ actor ProxySessionStore {
                     return .ignored
                 }
                 let reason = String(localized: "messages not append-only")
-                disableKeepaliveWithReason(for: sessionID, reason: reason)
+                disableKeepaliveWithReason(for: resolvedSessionID, reason: reason)
                 return .diverged(reason: reason)
             }
         }
@@ -357,31 +434,31 @@ actor ProxySessionStore {
         // divergence that would break the prompt cache.
         if incoming.model != tracked.model {
             let reason = "model changed: \(tracked.model) → \(incoming.model)"
-            disableKeepaliveWithReason(for: sessionID, reason: reason)
+            disableKeepaliveWithReason(for: resolvedSessionID, reason: reason)
             return .diverged(reason: reason)
         }
         if incoming.toolsCanonical != tracked.toolsCanonical {
             let reason = String(localized: "tools changed")
-            disableKeepaliveWithReason(for: sessionID, reason: reason)
+            disableKeepaliveWithReason(for: resolvedSessionID, reason: reason)
             return .diverged(reason: reason)
         }
         if incoming.toolChoiceCanonical != tracked.toolChoiceCanonical {
             let reason = String(localized: "tool_choice changed")
-            disableKeepaliveWithReason(for: sessionID, reason: reason)
+            disableKeepaliveWithReason(for: resolvedSessionID, reason: reason)
             return .diverged(reason: reason)
         }
         if incoming.thinkingCanonical != tracked.thinkingCanonical {
             let reason = String(localized: "thinking config changed")
-            disableKeepaliveWithReason(for: sessionID, reason: reason)
+            disableKeepaliveWithReason(for: resolvedSessionID, reason: reason)
             return .diverged(reason: reason)
         }
 
         // All checks pass — promote this request as the latest lineage point.
-        if var updated = sessions[sessionID] {
+        if var updated = sessions[resolvedSessionID] {
             updated.lineageMessagesDescriptor = incomingMessages
             updated.lineageRequestBody = body
             updated.lineageRequestHeaders = headers
-            sessions[sessionID] = updated
+            sessions[resolvedSessionID] = updated
         }
         return .tracked
     }
@@ -389,7 +466,7 @@ actor ProxySessionStore {
     /// Prefer an accepted in-flight main-agent continuation as the keepalive source,
     /// falling back to the last completed tracked lineage request.
     func keepaliveRequestContext(for sessionID: String) -> KeepaliveRequestContext? {
-        guard let session = sessions[sessionID] else { return nil }
+        guard let session = sessions[canonicalSessionID(sessionID)] else { return nil }
         return keepaliveRequestContext(for: session)
     }
 
@@ -432,10 +509,11 @@ actor ProxySessionStore {
 
     /// Disable keepalive with a human-readable reason for UI display.
     func disableKeepaliveWithReason(for sessionID: String, reason: String) {
-        if var session = sessions[sessionID] {
+        let resolvedSessionID = canonicalSessionID(sessionID)
+        if var session = sessions[resolvedSessionID] {
             session.isKeepaliveDisabled = true
             session.keepaliveDisabledReason = reason
-            sessions[sessionID] = session
+            sessions[resolvedSessionID] = session
         }
     }
 
@@ -443,16 +521,17 @@ actor ProxySessionStore {
     /// Clears the disabled flag and reason. Lineage state is preserved so the
     /// next tracked request can resume the keepalive loop.
     func enableKeepalive(for sessionID: String) {
-        if var session = sessions[sessionID] {
+        let resolvedSessionID = canonicalSessionID(sessionID)
+        if var session = sessions[resolvedSessionID] {
             session.isKeepaliveDisabled = false
             session.keepaliveDisabledReason = nil
-            sessions[sessionID] = session
+            sessions[resolvedSessionID] = session
         }
     }
 
     /// The reason keepalive was disabled for a session, if any.
     func keepaliveDisabledReason(for sessionID: String) -> String? {
-        sessions[sessionID]?.keepaliveDisabledReason
+        sessions[canonicalSessionID(sessionID)]?.keepaliveDisabledReason
     }
 
     /// Record keepalive result for a session. On success, accumulates cost.
@@ -462,7 +541,8 @@ actor ProxySessionStore {
         tokenUsage: TokenUsage,
         apiFlavor: ProxyAPIFlavor
     ) {
-        if var session = sessions[sessionID] {
+        let resolvedSessionID = canonicalSessionID(sessionID)
+        if var session = sessions[resolvedSessionID] {
             session.lastKeepaliveAt = Date()
             if success {
                 session.keepaliveSuccessCount += 1
@@ -476,7 +556,7 @@ actor ProxySessionStore {
             } else {
                 session.keepaliveFailureCount += 1
             }
-            sessions[sessionID] = session
+            sessions[resolvedSessionID] = session
         }
     }
 
@@ -489,7 +569,8 @@ actor ProxySessionStore {
         for sessionID: String,
         apiFlavor: ProxyAPIFlavor
     ) {
-        guard var session = sessions[sessionID] else { return }
+        let resolvedSessionID = canonicalSessionID(sessionID)
+        guard var session = sessions[resolvedSessionID] else { return }
         session.totalInputTokens += usage.inputTokens ?? 0
         session.totalOutputTokens += usage.outputTokens ?? 0
         session.totalCacheReadInputTokens += usage.cacheReadInputTokens ?? 0
@@ -499,7 +580,7 @@ actor ProxySessionStore {
             session.estimatedCostUSD += cost
             accumulateCost(cost, for: apiFlavor)
         }
-        sessions[sessionID] = session
+        sessions[resolvedSessionID] = session
     }
 
     /// Cumulative estimated cost since proxy start (survives session expiration).
@@ -529,6 +610,7 @@ actor ProxySessionStore {
         isMainAgentShaped: Bool,
         kind: ProxyRequestKind = .request
     ) {
+        let resolvedSessionID = canonicalSessionID(sessionID)
         let activity = ProxyRequestActivity(
             id: id,
             kind: kind,
@@ -548,11 +630,11 @@ actor ProxySessionStore {
         )
         if kind == .keepalive {
             activeRequests = activeRequests.filter { key, value in
-                key == id || value.sessionID != sessionID || !value.activity.isKeepalive
+                key == id || value.sessionID != resolvedSessionID || !value.activity.isKeepalive
             }
-            lastKeepaliveRequestBySession.removeValue(forKey: sessionID)
+            lastKeepaliveRequestBySession.removeValue(forKey: resolvedSessionID)
         }
-        activeRequests[id] = (sessionID: sessionID, activity: activity)
+        activeRequests[id] = (sessionID: resolvedSessionID, activity: activity)
         onTraffic?()
     }
 
@@ -621,6 +703,8 @@ actor ProxySessionStore {
     /// done section where prompt-based replacement is evaluated.
     func markRequestDone(id: UUID, errored: Bool, tokenUsage: TokenUsage?, estimatedCost: Double?) {
         guard var entry = activeRequests.removeValue(forKey: id) else { return }
+        let resolvedSessionID = canonicalSessionID(entry.sessionID)
+        entry.sessionID = resolvedSessionID
         let completedAt = Date()
         entry.activity.state = .done
         entry.activity.completedAt = completedAt
@@ -632,12 +716,12 @@ actor ProxySessionStore {
         // may be truncated (4 MB cap) and miss the final message_delta event.
         let isComplete = !errored
         if isComplete && entry.activity.isKeepalive {
-            lastKeepaliveRequestBySession[entry.sessionID] = entry.activity
+            lastKeepaliveRequestBySession[resolvedSessionID] = entry.activity
         } else if isComplete {
-            insertDoneRequest(entry.activity, for: entry.sessionID)
+            insertDoneRequest(entry.activity, for: resolvedSessionID)
         }
 
-        if var session = sessions[entry.sessionID] {
+        if var session = sessions[resolvedSessionID] {
             if session.activeAcceptedLineageRequestID == id {
                 session.activeAcceptedLineageRequestID = nil
                 session.activeAcceptedLineageRequestBody = nil
@@ -648,7 +732,7 @@ actor ProxySessionStore {
             } else {
                 session.erroredRequestCount += 1
             }
-            sessions[entry.sessionID] = session
+            sessions[resolvedSessionID] = session
         }
         onTraffic?()
     }
@@ -708,6 +792,17 @@ actor ProxySessionStore {
             doneRequestsBySession.removeValue(forKey: id)
             lastKeepaliveRequestBySession.removeValue(forKey: id)
         }
+        if !expired.isEmpty {
+            let expiredSessionIDs = Set(expired)
+            openAIThreadRecords = openAIThreadRecords.filter { _, record in
+                !expiredSessionIDs.contains(record.sessionID)
+            }
+            openAISessionAliases = openAISessionAliases.filter { sourceSessionID, destinationSessionID in
+                !expiredSessionIDs.contains(sourceSessionID)
+                    && !expiredSessionIDs.contains(destinationSessionID)
+            }
+            reconcileOpenAIThreadSessions()
+        }
         return expired
     }
 
@@ -733,20 +828,22 @@ actor ProxySessionStore {
     /// Clear the main-agent flag on a done request after lineage evaluation
     /// determines it is not part of the tracked main-agent lineage.
     func clearMainAgentFlag(requestID: UUID, sessionID: String) {
-        guard var doneRequests = doneRequestsBySession[sessionID] else { return }
+        let resolvedSessionID = canonicalSessionID(sessionID)
+        guard var doneRequests = doneRequestsBySession[resolvedSessionID] else { return }
         guard let index = doneRequests.firstIndex(where: { $0.id == requestID }) else { return }
         doneRequests[index].isMainAgentShaped = false
-        doneRequestsBySession[sessionID] = doneRequests
+        doneRequestsBySession[resolvedSessionID] = doneRequests
         onTraffic?()
     }
 
     private func insertDoneRequest(_ activity: ProxyRequestActivity, for sessionID: String) {
-        var doneRequests = doneRequestsBySession[sessionID] ?? []
+        let resolvedSessionID = canonicalSessionID(sessionID)
+        var doneRequests = doneRequestsBySession[resolvedSessionID] ?? []
         if let replacementIndex = replacementIndex(for: activity, in: doneRequests) {
             doneRequests.remove(at: replacementIndex)
         }
         doneRequests.append(activity)
-        doneRequestsBySession[sessionID] = doneRequests
+        doneRequestsBySession[resolvedSessionID] = doneRequests
     }
 
     private func usesShortRetentionWindow(for sessionID: String, session: Session) -> Bool {
@@ -811,5 +908,176 @@ actor ProxySessionStore {
                 return lhsLength < rhsLength
             }?
             .offset
+    }
+
+    private func resolveOpenAISessionID(threadID: String, parentThreadID: String?) -> String {
+        let normalizedThreadID = ProxySessionID.normalizedRawID(threadID)
+        let normalizedParentThreadID = ProxySessionID.normalizedOptionalRawID(parentThreadID)
+        let existingRecord = openAIThreadRecords[normalizedThreadID]
+        let effectiveParentThreadID: String?
+        if normalizedParentThreadID == normalizedThreadID {
+            effectiveParentThreadID = nil
+        } else {
+            effectiveParentThreadID = normalizedParentThreadID ?? existingRecord?.parentThreadID
+        }
+        let initialSessionID: String
+        if let effectiveParentThreadID,
+           let rootThreadID = highestKnownOpenAIAncestor(startingAt: effectiveParentThreadID) {
+            initialSessionID = ProxySessionID.make(rootThreadID, flavor: .openAIResponses)
+        } else {
+            initialSessionID = ProxySessionID.make(normalizedThreadID, flavor: .openAIResponses)
+        }
+
+        openAIThreadRecords[normalizedThreadID] = OpenAIThreadRecord(
+            parentThreadID: effectiveParentThreadID,
+            sessionID: initialSessionID
+        )
+
+        reconcileOpenAIThreadSessions()
+        return openAIThreadRecords[normalizedThreadID]?.sessionID ?? initialSessionID
+    }
+
+    private func highestKnownOpenAIAncestor(startingAt threadID: String) -> String? {
+        var currentThreadID = threadID
+        var highestKnownThreadID: String?
+        var visitedThreadIDs = Set<String>()
+
+        while visitedThreadIDs.insert(currentThreadID).inserted,
+              let record = openAIThreadRecords[currentThreadID] {
+            highestKnownThreadID = currentThreadID
+            guard let parentThreadID = record.parentThreadID else {
+                break
+            }
+            currentThreadID = parentThreadID
+        }
+
+        return highestKnownThreadID
+    }
+
+    private func reconcileOpenAIThreadSessions() {
+        for threadID in openAIThreadRecords.keys.sorted() {
+            guard var record = openAIThreadRecords[threadID] else { continue }
+            let desiredSessionID = desiredOpenAISessionID(for: threadID)
+            guard record.sessionID != desiredSessionID else { continue }
+            migrateOpenAISessionData(from: record.sessionID, to: desiredSessionID)
+            record.sessionID = desiredSessionID
+            openAIThreadRecords[threadID] = record
+        }
+    }
+
+    private func desiredOpenAISessionID(for threadID: String) -> String {
+        guard let record = openAIThreadRecords[threadID],
+              let parentThreadID = record.parentThreadID,
+              let rootThreadID = highestKnownOpenAIAncestor(startingAt: parentThreadID) else {
+            return ProxySessionID.make(threadID, flavor: .openAIResponses)
+        }
+
+        return ProxySessionID.make(rootThreadID, flavor: .openAIResponses)
+    }
+
+    private func migrateOpenAISessionData(from sourceSessionID: String, to destinationSessionID: String) {
+        guard sourceSessionID != destinationSessionID,
+              ProxySessionID.flavor(for: sourceSessionID) == .openAIResponses,
+              ProxySessionID.flavor(for: destinationSessionID) == .openAIResponses else {
+            return
+        }
+
+        let canonicalDestinationSessionID = canonicalSessionID(destinationSessionID)
+        openAISessionAliases[sourceSessionID] = canonicalDestinationSessionID
+
+        let sourceSession = sessions[sourceSessionID]
+        let destinationSession = sessions[canonicalDestinationSessionID]
+
+        if let sourceSession {
+            sessions[canonicalDestinationSessionID] = mergedOpenAISession(
+                source: sourceSession,
+                destination: destinationSession,
+                destinationSessionID: canonicalDestinationSessionID
+            )
+            sessions.removeValue(forKey: sourceSessionID)
+        }
+
+        reassignOpenAIRequestState(from: sourceSessionID, to: canonicalDestinationSessionID)
+    }
+
+    private func mergedOpenAISession(
+        source: Session,
+        destination: Session?,
+        destinationSessionID: String
+    ) -> Session {
+        let preferredContextSource: Session
+        if let destination, destination.lastSeenAt > source.lastSeenAt {
+            preferredContextSource = destination
+        } else {
+            preferredContextSource = source
+        }
+
+        return Session(
+            sessionID: destinationSessionID,
+            lastSeenAt: max(destination?.lastSeenAt ?? .distantPast, source.lastSeenAt),
+            inFlightRequestCount: (destination?.inFlightRequestCount ?? 0) + source.inFlightRequestCount,
+            lastRequestBody: preferredContextSource.lastRequestBody,
+            lastRequestHeaders: preferredContextSource.lastRequestHeaders,
+            lastKnownModel: preferredContextSource.lastKnownModel,
+            lastKeepaliveAt: nil,
+            keepaliveSuccessCount: 0,
+            keepaliveFailureCount: 0,
+            lastKeepaliveTokenUsage: nil,
+            isKeepaliveDisabled: false,
+            keepaliveMode: .off,
+            completedRequestCount: (destination?.completedRequestCount ?? 0) + source.completedRequestCount,
+            erroredRequestCount: (destination?.erroredRequestCount ?? 0) + source.erroredRequestCount,
+            totalInputTokens: (destination?.totalInputTokens ?? 0) + source.totalInputTokens,
+            totalOutputTokens: (destination?.totalOutputTokens ?? 0) + source.totalOutputTokens,
+            totalCacheReadInputTokens: (destination?.totalCacheReadInputTokens ?? 0) + source.totalCacheReadInputTokens,
+            totalCacheCreationInputTokens: (destination?.totalCacheCreationInputTokens ?? 0) + source.totalCacheCreationInputTokens,
+            estimatedCostUSD: (destination?.estimatedCostUSD ?? 0) + source.estimatedCostUSD,
+            totalRequestsSeen: 0,
+            lineageFingerprint: nil,
+            lineageMessagesDescriptor: nil,
+            lineageRequestBody: nil,
+            lineageRequestHeaders: [],
+            lineageEstablished: false,
+            keepaliveDisabledReason: nil,
+            activeAcceptedLineageRequestID: nil,
+            activeAcceptedLineageRequestBody: nil,
+            activeAcceptedLineageRequestHeaders: []
+        )
+    }
+
+    private func reassignOpenAIRequestState(from sourceSessionID: String, to destinationSessionID: String) {
+        let matchingActiveRequestIDs = activeRequests.compactMap { requestID, entry in
+            entry.sessionID == sourceSessionID ? requestID : nil
+        }
+        for requestID in matchingActiveRequestIDs {
+            guard let entry = activeRequests[requestID] else { continue }
+            activeRequests[requestID] = (sessionID: destinationSessionID, activity: entry.activity)
+        }
+
+        if let sourceDoneRequests = doneRequestsBySession.removeValue(forKey: sourceSessionID) {
+            doneRequestsBySession[destinationSessionID, default: []].append(contentsOf: sourceDoneRequests)
+        }
+
+        if let sourceLastKeepalive = lastKeepaliveRequestBySession.removeValue(forKey: sourceSessionID) {
+            let destinationLastKeepalive = lastKeepaliveRequestBySession[destinationSessionID]
+            let destinationCompletedAt = destinationLastKeepalive?.completedAt ?? .distantPast
+            let sourceCompletedAt = sourceLastKeepalive.completedAt ?? .distantPast
+            if sourceCompletedAt >= destinationCompletedAt {
+                lastKeepaliveRequestBySession[destinationSessionID] = sourceLastKeepalive
+            }
+        }
+    }
+
+    private func canonicalSessionID(_ sessionID: String) -> String {
+        var currentSessionID = sessionID
+        var visitedSessionIDs = Set<String>()
+
+        while visitedSessionIDs.insert(currentSessionID).inserted,
+              let nextSessionID = openAISessionAliases[currentSessionID],
+              nextSessionID != currentSessionID {
+            currentSessionID = nextSessionID
+        }
+
+        return currentSessionID
     }
 }

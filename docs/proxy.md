@@ -147,16 +147,14 @@ sequenceDiagram
 ## Session identity
 
 - **Anthropic Messages**: session ID comes from `X-Claude-Code-Session-Id`, normalized and stored as `anthropic:<id>`.
-- **OpenAI Responses**: session ID is stored as `openai:<session_id>` only when all of these are true:
-  - `originator` is exactly `codex-tui`
-  - `User-Agent` starts with `codex-tui/`
+- **OpenAI Responses**: traffic is treated as Codex session traffic when all of these are true:
   - `session_id` is present and non-empty
-  - `x-client-request-id` exactly matches `session_id`
   - `x-codex-window-id` parses as `<session_id>:<window_generation>` where `window_generation` is an integer
-  - `x-codex-turn-metadata` is valid JSON, includes the same `session_id`, and includes a non-empty `turn_id`
+  - If `x-codex-parent-thread-id` is absent, the request is stored as `openai:<session_id>`
+  - If `x-codex-parent-thread-id` is present, TokenPulse follows parent-thread links already known in the current session store and groups the request under the highest known ancestor; if no parent thread is known yet, it temporarily stores the request as `openai:<session_id>`
 - **Everything else**: falls back to `other`.
 
-This conservative rule reflects empirical Codex/OpenAI observations rather than a published OpenAI contract, so the proxy requires several independent headers to agree before it classifies a request as a tracked Codex session.
+When a previously unknown Codex root thread later appears, TokenPulse reconciles and merges any temporary child-thread session buckets back into the root session so the activity view heals into the expected single Codex work session.
 
 Tracked sessions store normal request activity and token/cost aggregation. Only Anthropic sessions run lineage tracking and retain keepalive-specific context.
 
@@ -164,9 +162,9 @@ Tracked sessions store normal request activity and token/cost aggregation. Only 
 
 The OpenAI Responses detection rule above is based on local observations from 2026-04-14 rather than formal OpenAI API documentation.
 
-- Captured Codex traffic in this environment included the session-related headers `x-codex-turn-metadata`, `x-codex-window-id`, `x-client-request-id`, `session_id`, `originator: codex-tui`, and `User-Agent: codex-tui/...`.
-- The observed `x-codex-turn-metadata` value was JSON carrying at least `session_id` and `turn_id`.
+- Captured Codex traffic in this environment included the session-related headers `x-codex-window-id`, `session_id`, and, for subagents, `x-codex-parent-thread-id`.
 - The observed `x-codex-window-id` format was `{conversation_id}:{window_generation}`.
+- The observed `x-codex-parent-thread-id` value pointed at the spawning Codex thread, and nested subagents continued that chain recursively.
 - Local Codex source confirms that `session_id` is the conversation/thread identifier and that `x-codex-window-id` reuses that identifier with a `window_generation` suffix.
 - Local Codex tests indicate `window_generation` starts at `0`, advances after history compaction, persists on resume, and resets on fork.
 
