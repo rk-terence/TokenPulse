@@ -2,7 +2,7 @@
 
 A macOS menu bar app that monitors AI platform token usage and optimizes API costs through a local caching proxy. A compact two-number menu bar icon shows your primary and secondary quota utilization at a glance, while the optional proxy keeps prompt caches warm between requests to reduce cache-write costs.
 
-![macOS 14+](https://img.shields.io/badge/macOS-14%2B-blue) ![Swift 5.9](https://img.shields.io/badge/Swift-5.9-orange)
+![macOS 14+](https://img.shields.io/badge/macOS-14%2B-blue) ![Swift 5](https://img.shields.io/badge/Swift-5-orange)
 
 ## Features
 
@@ -22,7 +22,7 @@ A macOS menu bar app that monitors AI platform token usage and optimizes API cos
 - **Streaming support** — Full HTTP/1.1 proxy with SSE streaming passthrough; parses token usage from both JSON and SSE responses
 - **Traffic indicator** — Menu bar slash animates with a bouncing glow when the proxy is forwarding requests
 - **Event logging** — Structured SQLite event log with 24-hour retention; optional request/response capture in SQLite for debugging
-- **Status snapshots** — Atomic JSON snapshots at `~/.tokenpulse/proxy_status.json` for external tooling
+- **Status snapshots** — Atomic JSON snapshots at `~/.tokenpulse/proxy_status.json` for external tooling when proxy logging is enabled
 
 ### General
 
@@ -34,7 +34,7 @@ A macOS menu bar app that monitors AI platform token usage and optimizes API cos
 
 | Provider | Auth method | What it shows |
 |----------|-------------|---------------|
-| **Codex** | Local Codex ChatGPT login (`~/.codex/auth.json`) | 5h window, weekly window, plan tier |
+| **Codex** | Local Codex ChatGPT login (`$CODEX_HOME/auth.json`, then `~/.codex/auth.json`) | 5h window, weekly window, plan tier |
 | **Claude** (Anthropic) | Keychain (Claude Code OAuth token) | 5h window, 7-day quota, Opus quota |
 | **ZenMux** | Management API key + Chrome cookies (auto-extracted) | 5h window, 7-day quota, monthly utilization*, tier, account status |
 
@@ -46,7 +46,7 @@ A macOS menu bar app that monitors AI platform token usage and optimizes API cos
 - **ZenMux support** — TokenPulse supports ZenMux out of the box via their official Management API. ZenMux is a niche provider that CodexBar doesn't cover, and likely too niche for them to want to maintain.
 - **One glance, no mode switch** — CodexBar shows two stacked bars per provider with multiple display modes. TokenPulse shows the primary and secondary window percentages directly in the icon, so you can read current utilization without opening a detail view.
 - **Minimal by design** — TokenPulse is ~28 source files with a simple `UsageProvider` protocol and an actor-based proxy subsystem. No SwiftSyntax macros, no helper processes, no multi-strategy fallback chains. The entire codebase is easy to audit, fork, and modify.
-- **Machine-readable output** — Every poll cycle writes a normalized provider snapshot to `~/.tokenpulse/raw_usage.json`, and the proxy writes status snapshots to `~/.tokenpulse/proxy_status.json`. Shell scripts and external tools can consume both without scraping or IPC.
+- **Machine-readable output** — Every poll cycle writes a normalized provider snapshot to `~/.tokenpulse/raw_usage.json`, and the proxy can write status snapshots to `~/.tokenpulse/proxy_status.json` when proxy logging is enabled. Shell scripts and external tools can consume both without scraping or IPC.
 
 If you use many AI providers and want comprehensive coverage, use CodexBar. If you use Codex, Claude, and/or ZenMux and want something small and direct — especially with cost optimization through cache-warming — TokenPulse is for you.
 
@@ -57,7 +57,7 @@ If you use many AI providers and want comprehensive coverage, use CodexBar. If y
 Requires Xcode 15+ and macOS 14 Sonoma.
 
 ```bash
-git clone https://github.com/user/TokenPulse.git
+git clone git@github.com:rk-terence/TokenPulse.git
 cd TokenPulse
 cp Local.xcconfig.example Local.xcconfig
 # Edit Local.xcconfig and set your Apple Developer Team ID
@@ -78,7 +78,7 @@ TokenPulse reads your Claude Code OAuth credentials from the macOS Keychain auto
 
 ### Codex provider
 
-TokenPulse reads your existing Codex ChatGPT login from `~/.codex/auth.json`. To set it up:
+TokenPulse reads your existing Codex ChatGPT login from `$CODEX_HOME/auth.json` first, then falls back to `~/.codex/auth.json`. To set it up:
 
 1. Install the Codex CLI and sign in with ChatGPT via `codex login`
 2. Open **Settings > Providers** and enable **Codex**
@@ -137,7 +137,7 @@ When TokenPulse establishes Anthropic lineage for a session, the popover can exp
 
 ### Observability
 
-The proxy writes structured event logs to `~/.tokenpulse/proxy_events.sqlite` (SQLite, WAL mode) and atomic status snapshots to `~/.tokenpulse/proxy_status.json` (throttled to 1-second intervals). Events are pruned after 24 hours with 5-minute sweep cycles.
+When proxy logging is enabled, the proxy writes structured event logs to `~/.tokenpulse/proxy_events.sqlite` (SQLite, WAL mode) and atomic status snapshots to `~/.tokenpulse/proxy_status.json` (throttled to 1-second intervals). Events are pruned after 24 hours with 5-minute sweep cycles.
 
 Optional payload capture stores full request bodies plus response bodies in the `proxy_request_content` table inside `~/.tokenpulse/proxy_events.sqlite` (disabled by default). Streaming response capture is truncated to 4 MB per request.
 
@@ -156,7 +156,7 @@ All fields are in `~/.tokenpulse/config.json`:
 | `keepaliveEnabled` | `false` | Show per-session manual keepalive controls in the popover |
 | `keepaliveIntervalSeconds` | `240` | Persisted compatibility field; currently unused by manual keepalive |
 | `proxyInactivityTimeoutSeconds` | `900` | Persisted compatibility field; currently unused by manual keepalive |
-| `saveProxyEventLog` | `true` | Write event metadata to SQLite |
+| `saveProxyEventLog` | `true` | Enable proxy event logging and status snapshot writes; event metadata is stored in SQLite |
 | `saveProxyPayloads` | `false` | Capture request/response bodies for debugging; streaming responses are truncated to 4 MB |
 
 ## Data export
@@ -183,8 +183,9 @@ TokenPulse sends macOS notifications for important usage events:
 | **Primary window above 80%** | Utilization crosses the 80% threshold (entering red zone) |
 | **Primary quota reset** | The provider's primary quota window resets |
 | **Secondary quota reset** | The provider's secondary quota window resets |
+| **Proxy keepalive disabled** | A tracked Anthropic session loses manual keepalive availability |
 
-Notifications are sent per provider. Grant notification permission when prompted on first launch.
+Provider usage notifications are sent per provider, and proxy keepalive notifications are sent per tracked session. Grant notification permission when prompted on first launch.
 
 ## Project structure
 

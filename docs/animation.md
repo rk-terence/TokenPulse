@@ -3,7 +3,7 @@ title: Slash Animation
 description: State machine, timing, and rendering details for the menu bar slash traffic animation.
 ---
 
-The diagonal slash between the 5-hour and weekly utilization numbers in the menu bar icon doubles as a traffic indicator. When the local proxy forwards a request, the slash morphs from a static gray line into a glowing orange segment that bounces back and forth, then settles back to gray when traffic stops.
+The diagonal slash between the 5-hour and weekly utilization numbers in the menu bar icon doubles as a proxy traffic indicator. When the local proxy records traffic activity, including upload and download byte callbacks, the slash morphs from a static gray line into a glowing orange segment that bounces back and forth, then settles back to gray when traffic stops.
 
 # State machine
 
@@ -30,11 +30,11 @@ stateDiagram-v2
 | `waitingForCenter` | Segment coasts toward the center position | Segment reaches center (within epsilon) |
 | `stopping` | Segment expands back to full-width gray (morph 1 -> 0) | Morph reaches 0.0 |
 
-A traffic event arriving mid-animation re-triggers appropriately: during `bouncing` it resets the countdown, during `waitingForCenter` it jumps back to `bouncing`, during `stopping` it reverses to `starting`.
+A traffic event arriving mid-animation re-triggers appropriately: during `starting` it is ignored, during `bouncing` it resets the countdown, during `waitingForCenter` it jumps back to `bouncing`, and during `stopping` it reverses to `starting`. When `starting` completes, `bouncing` begins from a randomized center-origin direction and phase instead of resuming from a fixed endpoint.
 
 # SlashAnimation struct
 
-Passed from `StatusBarController` to `BarIconRenderer.drawSlash()` each frame:
+Passed from `StatusBarController` to `BarIconRenderer.drawSlash()` on animation ticks and on non-timer redraws, including initial icon setup, provider-driven icon updates, and the final redraw that returns the slash to idle after stopping:
 
 ```swift
 struct SlashAnimation {

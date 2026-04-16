@@ -3,10 +3,12 @@ title: Proxy Subsystem
 description: Architecture, request flow, manual keepalive behavior, retention, and event logging details for the local Anthropic/OpenAI proxy.
 ---
 
-The proxy is an optional local HTTP proxy that sits between AI tools and upstream APIs. It currently serves two routes on the same local port:
+The proxy is an optional local HTTP proxy that sits between AI tools and upstream APIs. It currently serves two route families on the same local port:
 
 - `POST /v1/messages` for Anthropic Messages traffic
 - `POST /v1/responses` for OpenAI Responses traffic
+
+Both handlers also accept query-string variants of those paths, such as `/v1/messages?foo=bar` and `/v1/responses?foo=bar`.
 
 It forwards requests transparently while adding two capabilities:
 
@@ -131,8 +133,8 @@ sequenceDiagram
 4. Request line and headers are parsed
 5. Content-Length is validated; body is accumulated if present
 6. Route validation accepts only:
-   - POST /v1/messages
-   - POST /v1/responses
+   - `POST /v1/messages` and query-string variants of that path
+   - `POST /v1/responses` and query-string variants of that path
    Known route + wrong method => 405
    Unknown route => 404
 7. NWResponseWriter is created and the request is dispatched
@@ -275,13 +277,13 @@ Those disable reasons are shown in the popover and logged to `proxy_lifecycle`.
 
 ## Cost economics
 
-Each manual keepalive processes the full Anthropic prompt through the cache but generates minimal output. The proxy uses the same high-level economics as before:
+Each manual keepalive processes the full Anthropic prompt through the cache but generates minimal output. The code still defines the same high-level economics model:
 
 - **keepalive cost**: about `0.10x` base input rate (cache read)
 - **avoided cache miss cost**: about `1.15x` base input rate versus paying another cache write
 - **aggregate savings metric**: `max(0, totalCacheReads * 1.15 - totalKeepalivesSent * 0.10)`
 
-`ProxyMetricsStore.totalCacheReads` is incremented from keepalive results only, so it serves as a proxy for avoided cache writes rather than all cache reads seen in real traffic.
+`ProxyMetricsStore` still exposes cache read/write counters and the savings formula, but the live forwarding path does not currently update those cache-specific aggregate counters. In the current implementation, forwarded requests record parsed cache token usage in per-request logs and per-session aggregates, while the global `cacheReads` / `cacheWrites` metrics and derived savings value are not actively driven by normal proxy traffic.
 
 # Error handling
 
@@ -410,13 +412,13 @@ Bodies are serialized as UTF-8 when possible, otherwise base64. Streaming captur
 ## Retention and pruning
 
 - maximum event age: 24 hours
-- prune sweep interval: every 5 minutes
+- prune check interval: at most once every 5 minutes, opportunistically on write
 - prune targets:
   - `proxy_requests`
   - `proxy_keepalives`
   - `proxy_lifecycle`
 - `proxy_request_content` is cascade-deleted with its parent `proxy_requests` row
-- `PRAGMA wal_checkpoint(PASSIVE)` runs after each prune sweep
+- `PRAGMA wal_checkpoint(PASSIVE)` runs after each prune pass
 
 ## Insert strategy
 
@@ -429,7 +431,7 @@ If the initial insert fails, the logger falls back to a standalone insert with t
 
 # Status snapshots
 
-The proxy writes an atomic JSON snapshot to `~/.tokenpulse/proxy_status.json` after each request completion and during proxy shutdown. The writes are throttled, so multiple completions inside the throttle window may collapse into one later snapshot.
+When `ProxyEventLogger` is enabled, the proxy writes an atomic JSON snapshot to `~/.tokenpulse/proxy_status.json` after forwarded proxy request completions and during forced proxy shutdown. Manual keepalive completions do not trigger snapshot writes. The writes are throttled, so multiple completions inside the throttle window may collapse into one later snapshot.
 
 ## Format
 
@@ -487,7 +489,7 @@ Legacy `proxyUpstreamURL` is still read during config migration and mapped to `a
 | Constraint | Value | Enforced by |
 |------------|-------|-------------|
 | Bind address | `127.0.0.1` (IPv4 loopback only) | `ProxyHTTPServer` |
-| Supported endpoints | `POST /v1/messages`, `POST /v1/responses` | `LocalProxyController.requestValidator` |
+| Supported endpoints | `POST /v1/messages` and `POST /v1/responses`, plus query-string variants of those paths | `LocalProxyController.requestValidator` |
 | Max Content-Length | 50 MB (`50_000_000`) | `ProxyHTTPServer.processRequest()` |
 | Max header size | 64 KB (`65_536`) | `ProxyHTTPServer.readRequest()` |
 | Tracked session retention | 24 hours since last activity for Anthropic and detected Codex/OpenAI sessions | `LocalProxyController.sessionRetentionSeconds` |
@@ -495,7 +497,7 @@ Legacy `proxyUpstreamURL` is still read during config migration and mapped to `a
 | Tracked session UI visibility | 10 minutes since last activity, or any in-flight request | `LocalProxyController.visibleSessionActivities(...)` |
 | Non-main-agent done request retention | 5 minutes | `LocalProxyController.sideTrafficDoneRetentionSeconds` + `ProxySessionStore.pruneStaleDoneRequests(...)` |
 | Event retention | 24 hours | `ProxyEventLogger.maxEventAge` |
-| Event prune sweep | Every 5 minutes | `ProxyEventLogger.pruneInterval` |
+| Event prune pass | Opportunistic on write after 5 minutes have elapsed since the last prune | `ProxyEventLogger.pruneInterval` |
 | Status snapshot throttle | 1 second minimum interval | `ProxyEventLogger.statusSnapshotThrottleInterval` |
 | Streaming capture for parsing/logging | 4 MB max | `ProxyForwarder.maxLoggedStreamingResponseBytes` |
 | Forwarding timeouts | 300s request / 600s resource | `ProxyForwarder` URLSession configuration |

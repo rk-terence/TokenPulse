@@ -31,7 +31,8 @@ Observed auth file shape:
 
 Notes:
 - TokenPulse currently uses the existing access token as-is
-- If the file is missing, unreadable, in API key mode, or missing token data, the provider is treated as unconfigured/auth-stale
+- If the auth file is missing, `auth_mode` is API key mode, or required token data is missing, the provider is treated as unconfigured
+- If auth data exists but cannot be parsed/read cleanly, TokenPulse treats it as stale auth and guides the user to refresh Codex sign-in state
 - A future enhancement is to replicate Codex CLI token refresh against `https://auth.openai.com/oauth/token`
 
 ## API endpoint
@@ -69,9 +70,10 @@ Observed response family:
 Field notes:
 - `primary_window` is mapped to TokenPulse's primary slot and shown as **5h**
 - `secondary_window` is mapped to TokenPulse's secondary slot and shown as **7d** / weekly
-- `used_percent` is a 0–100 percentage and used as-is (no normalization)
+- TokenPulse accepts either `used_percent` or `utilization` for window usage percentage; values are treated as 0–100 percentages
 - A 200 response missing both rate-limit windows is treated as an invalid response
-- `reset_after_seconds` is converted to an absolute reset date relative to fetch time
+- TokenPulse accepts either `reset_after_seconds` or `resets_at` for window reset timing
+- `reset_after_seconds` is converted to an absolute reset date relative to fetch time; `resets_at` is parsed directly using flexible ISO 8601 date handling
 - `plan_type` is surfaced in the popover as a tag when present
 
 ## Known issues
@@ -146,7 +148,7 @@ Headers:
 
 ## Rate limiting
 
-The `/api/oauth/usage` endpoint itself has rate limits. Minimum poll interval: 60 seconds. A possible strategy for handling 429 responses is exponential backoff with jitter (e.g. base 60s, max 300s).
+TokenPulse applies a global minimum poll interval clamp of 60 seconds across providers. The Claude `/api/oauth/usage` endpoint also has its own rate limits. If 429 handling needs to become more adaptive later, exponential backoff with jitter would be a reasonable future strategy.
 
 ## Known issues
 
@@ -164,7 +166,7 @@ Two authentication methods are used:
 
 1. **Management API key** (primary) — stored in macOS Keychain (service: `"TokenPulse-ZenMuxAPIKey"`). Obtained from the ZenMux dashboard and entered in **Settings > Providers > ZenMux**. Note: this is a **Management API Key**, not a standard API key. The ZenMux dashboard labels these separately.
 
-2. **Chrome session cookies** (supplementary) — extracted automatically from Chrome's encrypted cookie store via `ChromeCookieService`. Requires `ctoken`, `sessionId`, and `sessionId.sig` cookies for `zenmux.ai`. Used for the subscription summary endpoint which has no management API equivalent.
+2. **Chrome session cookies** (supplementary) — extracted automatically from Chrome's encrypted cookie store via `ChromeCookieService`. Requires `ctoken`, `sessionId`, and `sessionId.sig` cookies for `zenmux.ai`. Used only for the optional subscription summary endpoint, which has no management API equivalent.
 
 ## Endpoints
 
@@ -232,7 +234,7 @@ Field notes:
 
 ### 2. Subscription summary (Cookie API) — supplementary
 
-Discovered via Chrome DevTools inspection. Provides current billing cycle cost breakdown. Used to derive monthly utilization since the management API's `quota_monthly` lacks usage data.
+Discovered via Chrome DevTools inspection. Provides current billing cycle cost breakdown. This endpoint is optional and non-fatal: TokenPulse still functions without it, but monthly utilization can only be derived when this summary data is available alongside `quota_monthly.max_value_usd`.
 
 ```
 GET https://zenmux.ai/api/dashboard/cost/query/subscription_summary?ctoken=<CTOKEN>
@@ -263,7 +265,7 @@ Response:
 Field notes:
 - All numeric values are returned as **strings**, not numbers
 - `totalCost`: Total USD spent in the current billing cycle
-- Monthly utilization is derived as: `totalCost / quota_monthly.max_value_usd × 100`
+- Monthly utilization is derived as: `totalCost / quota_monthly.max_value_usd × 100`, but only when both summary data and `quota_monthly.max_value_usd` are available
 - Date query parameters (`startDate`, `endDate`) are accepted but **ignored** — the endpoint always returns data for the current billing cycle
 - **Unverified assumption**: data resets at billing cycle boundary. To be confirmed after 2026-04-20
 
