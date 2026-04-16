@@ -68,11 +68,11 @@ Create a clear, scoped task for a Codex `worker` subagent that includes:
 - Build verification expected
 - Any known risks, edge cases, or acceptance criteria the reviewer should later validate
 
-The brief must be self-contained. Tell the developer to read `.agents/skills/developer/SKILL.md`, `AGENTS.md`, and any task-specific docs it needs, but not to wander beyond the assigned scope.
+The brief must be self-contained. Tell the developer to use the `developer` skill by reading and following `.agents/skills/developer/SKILL.md`, then read `AGENTS.md` and any task-specific docs it needs, but not to wander beyond the assigned scope.
 
 ### Step 2: Spawn the developer
 
-Spawn a Codex `worker` subagent with the scoped task. Give it explicit file ownership, remind it that it is not alone in the codebase, and tell it not to revert edits it did not make. The developer should implement, verify, and report back with:
+Spawn a Codex `worker` subagent with the scoped task. In the prompt, explicitly tell it to activate the `developer` skill for the task. Give it explicit file ownership, remind it that it is not alone in the codebase, and tell it not to revert edits it did not make. The developer should implement, verify, and report back with:
 - Files created or modified
 - Summary of what was implemented
 - Verification result
@@ -80,7 +80,7 @@ Spawn a Codex `worker` subagent with the scoped task. Give it explicit file owne
 
 ### Step 3: Review the output
 
-Read all files the developer created or modified. Then spawn a separate reviewer subagent (use the default agent type unless there is a better fit) and tell it to read `.agents/skills/reviewer/SKILL.md`. Frame the review request with team context:
+Read all files the developer created or modified. Then spawn a separate reviewer subagent (use the default agent type unless there is a better fit) and explicitly tell it to activate the `reviewer` skill by reading and following `.agents/skills/reviewer/SKILL.md`. Frame the review request with team context:
 
 - State that the code was produced by a developer agent implementing a scoped task
 - List which files to review (paths)
