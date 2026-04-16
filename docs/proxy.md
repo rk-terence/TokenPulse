@@ -324,7 +324,7 @@ Events are persisted to `~/.tokenpulse/proxy_events.sqlite` using SQLite with WA
 - `foreign_keys = ON`
 - `synchronous = NORMAL`
 
-The database is opened lazily on first write. The actor provides serialization, so `SQLITE_OPEN_NOMUTEX` is used.
+The database is opened lazily on first write whenever `ProxyEventLogger` is enabled. In the current app wiring, that logger is created when either `saveProxyEventLog` or `saveProxyPayloads` is `true`, so payload capture alone still enables SQLite metadata writes and lifecycle persistence. The actor provides serialization, so `SQLITE_OPEN_NOMUTEX` is used.
 
 ## Tables
 
@@ -398,7 +398,7 @@ Stores lifecycle events:
 
 ### `proxy_request_content`
 
-Optional request/response capture table enabled by `saveProxyPayloads`. Request bodies are stored in full; streaming response bodies are truncated to 4 MB.
+Optional request/response capture table enabled by `saveProxyPayloads`. Request bodies are stored in full; streaming response bodies are truncated to 4 MB. This table is additive: enabling payload capture also enables the same `ProxyEventLogger` instance that writes `proxy_requests`, `proxy_keepalives`, `proxy_lifecycle`, and status snapshots.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -431,7 +431,7 @@ If the initial insert fails, the logger falls back to a standalone insert with t
 
 # Status snapshots
 
-When `ProxyEventLogger` is enabled, the proxy writes an atomic JSON snapshot to `~/.tokenpulse/proxy_status.json` after forwarded proxy request completions and during forced proxy shutdown. Manual keepalive completions do not trigger snapshot writes. The writes are throttled, so multiple completions inside the throttle window may collapse into one later snapshot.
+When `ProxyEventLogger` is enabled, the proxy writes an atomic JSON snapshot to `~/.tokenpulse/proxy_status.json` after forwarded proxy request completions and during forced proxy shutdown. In the current implementation, `ProxyEventLogger` is enabled whenever either `saveProxyEventLog` or `saveProxyPayloads` is enabled, so payload capture by itself still turns on status snapshots and SQLite metadata writes. Manual keepalive completions do not trigger snapshot writes. The writes are throttled, so multiple completions inside the throttle window may collapse into one later snapshot.
 
 ## Format
 
@@ -479,8 +479,8 @@ Proxy settings live in `~/.tokenpulse/config.json` and are managed by `ConfigSer
 | `keepaliveEnabled` | Bool | `false` | Shows per-session manual keepalive controls in the popover for Anthropic Messages traffic |
 | `keepaliveIntervalSeconds` | Int | `240` | Persisted compatibility field; currently unused by the manual keepalive flow |
 | `proxyInactivityTimeoutSeconds` | Int | `900` | Persisted compatibility field; currently unused by the manual keepalive flow |
-| `saveProxyEventLog` | Bool | `true` | Whether to persist proxy metadata to SQLite |
-| `saveProxyPayloads` | Bool | `false` | Whether to capture full request/response payloads in `proxy_request_content` |
+| `saveProxyEventLog` | Bool | `true` | Whether to persist proxy metadata to SQLite; also contributes to enabling `ProxyEventLogger` |
+| `saveProxyPayloads` | Bool | `false` | Whether to capture full request/response payloads in `proxy_request_content`; also enables `ProxyEventLogger`, which means metadata rows and status snapshots are still written even if `saveProxyEventLog` is `false` |
 
 Legacy `proxyUpstreamURL` is still read during config migration and mapped to `anthropicUpstreamURL`.
 
@@ -492,10 +492,14 @@ Legacy `proxyUpstreamURL` is still read during config migration and mapped to `a
 | Supported endpoints | `POST /v1/messages` and `POST /v1/responses`, plus query-string variants of those paths | `LocalProxyController.requestValidator` |
 | Max Content-Length | 50 MB (`50_000_000`) | `ProxyHTTPServer.processRequest()` |
 | Max header size | 64 KB (`65_536`) | `ProxyHTTPServer.readRequest()` |
-| Tracked session retention | 24 hours since last activity for Anthropic and detected Codex/OpenAI sessions | `LocalProxyController.sessionRetentionSeconds` |
-| `other` session retention | 60 seconds since last activity | `LocalProxyController.otherTrafficRetentionSeconds` |
+| Tracked Anthropic session retention | 24 hours since last activity after lineage is established; before that, the session uses the short retention path | `LocalProxyController.sessionRetentionSeconds` + `ProxySessionID.usesShortRetentionWindow(...)` |
+| Tracked OpenAI/Codex session retention | 24 hours since last activity | `LocalProxyController.sessionRetentionSeconds` + `ProxySessionID.usesShortRetentionWindow(...)` |
+| `other` session retention | 60 seconds since last activity | `LocalProxyController.otherTrafficRetentionSeconds` + `ProxySessionID.usesShortRetentionWindow(...)` |
 | Tracked session UI visibility | 10 minutes since last activity, or any in-flight request | `LocalProxyController.visibleSessionActivities(...)` |
-| Non-main-agent done request retention | 5 minutes | `LocalProxyController.sideTrafficDoneRetentionSeconds` + `ProxySessionStore.pruneStaleDoneRequests(...)` |
+| Anthropic main-agent done request retention | Session lifetime unless replaced by a newer same-lineage superset prompt | `ProxySessionStore.insertDoneRequest(...)` + `ProxySessionStore.replacementIndex(...)` |
+| Anthropic non-main-agent done request retention | 5 minutes after lineage is established; before that, the session uses the short done-request path | `LocalProxyController.sideTrafficDoneRetentionSeconds` + `ProxySessionID.usesShortDoneRequestRetentionWindow(...)` + `ProxySessionStore.pruneStaleDoneRequests(...)` |
+| OpenAI/Codex done request retention | 60 seconds even though the tracked session summary persists on the 24-hour window | `LocalProxyController.otherTrafficRetentionSeconds` + `ProxySessionID.usesShortDoneRequestRetentionWindow(...)` |
+| `other` done request retention | 60 seconds | `LocalProxyController.otherTrafficRetentionSeconds` + `ProxySessionID.usesShortDoneRequestRetentionWindow(...)` |
 | Event retention | 24 hours | `ProxyEventLogger.maxEventAge` |
 | Event prune pass | Opportunistic on write after 5 minutes have elapsed since the last prune | `ProxyEventLogger.pruneInterval` |
 | Status snapshot throttle | 1 second minimum interval | `ProxyEventLogger.statusSnapshotThrottleInterval` |

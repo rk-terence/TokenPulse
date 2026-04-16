@@ -25,7 +25,6 @@ ditto "$(xcodebuild -scheme TokenPulse -configuration Release -showBuildSettings
 
 ## Code conventions
 
-- When spawning subagents, set the model to `gpt-5.4`. Choose the reasoning effort level to fit the task.
 - Swift strict concurrency checking is enabled. Resolve warnings, not just errors.
 - Prefer async/await over completion handlers.
 - Use `@Observable` for state, not `ObservableObject` or Combine.
@@ -33,6 +32,9 @@ ditto "$(xcodebuild -scheme TokenPulse -configuration Release -showBuildSettings
 - No force unwraps except in tests.
 - Localize all user-facing strings with `NSLocalizedString` or `String(localized:)`.
 - Use conventional commits: `feat: short description`, `fix: short description`, `docs: short description`, and similar.
+
+> For Codex:
+> - When spawning subagents, set the model to `gpt-5.4`. Choose the reasoning effort level to fit the task.
 
 ## Product invariants
 
@@ -47,4 +49,4 @@ ditto "$(xcodebuild -scheme TokenPulse -configuration Release -showBuildSettings
 - Proxy must listen on `127.0.0.1` only, never all interfaces.
 - Keepalive send is manual-only in the current implementation. No background keepalive loops.
 - Event logging uses SQLite with WAL mode and 24-hour retention.
-- Proxy status snapshots are written only when proxy logging is enabled and should stay throttled.
+- Proxy status snapshots are written whenever proxy logging infrastructure is enabled (currently if either `saveProxyEventLog` or `saveProxyPayloads` is enabled) and should stay throttled.

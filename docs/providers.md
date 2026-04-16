@@ -31,8 +31,9 @@ Observed auth file shape:
 
 Notes:
 - TokenPulse currently uses the existing access token as-is
+- If `CODEX_HOME` is set, `auth.json` must exist there; TokenPulse does not fall back to `~/.codex/auth.json`
 - If the auth file is missing, `auth_mode` is API key mode, or required token data is missing, the provider is treated as unconfigured
-- If auth data exists but cannot be parsed/read cleanly, TokenPulse treats it as stale auth and guides the user to refresh Codex sign-in state
+- If auth data exists but cannot be read or parsed cleanly, the provider reports an unreadable login configuration state and prompts the user to run `codex login` again
 - A future enhancement is to replicate Codex CLI token refresh against `https://auth.openai.com/oauth/token`
 
 ## API endpoint

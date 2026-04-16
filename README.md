@@ -22,7 +22,7 @@ A macOS menu bar app that monitors AI platform token usage and optimizes API cos
 - **Streaming support** — Full HTTP/1.1 proxy with SSE streaming passthrough; parses token usage from both JSON and SSE responses
 - **Traffic indicator** — Menu bar slash animates with a bouncing glow when the proxy is forwarding requests
 - **Event logging** — Structured SQLite event log with 24-hour retention; optional request/response capture in SQLite for debugging
-- **Status snapshots** — Atomic JSON snapshots at `~/.tokenpulse/proxy_status.json` for external tooling when proxy logging is enabled
+- **Status snapshots** — Atomic JSON snapshots at `~/.tokenpulse/proxy_status.json` for external tooling whenever proxy logging infrastructure is enabled (`saveProxyEventLog` or `saveProxyPayloads`)
 
 ### General
 
@@ -34,7 +34,7 @@ A macOS menu bar app that monitors AI platform token usage and optimizes API cos
 
 | Provider | Auth method | What it shows |
 |----------|-------------|---------------|
-| **Codex** | Local Codex ChatGPT login (`$CODEX_HOME/auth.json`, then `~/.codex/auth.json`) | 5h window, weekly window, plan tier |
+| **Codex** | Local Codex ChatGPT login (`$CODEX_HOME/auth.json` when `CODEX_HOME` is set; otherwise `~/.codex/auth.json`) | 5h window, weekly window, plan tier |
 | **Claude** (Anthropic) | Keychain (Claude Code OAuth token) | 5h window, 7-day quota, Opus quota |
 | **ZenMux** | Management API key + Chrome cookies (auto-extracted) | 5h window, 7-day quota, monthly utilization*, tier, account status |
 
@@ -46,7 +46,7 @@ A macOS menu bar app that monitors AI platform token usage and optimizes API cos
 - **ZenMux support** — TokenPulse supports ZenMux out of the box via their official Management API. ZenMux is a niche provider that CodexBar doesn't cover, and likely too niche for them to want to maintain.
 - **One glance, no mode switch** — CodexBar shows two stacked bars per provider with multiple display modes. TokenPulse shows the primary and secondary window percentages directly in the icon, so you can read current utilization without opening a detail view.
 - **Minimal by design** — TokenPulse is ~28 source files with a simple `UsageProvider` protocol and an actor-based proxy subsystem. No SwiftSyntax macros, no helper processes, no multi-strategy fallback chains. The entire codebase is easy to audit, fork, and modify.
-- **Machine-readable output** — Every poll cycle writes a normalized provider snapshot to `~/.tokenpulse/raw_usage.json`, and the proxy can write status snapshots to `~/.tokenpulse/proxy_status.json` when proxy logging is enabled. Shell scripts and external tools can consume both without scraping or IPC.
+- **Machine-readable output** — Every poll cycle writes a normalized provider snapshot to `~/.tokenpulse/raw_usage.json`, and the proxy can write status snapshots to `~/.tokenpulse/proxy_status.json` whenever proxy logging infrastructure is enabled. Shell scripts and external tools can consume both without scraping or IPC.
 
 If you use many AI providers and want comprehensive coverage, use CodexBar. If you use Codex, Claude, and/or ZenMux and want something small and direct — especially with cost optimization through cache-warming — TokenPulse is for you.
 
@@ -78,13 +78,13 @@ TokenPulse reads your Claude Code OAuth credentials from the macOS Keychain auto
 
 ### Codex provider
 
-TokenPulse reads your existing Codex ChatGPT login from `$CODEX_HOME/auth.json` first, then falls back to `~/.codex/auth.json`. To set it up:
+TokenPulse reads your existing Codex ChatGPT login from `$CODEX_HOME/auth.json` when `CODEX_HOME` is set. If `CODEX_HOME` is not set, it reads `~/.codex/auth.json`. There is no fallback to `~/.codex/auth.json` when `CODEX_HOME` is set. To set it up:
 
 1. Install the Codex CLI and sign in with ChatGPT via `codex login`
 2. Open **Settings > Providers** and enable **Codex**
 3. Refresh TokenPulse
 
-If your Codex CLI is currently using API key billing, run `codex login` to switch to your ChatGPT subscription.
+If your Codex CLI is currently using API key billing, or TokenPulse shows the Codex provider as not connected because the auth file is unreadable or missing token data, run `codex login` to refresh your ChatGPT subscription login.
 
 ### ZenMux provider
 
@@ -137,7 +137,7 @@ When TokenPulse establishes Anthropic lineage for a session, the popover can exp
 
 ### Observability
 
-When proxy logging is enabled, the proxy writes structured event logs to `~/.tokenpulse/proxy_events.sqlite` (SQLite, WAL mode) and atomic status snapshots to `~/.tokenpulse/proxy_status.json` (throttled to 1-second intervals). Events are pruned after 24 hours with 5-minute sweep cycles.
+When proxy logging infrastructure is enabled, the proxy writes structured event logs to `~/.tokenpulse/proxy_events.sqlite` (SQLite, WAL mode) and atomic status snapshots to `~/.tokenpulse/proxy_status.json` (throttled to 1-second intervals). This infrastructure is enabled whenever either `saveProxyEventLog` or `saveProxyPayloads` is on. Events are pruned after 24 hours with 5-minute sweep cycles.
 
 Optional payload capture stores full request bodies plus response bodies in the `proxy_request_content` table inside `~/.tokenpulse/proxy_events.sqlite` (disabled by default). Streaming response capture is truncated to 4 MB per request.
 
@@ -156,8 +156,8 @@ All fields are in `~/.tokenpulse/config.json`:
 | `keepaliveEnabled` | `false` | Show per-session manual keepalive controls in the popover |
 | `keepaliveIntervalSeconds` | `240` | Persisted compatibility field; currently unused by manual keepalive |
 | `proxyInactivityTimeoutSeconds` | `900` | Persisted compatibility field; currently unused by manual keepalive |
-| `saveProxyEventLog` | `true` | Enable proxy event logging and status snapshot writes; event metadata is stored in SQLite |
-| `saveProxyPayloads` | `false` | Capture request/response bodies for debugging; streaming responses are truncated to 4 MB |
+| `saveProxyEventLog` | `true` | Enable proxy logging infrastructure, including SQLite event metadata and status snapshot writes |
+| `saveProxyPayloads` | `false` | Capture request/response bodies for debugging; also enables proxy logging infrastructure if it was otherwise off. Streaming responses are truncated to 4 MB |
 
 ## Data export
 
