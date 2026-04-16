@@ -48,6 +48,19 @@ private enum RefreshTimeoutError: LocalizedError {
     }
 }
 
+@MainActor
+private final class SettingsWindowDelegate: NSObject, NSWindowDelegate {
+    private let onClose: () -> Void
+
+    init(onClose: @escaping () -> Void) {
+        self.onClose = onClose
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        onClose()
+    }
+}
+
 @Observable
 @MainActor
 final class ProviderManager {
@@ -63,6 +76,7 @@ final class ProviderManager {
     private var inFlightRefreshes: [String: Task<Void, Never>] = [:]
     private var inFlightTriggers: [String: RefreshTrigger] = [:]
     private var settingsWindow: NSWindow?
+    private var settingsWindowDelegate: SettingsWindowDelegate?
 
     var proxyController: LocalProxyController?
 
@@ -94,10 +108,18 @@ final class ProviderManager {
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
         window.minSize = NSSize(width: 820, height: 620)
         window.setContentSize(NSSize(width: 920, height: 700))
+        let delegate = SettingsWindowDelegate { [weak self, weak window] in
+            guard let self else { return }
+            guard self.settingsWindow === window else { return }
+            self.settingsWindow = nil
+            self.settingsWindowDelegate = nil
+        }
+        window.delegate = delegate
         window.center()
         window.level = .normal
         window.makeKeyAndOrderFront(nil)
         settingsWindow = window
+        settingsWindowDelegate = delegate
     }
 
     func register(_ provider: any UsageProvider) {
