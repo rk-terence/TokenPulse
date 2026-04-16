@@ -618,11 +618,9 @@ private struct SessionActivityRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            // Session ID (abbreviated) + completed / keepalive / errored counts
+            // Coding agent + abbreviated session ID + completed / keepalive / errored counts
             HStack(spacing: 0) {
-                Text(activity.rowTitle)
-                    .font(activity.isOtherTraffic ? .callout : .callout.monospaced())
-                    .foregroundStyle(.secondary)
+                sessionTitle
                 Spacer()
                 sessionStats
             }
@@ -670,6 +668,29 @@ private struct SessionActivityRow: View {
 
             keepaliveSection
         }
+    }
+
+    @ViewBuilder
+    private var sessionTitle: some View {
+        if let agentName = activity.agentName,
+           !activity.isOtherTraffic {
+            Text(localizedTrackedSessionTitle(agentName: agentName, shortID: activity.shortID))
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        } else {
+            Text(activity.rowTitle)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func localizedTrackedSessionTitle(agentName: String, shortID: String) -> String {
+        let format = NSLocalizedString(
+            "proxy.session.title",
+            value: "%1$@ %2$@",
+            comment: "Proxy popup session row title: agent name and abbreviated session ID"
+        )
+        return String(format: format, locale: Locale.current, agentName, shortID)
     }
 
     @ViewBuilder

@@ -24,6 +24,15 @@ enum ProxyAPIFlavor: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    var sessionAgentName: String {
+        switch self {
+        case .anthropicMessages:
+            return String(localized: "Claude Code")
+        case .openAIResponses:
+            return String(localized: "Codex")
+        }
+    }
+
     var supportsKeepalive: Bool {
         switch self {
         case .anthropicMessages:

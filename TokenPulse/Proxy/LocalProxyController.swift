@@ -41,6 +41,7 @@ final class LocalProxyController {
         var displayID: String { ProxySessionID.displayID(for: sessionID) }
         /// First 8 characters of the display session ID — enough to distinguish sessions in the UI.
         var shortID: String { ProxySessionID.shortDisplayID(for: sessionID) }
+        var agentName: String? { apiFlavor?.sessionAgentName }
         var rowTitle: String {
             ProxySessionID.isOther(sessionID) ? displayID : shortID
         }
