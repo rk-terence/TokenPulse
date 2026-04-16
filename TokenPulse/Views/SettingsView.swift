@@ -265,86 +265,100 @@ private struct ProxyTab: View {
             set: { newValue in
                 config.proxyEnabled = newValue
                 if newValue {
-                    proxyController?.start(
-                        port: config.proxyPort,
-                        anthropicUpstreamURL: config.anthropicUpstreamURL,
-                        openAIUpstreamURL: config.openAIUpstreamURL
-                    )
+                    startProxy()
                 } else {
-                    proxyController?.stop()
+                    stopProxy()
                 }
             }
         )
     }
 
     var body: some View {
-        Form {
-            Section(String(localized: "Local Proxy")) {
-                Toggle(String(localized: "Enable local proxy"), isOn: proxyEnabledBinding)
-                if config.proxyEnabled {
-                    TextField(String(localized: "Anthropic upstream URL"), text: $config.anthropicUpstreamURL)
-                        .textFieldStyle(.roundedBorder)
+        VStack(spacing: 0) {
+            Form {
+                Section(String(localized: "Local Proxy")) {
+                    Toggle(String(localized: "Enable local proxy"), isOn: proxyEnabledBinding)
+                    if config.proxyEnabled {
+                        TextField(String(localized: "Anthropic upstream URL"), text: $config.anthropicUpstreamURL)
+                            .textFieldStyle(.roundedBorder)
 
-                    TextField(String(localized: "OpenAI upstream URL"), text: $config.openAIUpstreamURL)
-                        .textFieldStyle(.roundedBorder)
+                        TextField(String(localized: "OpenAI upstream URL"), text: $config.openAIUpstreamURL)
+                            .textFieldStyle(.roundedBorder)
 
-                    TextField(String(localized: "Port"), text: $portText)
-                        .textFieldStyle(.roundedBorder)
-                    Text(String(
-                        format: NSLocalizedString(
-                            "proxy.settings.restartRoute",
-                            value: "Restart the proxy to apply upstream URL changes. The proxy serves %@ and %@ on the same local port.",
-                            comment: ""
-                        ),
-                        ProxyAPIFlavor.anthropicMessages.supportedRouteDescription,
-                        ProxyAPIFlavor.openAIResponses.supportedRouteDescription
-                    ))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    Divider()
-
-                    Toggle(String(localized: "Enable keepalive controls"), isOn: $config.keepaliveEnabled)
-                    Text(String(localized: "Shows per-session keepalive controls in the activity popover. Keepalive applies only to Anthropic Messages traffic."))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    Divider()
-
-                    Toggle(String(localized: "Save event log"), isOn: $config.saveProxyEventLog)
-                    if config.saveProxyEventLog {
-                        Text(String(localized: "Saves proxy metadata to ~/.tokenpulse/proxy_events.sqlite (proxy_requests, proxy_keepalives, proxy_lifecycle tables), including request timing, status, cache metrics, and upstream request IDs. Prompt and response content are excluded unless Capture all content is enabled. Restart the proxy to apply."))
+                        TextField(String(localized: "Port"), text: $portText)
+                            .textFieldStyle(.roundedBorder)
+                        Text(String(
+                            format: NSLocalizedString(
+                                "proxy.settings.restartRoute",
+                                value: "Restart the proxy to apply upstream URL changes. The proxy serves %@ and %@ on the same local port.",
+                                comment: ""
+                            ),
+                            ProxyAPIFlavor.anthropicMessages.supportedRouteDescription,
+                            ProxyAPIFlavor.openAIResponses.supportedRouteDescription
+                        ))
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                    }
 
-                    Toggle(String(localized: "Capture all content"), isOn: $config.saveProxyPayloads)
-                    if config.saveProxyPayloads {
-                        Text(String(localized: "Saves full proxy request and response headers and bodies to the proxy_request_content table in ~/.tokenpulse/proxy_events.sqlite, linked to per-request rows. These records contain your prompts, conversation content, and model outputs. Restart the proxy to apply."))
+                        Divider()
+
+                        Toggle(String(localized: "Enable keepalive controls"), isOn: $config.keepaliveEnabled)
+                        Text(String(localized: "Shows per-session keepalive controls in the activity popover. Keepalive applies only to Anthropic Messages traffic."))
                             .font(.caption)
-                            .foregroundStyle(.orange)
-                    }
-                }
-            }
+                            .foregroundStyle(.secondary)
 
-            if let controller = proxyController, controller.isRunning {
-                Section(String(localized: "Status")) {
-                    LabeledContent(String(localized: "Port")) {
-                        Text("\(controller.listeningPort)")
-                            .monospacedDigit()
+                        Divider()
+
+                        Toggle(String(localized: "Save event log"), isOn: $config.saveProxyEventLog)
+                        if config.saveProxyEventLog {
+                            Text(String(localized: "Saves proxy metadata to ~/.tokenpulse/proxy_events.sqlite (proxy_requests, proxy_keepalives, proxy_lifecycle tables), including request timing, status, cache metrics, and upstream request IDs. Prompt and response content are excluded unless Capture all content is enabled. Restart the proxy to apply."))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Toggle(String(localized: "Capture all content"), isOn: $config.saveProxyPayloads)
+                        if config.saveProxyPayloads {
+                            Text(String(localized: "Saves full proxy request and response headers and bodies to the proxy_request_content table in ~/.tokenpulse/proxy_events.sqlite, linked to per-request rows. These records contain your prompts, conversation content, and model outputs. Restart the proxy to apply."))
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        }
                     }
-                    LabeledContent(String(localized: "Active sessions")) {
-                        Text("\(controller.proxyStatus.activeSessions)")
-                            .monospacedDigit()
-                    }
-                    LabeledContent(String(localized: "Requests forwarded")) {
-                        Text("\(controller.proxyStatus.totalRequestsForwarded)")
-                            .monospacedDigit()
+                }
+
+                if let controller = proxyController, controller.isRunning {
+                    Section(String(localized: "Status")) {
+                        LabeledContent(String(localized: "Port")) {
+                            Text("\(controller.listeningPort)")
+                                .monospacedDigit()
+                        }
+                        LabeledContent(String(localized: "Active sessions")) {
+                            Text("\(controller.proxyStatus.activeSessions)")
+                                .monospacedDigit()
+                        }
+                        LabeledContent(String(localized: "Requests forwarded")) {
+                            Text("\(controller.proxyStatus.totalRequestsForwarded)")
+                                .monospacedDigit()
+                        }
                     }
                 }
             }
+            .formStyle(.grouped)
+
+            Divider()
+
+            HStack(alignment: .center) {
+                Text(String(localized: "Use restart after changing proxy settings that apply only on startup."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    restartProxy()
+                } label: {
+                    Label(String(localized: "Restart Proxy"), systemImage: "arrow.clockwise")
+                }
+                .disabled(!canRestartProxy)
+            }
+            .padding(.top, 12)
         }
-        .formStyle(.grouped)
         .onAppear {
             portText = String(config.proxyPort)
         }
@@ -356,5 +370,27 @@ private struct ProxyTab: View {
                 portText = String(config.proxyPort)
             }
         }
+    }
+
+    private var canRestartProxy: Bool {
+        config.proxyEnabled && proxyController != nil
+    }
+
+    private func startProxy() {
+        proxyController?.start(
+            port: config.proxyPort,
+            anthropicUpstreamURL: config.anthropicUpstreamURL,
+            openAIUpstreamURL: config.openAIUpstreamURL
+        )
+    }
+
+    private func stopProxy() {
+        proxyController?.stop()
+    }
+
+    private func restartProxy() {
+        guard canRestartProxy else { return }
+        stopProxy()
+        startProxy()
     }
 }

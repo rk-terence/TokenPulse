@@ -817,6 +817,14 @@ private struct SessionActivityRow: View {
 private struct RequestActivityRow: View {
     let request: ProxyRequestActivity
 
+    private enum StatField {
+        static let timingLabelWidth = 4
+        static let valueWidth = 6
+        static let outputValueWidth = 5
+        static let durationWidth = 4
+        static let costWidth = 5
+    }
+
     private var rowFont: Font { .callout.monospaced() }
 
     var body: some View {
@@ -890,7 +898,7 @@ private struct RequestActivityRow: View {
                 .foregroundStyle(.secondary)
                 .italic()
             if let ttft = timeToFirstToken {
-                Text(paddedLabel("ttft", width: 4))
+                Text(paddedLabel("ttft", width: StatField.timingLabelWidth))
                     .font(rowFont)
                     .foregroundStyle(.tertiary)
                 Text(formattedDuration(ttft))
@@ -911,12 +919,12 @@ private struct RequestActivityRow: View {
                 Text("\u{2193}")
                     .font(rowFont)
                     .foregroundStyle(.tertiary)
-                Text(formattedTokenCount(outputK))
+                Text(formattedTokenCount(outputK, width: StatField.outputValueWidth))
                     .font(rowFont)
                     .foregroundStyle(.secondary)
             }
             if let e2e = endToEndDuration {
-                Text(paddedLabel("e2e", width: 4))
+                Text(paddedLabel("e2e", width: StatField.timingLabelWidth))
                     .font(rowFont)
                     .foregroundStyle(.tertiary)
                 Text(formattedDuration(e2e))
@@ -1017,26 +1025,30 @@ private struct RequestActivityRow: View {
         formattedScaledField(
             value: Double(max(0, bytes)),
             units: ["B", "KB", "MB", "GB", "TB", "PB"],
-            totalWidth: 6,
+            totalWidth: StatField.valueWidth,
             allowFractionInBaseUnit: false
         )
     }
 
     private func formattedTokenCount(_ tokens: Int) -> String {
+        formattedTokenCount(tokens, width: StatField.valueWidth)
+    }
+
+    private func formattedTokenCount(_ tokens: Int, width: Int) -> String {
         formattedScaledField(
             value: Double(max(0, tokens)),
             units: ["", "K", "M", "B", "T", "P", "E"],
-            totalWidth: 6,
+            totalWidth: width,
             allowFractionInBaseUnit: false
         )
     }
 
     private func formattedDuration(_ seconds: TimeInterval) -> String {
-        formattedCompactDuration(seconds, width: 4)
+        formattedCompactDuration(seconds, width: StatField.durationWidth)
     }
 
     private func formatCost(_ cost: Double) -> String {
-        formattedFixedWidthNumber(max(0, cost), width: 5)
+        formattedFixedWidthNumber(max(0, cost), width: StatField.costWidth)
     }
 
     private func formattedScaledField(
