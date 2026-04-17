@@ -704,7 +704,8 @@ enum ModelPricingTable {
         "gpt-4.1":           ModelPricing(inputPerMTok: 2.0, outputPerMTok: 8.0, cacheReadPerMTok: 0.50, cacheWritePerMTok: 0),
         "gpt-4o-mini":       ModelPricing(inputPerMTok: 0.15, outputPerMTok: 0.60, cacheReadPerMTok: 0.075, cacheWritePerMTok: 0),
         "gpt-4o":            ModelPricing(inputPerMTok: 2.50, outputPerMTok: 10.0, cacheReadPerMTok: 1.25, cacheWritePerMTok: 0),
-        // Opus 4.6 / 4.5 — $5 / $25
+        // Opus 4.7 / 4.6 / 4.5 — $5 / $25
+        "claude-opus-4-7":   ModelPricing(inputPerMTok: 5,  outputPerMTok: 25, cacheReadPerMTok: 0.50, cacheWritePerMTok: 6.25),
         "claude-opus-4-6":   ModelPricing(inputPerMTok: 5,  outputPerMTok: 25, cacheReadPerMTok: 0.50, cacheWritePerMTok: 6.25),
         "claude-opus-4-5":   ModelPricing(inputPerMTok: 5,  outputPerMTok: 25, cacheReadPerMTok: 0.50, cacheWritePerMTok: 6.25),
         // Opus 4.1 — $15 / $75

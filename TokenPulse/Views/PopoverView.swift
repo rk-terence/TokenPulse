@@ -1029,10 +1029,27 @@ private struct RequestActivityRow: View {
         ]
 
         for entry in compactLabels where normalized.contains(entry.needle) {
-            return shortenedModelLabel(entry.label, maxCharacters: StatField.modelLabelWidth)
+            let versioned = claudeLabelWithVersion(label: entry.label, needle: entry.needle, in: normalized)
+            return shortenedModelLabel(versioned, maxCharacters: StatField.modelLabelWidth)
         }
 
         return shortenedModelLabel(modelID.isEmpty ? rawModelID : modelID, maxCharacters: StatField.modelLabelWidth)
+    }
+
+    private func claudeLabelWithVersion(label: String, needle: String, in normalized: String) -> String {
+        let pattern = "\(needle)[-_]?(\\d+)(?:[-_](\\d+))?"
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+              let match = regex.firstMatch(in: normalized, range: NSRange(normalized.startIndex..., in: normalized)),
+              match.numberOfRanges >= 2,
+              let majorRange = Range(match.range(at: 1), in: normalized) else {
+            return label
+        }
+        var versioned = "\(label)-\(normalized[majorRange])"
+        if match.numberOfRanges >= 3,
+           let minorRange = Range(match.range(at: 2), in: normalized) {
+            versioned += ".\(normalized[minorRange])"
+        }
+        return versioned
     }
 
     private func shortenedModelLabel(_ label: String, maxCharacters: Int) -> String {
