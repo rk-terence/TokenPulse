@@ -114,13 +114,26 @@ actor ProxySessionStore {
     private var cumulativeEstimatedCostUSD: Double = 0
     private var cumulativeEstimatedCostUSDByAPI: [ProxyAPIFlavor: Double] = [:]
 
-    /// Callback fired when data traffic occurs (upload start or download chunk).
+    /// Callback fired on every state change that should refresh the UI.
+    /// The `TrafficDirection?` argument is non-nil when the event corresponds
+    /// to actual bytes flowing (for driving the menu bar arrow animations);
+    /// it is nil for bookkeeping updates that should still refresh listeners
+    /// but not animate traffic arrows.
     /// Called from within the actor — callers should dispatch to MainActor as needed.
-    private var onTraffic: (@Sendable () -> Void)?
+    private var onTraffic: (@Sendable (TrafficDirection?) -> Void)?
+    /// Fired once per request when it finalizes (success or error). Used by the
+    /// menu bar icon to spawn a cost-transformation particle, independent of
+    /// the byte-level traffic animation.
+    private var onRequestDone: (@Sendable () -> Void)?
 
     /// Set the traffic callback. Called from outside the actor isolation.
-    func setTrafficCallback(_ callback: @escaping @Sendable () -> Void) {
+    func setTrafficCallback(_ callback: @escaping @Sendable (TrafficDirection?) -> Void) {
         onTraffic = callback
+    }
+
+    /// Set the request-done callback. Called from outside the actor isolation.
+    func setRequestDoneCallback(_ callback: @escaping @Sendable () -> Void) {
+        onRequestDone = callback
     }
 
     /// Resolve an incoming request identity into the session bucket used by the UI and metrics.
@@ -645,7 +658,7 @@ actor ProxySessionStore {
             lastKeepaliveRequestBySession.removeValue(forKey: resolvedSessionID)
         }
         activeRequests[id] = (sessionID: resolvedSessionID, activity: activity)
-        onTraffic?()
+        onTraffic?(.upload)
     }
 
     /// Transition a request from `.uploading` to `.waiting` once the upload is complete.
@@ -655,7 +668,7 @@ actor ProxySessionStore {
         entry.activity.state = .waiting
         entry.activity.lastDataAt = Date()
         activeRequests[id] = entry
-        onTraffic?()
+        onTraffic?(nil)
     }
 
     /// Transition a request from `.uploading` or `.waiting` to `.receiving` once response headers arrive.
@@ -666,7 +679,7 @@ actor ProxySessionStore {
         entry.activity.lastDataAt = Date()
         entry.activity.receivingStartedAt = Date()
         activeRequests[id] = entry
-        onTraffic?()
+        onTraffic?(.download)
     }
 
     /// Record the timestamp of the first upstream data chunk (once per request).
@@ -685,7 +698,7 @@ actor ProxySessionStore {
         guard var entry = activeRequests[id] else { return }
         entry.activity.bytesSent = totalBytesSent
         activeRequests[id] = entry
-        onTraffic?()
+        onTraffic?(.upload)
     }
 
     /// Accumulate bytes received and refresh the last-data timestamp.
@@ -695,7 +708,7 @@ actor ProxySessionStore {
         entry.activity.lastDataAt = Date()
         activeRequests[id] = entry
         totalBytesReceived += additionalBytes
-        onTraffic?()
+        onTraffic?(.download)
     }
 
     /// Record bytes sent upstream for a new request (call once per request at start).
@@ -745,7 +758,13 @@ actor ProxySessionStore {
             }
             sessions[resolvedSessionID] = session
         }
-        onTraffic?()
+        onTraffic?(nil)
+        // Only successful completions spawn the cost-transformation particle.
+        // 4xx/5xx/transport failures typically don't accrue provider cost,
+        // so animating them would be a false positive.
+        if isComplete {
+            onRequestDone?()
+        }
     }
 
     /// Return a snapshot of all sessions with their stats and in-flight requests,
@@ -844,7 +863,7 @@ actor ProxySessionStore {
         guard let index = doneRequests.firstIndex(where: { $0.id == requestID }) else { return }
         doneRequests[index].isMainAgentShaped = false
         doneRequestsBySession[resolvedSessionID] = doneRequests
-        onTraffic?()
+        onTraffic?(nil)
     }
 
     private func insertDoneRequest(_ activity: ProxyRequestActivity, for sessionID: String) {

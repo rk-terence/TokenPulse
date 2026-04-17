@@ -1,5 +1,13 @@
 import Foundation
 
+/// Direction of proxy byte flow relative to the local machine.
+/// `.upload` = request body bytes leaving the proxy toward upstream.
+/// `.download` = response bytes arriving from upstream.
+enum TrafficDirection: Sendable {
+    case upload
+    case download
+}
+
 enum ProxyAPIFlavor: String, CaseIterable, Identifiable, Sendable {
     case anthropicMessages
     case openAIResponses

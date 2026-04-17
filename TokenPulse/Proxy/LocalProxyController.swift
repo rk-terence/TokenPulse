@@ -91,7 +91,13 @@ final class LocalProxyController {
         )
     }
 
-    private(set) var isRunning = false
+    private(set) var isRunning = false {
+        didSet {
+            if oldValue != isRunning {
+                onRunningChanged?(isRunning)
+            }
+        }
+    }
     private(set) var isRestarting = false
     private(set) var listeningPort: Int = 0
     private(set) var proxyStatus: ProxyStatus = .empty
@@ -101,8 +107,18 @@ final class LocalProxyController {
     /// Download throughput in bytes per second, computed from cumulative deltas every refresh tick.
     private(set) var downloadBytesPerSec: Double = 0
 
-    /// Called on the main actor when the proxy detects data traffic (upload or download).
-    var onTrafficEvent: (() -> Void)?
+    /// Called on the main actor when the proxy detects data traffic.
+    /// `direction` is non-nil when bytes actually flowed (used to animate the
+    /// menu bar arrows); it is nil for bookkeeping updates that refresh the
+    /// popover but should not trigger a byte-level animation.
+    var onTrafficEvent: ((TrafficDirection?) -> Void)?
+    /// Called on the main actor once per finalized request (success or error).
+    /// Used by the menu bar icon to spawn a cost-transformation particle.
+    var onRequestDone: (() -> Void)?
+    /// Called on the main actor whenever `isRunning` transitions between
+    /// true and false. Used so the menu bar icon can redraw the proxy-off
+    /// dim immediately, even when no traffic or poll event is pending.
+    var onRunningChanged: ((Bool) -> Void)?
 
     private var server: ProxyHTTPServer?
     private let sessionStore = ProxySessionStore()
@@ -158,10 +174,15 @@ final class LocalProxyController {
         Task { [weak self] in
             guard let self else { return }
             let store = self.sessionStore
-            await store.setTrafficCallback { [weak self] in
+            await store.setTrafficCallback { [weak self] direction in
                 Task { @MainActor [weak self] in
-                    self?.onTrafficEvent?()
+                    self?.onTrafficEvent?(direction)
                     self?.scheduleTrafficRefresh()
+                }
+            }
+            await store.setRequestDoneCallback { [weak self] in
+                Task { @MainActor [weak self] in
+                    self?.onRequestDone?()
                 }
             }
         }

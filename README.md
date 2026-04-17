@@ -100,10 +100,13 @@ If your Codex CLI is currently using API key billing, or TokenPulse shows the Co
 - **Right-click** to switch between providers
 - Click the **gear icon** in the popover to open Settings
 
-The menu bar icon shows utilization for the active provider:
-- **Top-left number** — primary window utilization, typically the 5-hour window
-- **Bottom-right number** — secondary window utilization when available
-- **Slash** — proxy traffic indicator when the local proxy is forwarding requests
+The menu bar icon reads left to right as `↑ ↓ | NN%`:
+- **↑ cyan arrow** — glows when the proxy is sending bytes upstream
+- **↓ mint arrow** — glows when the proxy is receiving bytes downstream
+- **| bar** — neutral gray; warms to orange and carries a particle toward the percentage each time a request completes, as a visual cue that cost just accrued
+- **NN%** — the active provider's primary-window (5-hour) utilization; shows `FUL` at 100% in alert red
+
+When the proxy is off, the arrows and bar dim; the percentage stays at its normal brightness because it reflects provider polls, not proxy traffic.
 
 ## Local proxy
 

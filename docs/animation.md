@@ -1,90 +1,128 @@
 ---
-title: Slash Animation
-description: State machine, timing, and rendering details for the menu bar slash traffic animation.
+title: Menu Bar Icon Animation
+description: Three parallel animation tracks (arrows, bar + particles, percent) that drive the `↑ ↓ | NN%` menu bar icon.
 ---
 
-The diagonal slash between the 5-hour and weekly utilization numbers in the menu bar icon doubles as a proxy traffic indicator. When the local proxy records traffic activity, including upload and download byte callbacks, the slash morphs from a static gray line into a glowing orange segment that bounces back and forth, then settles back to gray when traffic stops.
+# Composition
 
-# State machine
+The icon is rendered top-to-bottom at 22 pt menu bar height and reads left-to-right:
 
-The animation is driven by a five-state machine in `StatusBarController`:
+```
+↑  ↓  |  NN%
+```
+
+- **↑ upload** and **↓ download** — two custom vector arrows drawn in cyan (`#4FC3F7`) and mint (`#34D399`). Each has an always-visible dim baseline and glows up when its direction records traffic.
+- **| bar** — a 1.6 pt wide pill in neutral gray (`#9CA3AF`). It warms to orange (`#FB923C`) and carries a glowing particle across to the digits each time a request completes.
+- **NN%** — the active provider's primary-window utilization in monospaced bold (3-char slot; `FUL` at 100% in alert red `#EF4444`).
+
+Arrow vertical alignment is nudged by each arrow's visual center-of-mass offset so both glyphs land on the icon's horizontal centerline even though the head+stem shape is asymmetric about its own midpoint.
+
+# Three independent tracks
+
+Each track advances on every tick of the shared 30 fps timer in `StatusBarController`. The timer runs only while at least one track is non-idle; when all three return to idle it is stopped.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> idle
-    idle --> starting: traffic event
-    starting --> bouncing: morph reaches 1.0
-    bouncing --> waitingForCenter: timer expires
-    bouncing --> bouncing: traffic event
-    waitingForCenter --> bouncing: traffic event
-    waitingForCenter --> stopping: at center
-    stopping --> starting: traffic event
-    stopping --> idle: morph reaches 0.0
+    state ArrowTrack {
+        [*] --> idle_a
+        idle_a --> holding: traffic event
+        holding --> decaying: hold expires
+        holding --> holding: traffic event (refresh hold)
+        decaying --> holding: traffic event
+        decaying --> idle_a: intensity → 0
+    }
+
+    state BarTrack {
+        [*] --> idle_b
+        idle_b --> carrying: requestDone
+        carrying --> carrying: requestDone (append particle)
+        carrying --> idle_b: all particles arrived
+    }
+
+    state PercentTrack {
+        [*] --> stable
+        stable --> highlight: particle absorbed
+        stable --> settle: poll value changed
+        highlight --> stable: pulse → 0
+        settle --> stable: fade → 0
+    }
 ```
 
-| State | What happens | Exit condition |
-|-------|-------------|----------------|
-| `idle` | Full-width gray slash, timer stopped | Traffic event arrives |
-| `starting` | Slash shrinks toward a short glowing segment (morph 0 -> 1) | Morph reaches 1.0 |
-| `bouncing` | Glowing segment ping-pongs along the slash; 2s countdown timer | Timer expires, or traffic event resets it |
-| `waitingForCenter` | Segment coasts toward the center position | Segment reaches center (within epsilon) |
-| `stopping` | Segment expands back to full-width gray (morph 1 -> 0) | Morph reaches 0.0 |
+Tracks compose freely: traffic arrows can glow while a particle is mid-flight and a poll value settles, all at the same tick.
 
-A traffic event arriving mid-animation re-triggers appropriately: during `starting` it is ignored, during `bouncing` it resets the countdown, during `waitingForCenter` it jumps back to `bouncing`, and during `stopping` it reverses to `starting`. When `starting` completes, `bouncing` begins from a randomized center-origin direction and phase instead of resuming from a fixed endpoint.
+## Arrow track (×2, one per direction)
 
-# SlashAnimation struct
+| Field             | Meaning |
+|-------------------|---------|
+| `intensity`       | 0…1 — drives color saturation and glow radius |
+| `holdRemaining`   | Seconds remaining in the hold window |
 
-Passed from `StatusBarController` to `BarIconRenderer.drawSlash()` on animation ticks and on non-timer redraws, including initial icon setup, provider-driven icon updates, and the final redraw that returns the slash to idle after stopping:
+- A traffic event snaps `intensity` to 1 and resets `holdRemaining` to `arrowHoldDuration` (0.6 s). Repeated events within the hold window refresh the window rather than restart the whole track.
+- Once `holdRemaining` reaches 0, `intensity` fades linearly over `arrowDecayDuration` (0.8 s).
 
-```swift
-struct SlashAnimation {
-    let flow: SlashFlow       // currently .idle or .downstream in production use
-    let phase: CGFloat        // [0, 2) — ping-pong position along the slash
-    let transition: CGFloat   // 0 = idle (full-width gray), 1 = active (short glowing segment)
-}
-```
+## Bar track
 
-`flow` is currently informational only; the renderer uses `phase` and `transition` for the visual behavior.
+| Field      | Meaning |
+|------------|---------|
+| `particles`| In-flight particles, each with `progress` in 0…1 |
+| `carrying` | 0…1 — eases toward 1 while any particle is in flight, back to 0 when the list empties |
 
-`phase` is converted to a ping-pong value in [0, 1] via `raw <= 1 ? raw : 2 - raw`, so 0 -> 1 -> 0 maps to one full back-and-forth cycle.
+- Each `requestDone` event appends a new particle at `progress = 0`. Successful completions only — errored requests don't accrue provider cost and are filtered out in `ProxySessionStore.markRequestDone` before the callback fires.
+- On every tick each particle advances by `dt / particleTravelDuration` (0.7 s total). Particles that reach 1.0 are removed and each arrival triggers a `PercentTrack` highlight pulse.
+- A soft cap (`particleCap = 5`) prevents runaway spawning during bursts; excess `requestDone` events silently noop until the list has room.
+- `carrying` eases at 3.0 s⁻¹ up and 1.5 s⁻¹ down.
 
-# Timing
+## Percent track
 
-All values tuned for 30 fps (timer interval = 1/30s):
+| Field        | Meaning |
+|--------------|---------|
+| `highlight`  | 0…1 — pulse triggered on particle arrival (predicted accrual) |
+| `settle`     | 0…1 — fade triggered when the authoritative % changes on a poll |
+| `lastUtilization` | Last observed utilization (used to detect changes) |
 
-| Constant | Value | Effect |
-|----------|-------|--------|
-| `morphSpeed` | 0.083 | Morph increment per tick; full morph in ~12 ticks (~0.4s) |
-| `phaseStep` | 0.04 | Phase increment per tick; full ping-pong in ~50 ticks (~1.7s) |
-| `bounceDuration` | 2.0s | Bounce countdown before coasting to center |
-| `centerEpsilon` | 0.05 | Snap-to-center threshold |
+- `highlight` pulses up to 1 whenever a particle arrives and decays over `percentHighlightDuration` (0.7 s). Concurrent arrivals within the decay window coalesce because the state is a single scalar, not a list.
+- `settle` pulses up to 1 when a new `StatusBarIconModel` arrives with an integer-rounded utilization different from the previous one. It fades over `percentSettleDuration` (1.1 s). The renderer reads this as a subtle brightness dip to signal a crossfade.
+- The `alert` flag (utilization ≥ 100) swaps the amber color for the alert red; the digit glyphs switch to `FUL`.
+
+# Event sources
+
+Two callbacks into `StatusBarController`, both fired on the main actor by `LocalProxyController`:
+
+| Callback                          | Source                                                              | Drives |
+|-----------------------------------|---------------------------------------------------------------------|--------|
+| `onTrafficEvent(TrafficDirection?)` | `ProxySessionStore.onTraffic`, with direction set at call sites     | Arrow tracks (only when direction is non-nil) |
+| `onRequestDone()`                  | `ProxySessionStore.onRequestDone`, fired from `markRequestDone` when `!errored` | Bar track (spawn particle) |
+
+The third input is the periodic provider poll; `ProviderManager.onIconUpdate` calls `StatusBarController.updateIcon(_:)`, which compares the rounded utilization against the previous value and seeds `PercentTrack.settle` if it changed.
+
+# Tunables
+
+All in `StatusBarController`:
+
+| Constant                    | Value  | Effect |
+|-----------------------------|--------|--------|
+| `fps`                       | 30     | Tick rate for all tracks |
+| `arrowHoldDuration`         | 0.60 s | Glow hold window after a byte event |
+| `arrowDecayDuration`        | 0.80 s | Linear fade back to idle |
+| `particleTravelDuration`    | 0.70 s | Bar → digits traversal time |
+| `particleCap`               | 5      | Max concurrent in-flight particles |
+| `barEaseUpPerSec`           | 3.0    | Bar carrying rise rate |
+| `barEaseDownPerSec`         | 1.5    | Bar carrying fall rate |
+| `percentHighlightDuration`  | 0.70 s | Highlight-pulse decay |
+| `percentSettleDuration`     | 1.10 s | Settle-fade decay |
 
 # Rendering
 
-The slash runs from upper-right to lower-left between the two number cells.
+Drawing lives in `BarIconRenderer.renderIcon(_:animation:)`:
 
-**Segment geometry** — the visible portion of the slash is computed from `phase` and `transition`:
-
-```
-halfRunner = 0.25              (runner is 50% of slash length, halved)
-center     = 0.5 + transition * (pingPong - 0.5)
-halfWidth  = 0.5 - transition * (0.5 - halfRunner)
-segStart   = clamp(center - halfWidth, 0, 1)
-segEnd     = clamp(center + halfWidth, 0, 1)
-```
-
-When `transition = 0` (idle), the full slash is drawn. When `transition = 1` (active), a 50%-length segment is drawn at the `pingPong` position.
-
-**Colors** — the core line color blends from `secondaryLabelColor` (gray) to `systemOrange` proportional to `transition`, using sRGB interpolation.
-
-**Glow** — when `transition > 0.01`, a second wider stroke is drawn underneath with:
-- Shadow: blur 2.5pt, orange at 60% opacity * transition
-- Stroke: orange at 50% opacity * transition
-- Width: `1.0 + 1.5 * transition`
-
-The core line narrows from 1.5pt (idle) to 1.0pt (active) as the glow takes over.
+- Icon width is computed from a 3-character monospaced digit slot and fixed gap constants, so the menu bar doesn't shuffle as the percentage changes. `FUL` fits the same slot as `99%`.
+- Arrow paths are authored in AppKit's unflipped coordinate system (y=0 at the bottom). Each arrow's y-position is offset by `arrowCenterOfMassYOffset` so up and down glyphs align optically.
+- Particles render with a short gradient trail + round dot, both using `cBarC` with a `setShadow` glow.
+- The `IconAnimation.proxyEnabled` flag produces a `dim` factor (0.35 when off) that multiplies the *final* alpha of the arrows and bar — not just the animation driver — so the idle state visibly recedes when the proxy is stopped. The percentage is unaffected because it reflects provider polls, not proxy state.
 
 # Key files
 
-- `Rendering/BarIconRenderer.swift` — `SlashFlow`, `SlashAnimation`, `drawSlash()`, color blending
-- `App/StatusBarController.swift` — `AnimationState` enum, 30fps timer, `trafficEventReceived()`, `onAnimationTick()`
+- `Rendering/BarIconRenderer.swift` — `IconAnimation`, `renderIcon`, arrow and bar drawing, particle composition
+- `App/StatusBarController.swift` — `ArrowTrack` (×2), `BarTrack`, `PercentTrack`, 30 fps tick loop, event ingest
+- `Proxy/ProxySessionStore.swift` — emission sites for `onTraffic(.upload|.download|nil)` and `onRequestDone` (gated on successful completion)
+- `Proxy/LocalProxyController.swift` — adapter that hops the callbacks onto the main actor
