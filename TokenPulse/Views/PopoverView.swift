@@ -743,16 +743,7 @@ private struct SessionActivityRow: View {
             if activity.keepaliveCount > 0,
                let cachePercent = activity.lastKeepaliveCacheReadPercent {
                 HStack(spacing: 4) {
-                    Text(String(
-                        format: NSLocalizedString(
-                            "proxy.keepalive.stats",
-                            value: "#keepalive: %d  last: %.0f%% cache read, %d out tok",
-                            comment: ""
-                        ),
-                        activity.keepaliveCount,
-                        cachePercent,
-                        activity.lastKeepaliveOutputTokens ?? 0
-                    ))
+                    Text(keepaliveStatsText(cachePercent: cachePercent))
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
 
@@ -808,6 +799,35 @@ private struct SessionActivityRow: View {
             return String(format: "%.3f", cost)
         } else {
             return String(format: "%.2f", cost)
+        }
+    }
+
+    private func keepaliveStatsText(cachePercent: Double) -> String {
+        let readTokens = abbreviatedTokenCount(activity.lastKeepaliveCacheReadTokens ?? 0)
+        let writeTokens = abbreviatedTokenCount(activity.lastKeepaliveCacheCreationTokens ?? 0)
+        return String(
+            format: NSLocalizedString(
+                "proxy.keepalive.stats",
+                value: "#keepalive: %d  last: %.0f%% cache read, %@ read / %@ write, %d out tok",
+                comment: "Proxy popup keepalive stats: count, cache read percent, cache read tokens, cache write tokens, output tokens."
+            ),
+            activity.keepaliveCount,
+            cachePercent,
+            readTokens,
+            writeTokens,
+            activity.lastKeepaliveOutputTokens ?? 0
+        )
+    }
+
+    private func abbreviatedTokenCount(_ count: Int) -> String {
+        if count >= 1_000_000 {
+            return String(format: "%.2fM", Double(count) / 1_000_000)
+        } else if count >= 10_000 {
+            return String(format: "%.0fK", Double(count) / 1_000)
+        } else if count >= 1_000 {
+            return String(format: "%.1fK", Double(count) / 1_000)
+        } else {
+            return "\(count)"
         }
     }
 

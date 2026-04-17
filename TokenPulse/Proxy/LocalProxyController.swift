@@ -37,6 +37,10 @@ final class LocalProxyController {
         let lastKeepaliveAt: Date?
         /// Cache read percentage from the last keepalive response (0–100), nil if no keepalive yet.
         let lastKeepaliveCacheReadPercent: Double?
+        /// Cache-read tokens from the last keepalive response, for diagnostics.
+        let lastKeepaliveCacheReadTokens: Int?
+        /// Cache-creation tokens from the last keepalive response, for diagnostics.
+        let lastKeepaliveCacheCreationTokens: Int?
         /// Output tokens from the last keepalive response, for verification.
         let lastKeepaliveOutputTokens: Int?
 
@@ -482,7 +486,7 @@ final class LocalProxyController {
 
         let lineageHeaders = keepaliveSource.headers
         let urlString = upstreamBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            + apiHandler.keepaliveRequestPath
+            + keepaliveSource.path
         guard let url = URL(string: urlString) else { return false }
 
         let model = apiHandler.extractModel(from: lineageBody)
@@ -790,6 +794,8 @@ final class LocalProxyController {
                     lineageReady: snap.lineageEstablished,
                     lastKeepaliveAt: snap.lastKeepaliveAt,
                     lastKeepaliveCacheReadPercent: Self.cacheReadPercent(from: snap.lastKeepaliveTokenUsage),
+                    lastKeepaliveCacheReadTokens: snap.lastKeepaliveTokenUsage?.cacheReadInputTokens,
+                    lastKeepaliveCacheCreationTokens: snap.lastKeepaliveTokenUsage?.cacheCreationInputTokens,
                     lastKeepaliveOutputTokens: snap.lastKeepaliveTokenUsage?.outputTokens
                 )
             }

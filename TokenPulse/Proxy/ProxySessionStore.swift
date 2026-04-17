@@ -10,6 +10,7 @@ actor ProxySessionStore {
     }
 
     struct KeepaliveRequestContext: Sendable {
+        let path: String
         let body: Data
         let headers: [(name: String, value: String)]
     }
@@ -46,11 +47,13 @@ actor ProxySessionStore {
         var totalRequestsSeen: Int
         var lineageFingerprint: LineageFingerprint?
         var lineageMessagesDescriptor: String?
+        var lineageRequestPath: String?
         var lineageRequestBody: Data?
         var lineageRequestHeaders: [(name: String, value: String)]
         var lineageEstablished: Bool
         var keepaliveDisabledReason: String?
         var activeAcceptedLineageRequestID: UUID?
+        var activeAcceptedLineageRequestPath: String?
         var activeAcceptedLineageRequestBody: Data?
         var activeAcceptedLineageRequestHeaders: [(name: String, value: String)]
     }
@@ -216,11 +219,13 @@ actor ProxySessionStore {
                 totalRequestsSeen: 0,
                 lineageFingerprint: nil,
                 lineageMessagesDescriptor: nil,
+                lineageRequestPath: nil,
                 lineageRequestBody: nil,
                 lineageRequestHeaders: [],
                 lineageEstablished: false,
                 keepaliveDisabledReason: nil,
                 activeAcceptedLineageRequestID: nil,
+                activeAcceptedLineageRequestPath: nil,
                 activeAcceptedLineageRequestBody: nil,
                 activeAcceptedLineageRequestHeaders: []
             )
@@ -329,6 +334,7 @@ actor ProxySessionStore {
     /// Updates lineage state and returns an evaluation that tells the caller
     /// whether to start/reset keepalive, stop it, or leave it alone.
     func evaluateAndTrackLineage(
+        path: String,
         body: Data,
         headers: [(name: String, value: String)],
         model: String?,
@@ -362,6 +368,7 @@ actor ProxySessionStore {
                     }
                     session.lineageFingerprint = fingerprint
                     session.lineageMessagesDescriptor = apiHandler.messagesDescriptor(from: body)
+                    session.lineageRequestPath = path
                     session.lineageRequestBody = body
                     session.lineageRequestHeaders = headers
                     // Close the window if this is already request #2.
@@ -456,6 +463,7 @@ actor ProxySessionStore {
         // All checks pass — promote this request as the latest lineage point.
         if var updated = sessions[resolvedSessionID] {
             updated.lineageMessagesDescriptor = incomingMessages
+            updated.lineageRequestPath = path
             updated.lineageRequestBody = body
             updated.lineageRequestHeaders = headers
             sessions[resolvedSessionID] = updated
@@ -473,6 +481,7 @@ actor ProxySessionStore {
     /// Track an accepted upstream request as the freshest keepalive source while it is still active.
     func markAcceptedLineageRequestActive(
         id: UUID,
+        path: String,
         body: Data,
         headers: [(name: String, value: String)],
         for sessionID: String,
@@ -502,6 +511,7 @@ actor ProxySessionStore {
         }
 
         session.activeAcceptedLineageRequestID = id
+        session.activeAcceptedLineageRequestPath = path
         session.activeAcceptedLineageRequestBody = body
         session.activeAcceptedLineageRequestHeaders = headers
         sessions[sessionID] = session
@@ -724,6 +734,7 @@ actor ProxySessionStore {
         if var session = sessions[resolvedSessionID] {
             if session.activeAcceptedLineageRequestID == id {
                 session.activeAcceptedLineageRequestID = nil
+                session.activeAcceptedLineageRequestPath = nil
                 session.activeAcceptedLineageRequestBody = nil
                 session.activeAcceptedLineageRequestHeaders = []
             }
@@ -866,14 +877,18 @@ actor ProxySessionStore {
     }
 
     private func keepaliveRequestContext(for session: Session) -> KeepaliveRequestContext? {
-        if let body = session.activeAcceptedLineageRequestBody {
+        if let path = session.activeAcceptedLineageRequestPath,
+           let body = session.activeAcceptedLineageRequestBody {
             return KeepaliveRequestContext(
+                path: path,
                 body: body,
                 headers: session.activeAcceptedLineageRequestHeaders
             )
         }
-        if let body = session.lineageRequestBody {
+        if let path = session.lineageRequestPath,
+           let body = session.lineageRequestBody {
             return KeepaliveRequestContext(
+                path: path,
                 body: body,
                 headers: session.lineageRequestHeaders
             )
@@ -1035,11 +1050,13 @@ actor ProxySessionStore {
             totalRequestsSeen: 0,
             lineageFingerprint: nil,
             lineageMessagesDescriptor: nil,
+            lineageRequestPath: nil,
             lineageRequestBody: nil,
             lineageRequestHeaders: [],
             lineageEstablished: false,
             keepaliveDisabledReason: nil,
             activeAcceptedLineageRequestID: nil,
+            activeAcceptedLineageRequestPath: nil,
             activeAcceptedLineageRequestBody: nil,
             activeAcceptedLineageRequestHeaders: []
         )

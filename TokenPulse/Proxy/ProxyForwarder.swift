@@ -147,6 +147,7 @@ final class ProxyForwarder: Sendable {
         if wantsStreaming {
             errored = await forwardStreaming(
                 urlRequest: urlRequest,
+                requestPath: request.path,
                 requestBody: request.body,
                 requestHeaders: request.headers,
                 writer: request.writer,
@@ -163,6 +164,7 @@ final class ProxyForwarder: Sendable {
         } else {
             errored = await forwardNonStreaming(
                 urlRequest: urlRequest,
+                requestPath: request.path,
                 requestBody: request.body,
                 requestHeaders: request.headers,
                 writer: request.writer,
@@ -186,6 +188,7 @@ final class ProxyForwarder: Sendable {
         // Only Anthropic tracked sessions participate in lineage/keepalive.
         if !errored && supportsKeepalive {
             let lineageResult = await sessionStore.evaluateAndTrackLineage(
+                path: request.path,
                 body: request.body,
                 headers: request.headers,
                 model: model,
@@ -223,6 +226,7 @@ final class ProxyForwarder: Sendable {
 
     private func forwardStreaming(
         urlRequest: URLRequest,
+        requestPath: String,
         requestBody: Data,
         requestHeaders: [(name: String, value: String)],
         writer: ResponseWriter,
@@ -304,6 +308,7 @@ final class ProxyForwarder: Sendable {
                 if supportsTrackedSession, (200..<300).contains(httpResponse.statusCode) {
                     await sessionStore.markAcceptedLineageRequestActive(
                         id: requestID,
+                        path: requestPath,
                         body: requestBody,
                         headers: requestHeaders,
                         for: sessionID,
@@ -407,6 +412,7 @@ final class ProxyForwarder: Sendable {
 
     private func forwardNonStreaming(
         urlRequest: URLRequest,
+        requestPath: String,
         requestBody: Data,
         requestHeaders: [(name: String, value: String)],
         writer: ResponseWriter,
@@ -454,6 +460,7 @@ final class ProxyForwarder: Sendable {
                 if supportsTrackedSession, (200..<300).contains(httpResponse.statusCode) {
                     await sessionStore.markAcceptedLineageRequestActive(
                         id: requestID,
+                        path: requestPath,
                         body: requestBody,
                         headers: requestHeaders,
                         for: sessionID,
