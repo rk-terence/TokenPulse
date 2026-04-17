@@ -1,8 +1,9 @@
 {
-  "enabledPlugins": {
-    "swift-lsp@claude-plugins-official": true
-  },
   "attribution": {
     "commit": ""
+  },
+  "enabledPlugins": {
+    "swift-lsp@claude-plugins-official": true,
+    "figma@claude-plugins-official": true
   }
 }
