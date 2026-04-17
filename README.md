@@ -1,6 +1,6 @@
 # TokenPulse
 
-A macOS menu bar app that monitors AI platform token usage and optimizes API costs through a local caching proxy. A compact two-number menu bar icon shows your primary and secondary quota utilization at a glance, while the optional proxy keeps prompt caches warm between requests to reduce cache-write costs.
+A macOS menu bar app that monitors AI platform token usage and optimizes API costs through a local proxy. A compact `↑ ↓ | NN%` menu bar icon shows the active provider's primary-window utilization at a glance, while the optional proxy supports manual cache-warming keepalives to reduce cache-write costs when you need them.
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-blue) ![Swift 5](https://img.shields.io/badge/Swift-5-orange)
 
@@ -8,19 +8,19 @@ A macOS menu bar app that monitors AI platform token usage and optimizes API cos
 
 ### Usage monitoring
 
-- **Menu bar icon** — Compact 5-hour / secondary-window utilization display with a diagonal slash traffic indicator
+- **Menu bar icon** — Compact `↑ ↓ | NN%` display with upload/download activity and the active provider's primary-window utilization
 - **Multiple providers** — Right-click the icon to cycle between providers
 - **Click for details** — Left-click opens a popover with per-provider breakdown, quota windows, reset timers, and more
 - **Usage notifications** — macOS notifications when a provider's primary window crosses 50% or 80%, and when quota windows reset
 - **Graceful degradation** — Shows stale data on transient errors, surfaces auth guidance on credential issues, dims icon when refreshing
-- **Machine-readable export** — Every poll writes a normalized provider status snapshot to `~/.tokenpulse/raw_usage.json` for shell scripts and external tools
+- **Machine-readable export** — Provider refresh results update a normalized status snapshot at `~/.tokenpulse/raw_usage.json` for shell scripts and external tools
 
 ### Local proxy
 
 - **Manual cache-warming keepalives** — Lets you send lightweight Anthropic keepalive requests from the popover when a tracked session's cache would otherwise go cold
 - **Per-session cost tracking** — Tracks token usage, bytes transferred, and estimated cost per tracked proxy session
 - **Streaming support** — Full HTTP/1.1 proxy with SSE streaming passthrough; parses token usage from both JSON and SSE responses
-- **Traffic indicator** — Menu bar slash animates with a bouncing glow when the proxy is forwarding requests
+- **Traffic indicator** — Menu bar arrows and bar animate when the proxy forwards requests and completions
 - **Event logging** — Structured SQLite event log with 24-hour retention; optional request/response capture in SQLite for debugging
 - **Status snapshots** — Atomic JSON snapshots at `~/.tokenpulse/proxy_status.json` for external tooling whenever proxy logging infrastructure is enabled (`saveProxyEventLog` or `saveProxyPayloads`)
 
@@ -42,13 +42,13 @@ A macOS menu bar app that monitors AI platform token usage and optimizes API cos
 
 [CodexBar](https://github.com/steipete/CodexBar) is an excellent menu bar usage tracker with 15+ providers and an active community. TokenPulse exists because it makes different trade-offs:
 
-- **Local caching proxy** — TokenPulse can sit between your AI tools and the upstream API, keeping prompt caches warm between requests. This is a cost optimization layer that no usage tracker offers — it actively saves you money rather than just reporting what you've spent.
+- **Local caching proxy** — TokenPulse can sit between your AI tools and the upstream API, with manual cache-warming keepalives available from the popover for tracked Anthropic sessions. This is a cost optimization layer that can save you money rather than just reporting what you've spent.
 - **ZenMux support** — TokenPulse supports ZenMux out of the box via their official Management API. ZenMux is a niche provider that CodexBar doesn't cover, and likely too niche for them to want to maintain.
-- **One glance, no mode switch** — CodexBar shows two stacked bars per provider with multiple display modes. TokenPulse shows the primary and secondary window percentages directly in the icon, so you can read current utilization without opening a detail view.
+- **One glance, no mode switch** — CodexBar shows two stacked bars per provider with multiple display modes. TokenPulse shows the active provider's primary-window utilization directly in the icon, so you can read current usage without opening a detail view.
 - **Minimal by design** — TokenPulse is ~28 source files with a simple `UsageProvider` protocol and an actor-based proxy subsystem. No SwiftSyntax macros, no helper processes, no multi-strategy fallback chains. The entire codebase is easy to audit, fork, and modify.
-- **Machine-readable output** — Every poll cycle writes a normalized provider snapshot to `~/.tokenpulse/raw_usage.json`, and the proxy can write status snapshots to `~/.tokenpulse/proxy_status.json` whenever proxy logging infrastructure is enabled. Shell scripts and external tools can consume both without scraping or IPC.
+- **Machine-readable output** — Provider refresh results write a normalized snapshot to `~/.tokenpulse/raw_usage.json`, and the proxy can write status snapshots to `~/.tokenpulse/proxy_status.json` whenever proxy logging infrastructure is enabled. Shell scripts and external tools can consume both without scraping or IPC.
 
-If you use many AI providers and want comprehensive coverage, use CodexBar. If you use Codex, Claude, and/or ZenMux and want something small and direct — especially with cost optimization through cache-warming — TokenPulse is for you.
+If you use many AI providers and want comprehensive coverage, use CodexBar. If you use Codex, Claude, and/or ZenMux and want something small and direct — especially with manual cache-warming support for tracked Anthropic sessions — TokenPulse is for you.
 
 ## Install
 
@@ -130,13 +130,13 @@ The proxy is a full HTTP/1.1 server built on Network.framework. Anthropic Messag
 
 - **Forwarding** — Requests are forwarded to the upstream URL with streaming SSE passthrough. Token usage is parsed from JSON responses and from terminal usage events in SSE streams.
 - **Cost tracking** — Per-session counters track input/output/cache-read/cache-write tokens and estimate cost using per-model pricing tables. The popover shows active sessions with their request counts and running cost.
-- **Traffic indicator** — When the proxy forwards a request, the menu bar slash animates with a bouncing orange glow, settling back to gray when traffic stops.
+- **Traffic indicator** — When the proxy forwards a request, the menu bar arrows glow and the bar/particle track animates to reflect request and completion activity.
 
 ### Manual keepalives
 
 Anthropic's prompt cache has a 5-minute TTL. If your next request arrives after the cache expires, the full prompt is re-cached at a cost of ~1.25x base input tokens. Keepalives prevent this by sending minimal requests (`max_tokens=1`) that read the cache at ~0.10x base input tokens — a net saving of ~1.15x per avoided cache write.
 
-When TokenPulse establishes Anthropic lineage for a session, the popover can expose a per-session **Manual** keepalive mode. Sending one keepalive replays cache-relevant fields (system prompt, messages, tools, tool_choice, thinking config) as a minimal `POST /v1/messages` request. If a newer same-lineage request has already received an upstream `2xx` but is still streaming, TokenPulse may prefer that active request as the keepalive source on the working hypothesis that upstream acceptance usually means the cached prompt state was usable, even though Anthropic does not document `2xx` as a strict cache-hit signal. Otherwise it falls back to the last completed tracked request. The result is logged and counted in session metrics; there is no automatic background keepalive loop in the current implementation.
+When TokenPulse establishes Anthropic lineage for a session, the popover can expose a per-session **Manual** keepalive mode. Sending one keepalive replays cache-relevant fields (system prompt, messages, tools, tool_choice, thinking config) as a minimal Anthropic request using the stored tracked path. If a newer same-lineage request has already received an upstream `2xx` but is still streaming, TokenPulse may prefer that active request as the keepalive source on the working hypothesis that upstream acceptance usually means the cached prompt state was usable, even though Anthropic does not document `2xx` as a strict cache-hit signal. Otherwise it falls back to the last completed tracked request. The result is logged and counted in session metrics; there is no automatic background keepalive loop in the current implementation.
 
 ### Observability
 
@@ -164,7 +164,7 @@ All fields are in `~/.tokenpulse/config.json`:
 
 ## Data export
 
-TokenPulse writes a normalized provider status snapshot to `~/.tokenpulse/raw_usage.json` after every poll. Example:
+TokenPulse updates a normalized provider status snapshot at `~/.tokenpulse/raw_usage.json` whenever a provider refresh result is applied. Example:
 
 ```bash
 # Get Claude 5-hour utilization

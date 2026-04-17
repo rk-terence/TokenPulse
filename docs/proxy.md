@@ -257,7 +257,8 @@ When the user enables keepalive controls and switches a session to `manual`, `Lo
    - `Host`
    - `Content-Length`
    - `Transfer-Encoding`
-4. Send a one-shot `POST /v1/messages` with `URLSession.shared`.
+4. Send a one-shot replay of the stored Anthropic request path with `URLSession.shared`.
+   Query-string variants are preserved if the tracked request used them.
 5. Parse token usage from the response.
 6. Record the result in:
    - `ProxySessionStore`
@@ -412,7 +413,7 @@ Bodies are serialized as UTF-8 when possible, otherwise base64. Streaming captur
 ## Retention and pruning
 
 - maximum event age: 24 hours
-- prune check interval: at most once every 5 minutes, opportunistically on write
+- prune check interval: at most once every 5 minutes, opportunistically on request/keepalive writes
 - prune targets:
   - `proxy_requests`
   - `proxy_keepalives`

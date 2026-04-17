@@ -77,23 +77,23 @@ Tracks compose freely: traffic arrows can glow while a particle is mid-flight an
 | Field        | Meaning |
 |--------------|---------|
 | `highlight`  | 0…1 — pulse triggered on particle arrival (predicted accrual) |
-| `settle`     | 0…1 — fade triggered when the authoritative % changes on a poll |
-| `lastUtilization` | Last observed utilization (used to detect changes) |
+| `settle`     | 0…1 — fade triggered when a new icon model changes the rounded utilization |
 
 - `highlight` pulses up to 1 whenever a particle arrives and decays over `percentHighlightDuration` (0.7 s). Concurrent arrivals within the decay window coalesce because the state is a single scalar, not a list.
-- `settle` pulses up to 1 when a new `StatusBarIconModel` arrives with an integer-rounded utilization different from the previous one. It fades over `percentSettleDuration` (1.1 s). The renderer reads this as a subtle brightness dip to signal a crossfade.
+- `settle` pulses up to 1 when `StatusBarController.updateIcon(_:)` receives a `StatusBarIconModel` whose integer-rounded utilization differs from the previous model. It fades over `percentSettleDuration` (1.1 s). The renderer reads this as a subtle brightness dip to signal a crossfade.
 - The `alert` flag (utilization ≥ 100) swaps the amber color for the alert red; the digit glyphs switch to `FUL`.
 
 # Event sources
 
-Two callbacks into `StatusBarController`, both fired on the main actor by `LocalProxyController`:
+Three callback-driven inputs feed `StatusBarController` from `LocalProxyController` and `ProviderManager`:
 
 | Callback                          | Source                                                              | Drives |
 |-----------------------------------|---------------------------------------------------------------------|--------|
-| `onTrafficEvent(TrafficDirection?)` | `ProxySessionStore.onTraffic`, with direction set at call sites     | Arrow tracks (only when direction is non-nil) |
+| `onTrafficEvent(TrafficDirection?)` | `ProxySessionStore.onTraffic`, with direction set at request start, response-header receipt, and byte-update call sites | Arrow tracks (only when direction is non-nil) |
 | `onRequestDone()`                  | `ProxySessionStore.onRequestDone`, fired from `markRequestDone` when `!errored` | Bar track (spawn particle) |
+| `onRunningChanged(Bool)`           | `LocalProxyController.isRunning.didSet`                             | Immediate redraw so proxy dim state updates without waiting for traffic |
 
-The third input is the periodic provider poll; `ProviderManager.onIconUpdate` calls `StatusBarController.updateIcon(_:)`, which compares the rounded utilization against the previous value and seeds `PercentTrack.settle` if it changed.
+`ProviderManager.onIconUpdate` calls `StatusBarController.updateIcon(_:)` on provider refreshes, provider switches, and other icon-model updates. That path always redraws the icon and seeds `PercentTrack.settle` when the rounded utilization changes.
 
 # Tunables
 
@@ -102,7 +102,7 @@ All in `StatusBarController`:
 | Constant                    | Value  | Effect |
 |-----------------------------|--------|--------|
 | `fps`                       | 30     | Tick rate for all tracks |
-| `arrowHoldDuration`         | 0.60 s | Glow hold window after a byte event |
+| `arrowHoldDuration`         | 0.60 s | Glow hold window after an upload/download cue event |
 | `arrowDecayDuration`        | 0.80 s | Linear fade back to idle |
 | `particleTravelDuration`    | 0.70 s | Bar → digits traversal time |
 | `particleCap`               | 5      | Max concurrent in-flight particles |
@@ -117,7 +117,7 @@ Drawing lives in `BarIconRenderer.renderIcon(_:animation:)`:
 
 - Icon width is computed from a 3-character monospaced digit slot and fixed gap constants, so the menu bar doesn't shuffle as the percentage changes. `FUL` fits the same slot as `99%`.
 - Arrow paths are authored in AppKit's unflipped coordinate system (y=0 at the bottom). Each arrow's y-position is offset by `arrowCenterOfMassYOffset` so up and down glyphs align optically.
-- Particles render with a short gradient trail + round dot, both using `cBarC` with a `setShadow` glow.
+- Particles render with a short solid trail plus a round dot; the dot uses `cBarC` with a `setShadow` glow.
 - The `IconAnimation.proxyEnabled` flag produces a `dim` factor (0.35 when off) that multiplies the *final* alpha of the arrows and bar — not just the animation driver — so the idle state visibly recedes when the proxy is stopped. The percentage is unaffected because it reflects provider polls, not proxy state.
 
 # Key files
