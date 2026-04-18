@@ -11,9 +11,13 @@ The icon is rendered top-to-bottom at 22 pt menu bar height and reads left-to-ri
 ↑  ↓  |  NN%
 ```
 
-- **↑ upload** and **↓ download** — two custom vector arrows drawn in cyan (`#4FC3F7`) and mint (`#34D399`). Each has an always-visible dim baseline and glows up when its direction records traffic.
-- **| bar** — a 1.6 pt wide pill in neutral gray (`#9CA3AF`). It warms to orange (`#FB923C`) and carries a glowing particle across to the digits each time a request completes.
-- **NN%** — the active provider's primary-window utilization in monospaced bold (3-char slot; `FUL` at 100% in alert red `#EF4444`).
+Every part sits at `NSColor.labelColor` when idle — white at 85% alpha on dark menu bars, black at 85% on light menu bars — so the glyph reads like Wi-Fi, Battery, and other stock menu extras between ticks. The palette only blooms during animation, and it swaps between a dark-mode and a light-mode set so the accents stay legible regardless of bar translucency.
+
+- **↑ upload** and **↓ download** — two custom vector arrows that crossfade from labelColor to the palette accent (cyan `#4FC3F7` / blue `#3B82F6` on dark/light; mint `#34D399` / emerald `#10B981`) while `intensity` ramps to 1 and back.
+- **| bar** — a 1.6 pt wide pill that sits at labelColor, warming toward amber (`#FBBF24` / `#F59E0B`) while a particle is in flight and returning to labelColor once the list empties.
+- **NN%** — monospaced bold utilization in a 3-char slot. Idle it is labelColor; it briefly flashes the palette percent accent (`#F59E0B` / `#D97706`) during `highlight` or `settle` pulses. Alert (`≥100%`) is the one persistent color: the slot stays red (`#EF4444` / `#DC2626`) and the text switches to `FUL`.
+
+The light-mode accents are intentionally mid-weight (500–600) rather than the deep 700–800 tones the early spec carried. Idle is effectively black on a light menu bar, so a too-dark accent just reads as the same glyph pulsing in place — the crossfade target has to carry enough luminance for the animation to be visible.
 
 Arrow vertical alignment is nudged by each arrow's visual center-of-mass offset so both glyphs land on the icon's horizontal centerline even though the head+stem shape is asymmetric about its own midpoint.
 
@@ -54,11 +58,11 @@ Tracks compose freely: traffic arrows can glow while a particle is mid-flight an
 
 | Field             | Meaning |
 |-------------------|---------|
-| `intensity`       | 0…1 — drives color saturation and glow radius |
+| `intensity`       | 0…1 — crossfades the fill from labelColor → palette accent and drives glow radius |
 | `holdRemaining`   | Seconds remaining in the hold window |
 
 - A traffic event snaps `intensity` to 1 and resets `holdRemaining` to `arrowHoldDuration` (0.6 s). Repeated events within the hold window refresh the window rather than restart the whole track.
-- Once `holdRemaining` reaches 0, `intensity` fades linearly over `arrowDecayDuration` (0.8 s).
+- Once `holdRemaining` reaches 0, `intensity` fades linearly over `arrowDecayDuration` (0.8 s). The color follows `intensity`, so the arrow drifts back to labelColor as the glow fades.
 
 ## Bar track
 
@@ -80,8 +84,9 @@ Tracks compose freely: traffic arrows can glow while a particle is mid-flight an
 | `settle`     | 0…1 — fade triggered when a new icon model changes the rounded utilization |
 
 - `highlight` pulses up to 1 whenever a particle arrives and decays over `percentHighlightDuration` (0.7 s). Concurrent arrivals within the decay window coalesce because the state is a single scalar, not a list.
-- `settle` pulses up to 1 when `StatusBarController.updateIcon(_:)` receives a `StatusBarIconModel` whose integer-rounded utilization differs from the previous model. It fades over `percentSettleDuration` (1.1 s). The renderer reads this as a subtle brightness dip to signal a crossfade.
-- The `alert` flag (utilization ≥ 100) swaps the amber color for the alert red; the digit glyphs switch to `FUL`.
+- `settle` pulses up to 1 when `StatusBarController.updateIcon(_:)` receives a `StatusBarIconModel` whose integer-rounded utilization differs from the previous model. Both sides must be non-nil — the initial `nil → value` transition does not pulse, so first-load doesn't flash. It fades over `percentSettleDuration` (1.1 s). The renderer reads this as a subtle brightness dip to signal a crossfade.
+- The renderer uses `max(highlight, settle)` as the crossfade parameter from labelColor → the palette percent accent. Between pulses the digits stay at labelColor; color only appears while a pulse is in flight.
+- The `alert` flag (utilization ≥ 100) opts out of the pulse-driven crossfade: the digit color pins to the alert red and the glyphs switch to `FUL`, so the over-quota signal stays visible even at rest.
 
 # Event sources
 
@@ -117,8 +122,10 @@ Drawing lives in `BarIconRenderer.renderIcon(_:animation:)`:
 
 - Icon width is computed from a 3-character monospaced digit slot and fixed gap constants, so the menu bar doesn't shuffle as the percentage changes. `FUL` fits the same slot as `99%`.
 - Arrow paths are authored in AppKit's unflipped coordinate system (y=0 at the bottom). Each arrow's y-position is offset by `arrowCenterOfMassYOffset` so up and down glyphs align optically.
-- Particles render with a short solid trail plus a round dot; the dot uses `cBarC` with a `setShadow` glow.
-- The `IconAnimation.proxyEnabled` flag produces a `dim` factor (0.35 when off) that multiplies the *final* alpha of the arrows and bar — not just the animation driver — so the idle state visibly recedes when the proxy is stopped. The percentage is unaffected because it reflects provider polls, not proxy state.
+- Arrow, bar, and non-alert digit colors all come from `blend(labelColor, paletteAccent, t: …)` where `t` is `intensity`, `carrying`, or `max(highlight, settle)` respectively. This is the single mechanism that keeps those parts monochrome at rest and colored only when animating. Alert digits (`≥100%`) opt out and pin to `percentAlert` steady-state, as noted in the percent track above.
+- Particles render with a short solid trail plus a round dot; both use the palette `barCarrying` amber with a `setShadow` glow.
+- **Proxy off** (`IconAnimation.proxyEnabled == false`) dims the left half — arrows and bar — via a `dim` factor (0.35) that multiplies each part's final alpha. The digit slot is unaffected because it tracks provider polls, not proxy state.
+- **Usage errored / stale / unconfigured / refreshing** dims the right half — the digit slot falls to 55% opacity whenever the provider isn't returning a confident fresh number. Only `.ready` with a utilization value runs at full opacity.
 
 # Key files
 

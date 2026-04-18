@@ -112,8 +112,10 @@ final class LocalProxyController {
     /// menu bar arrows); it is nil for bookkeeping updates that refresh the
     /// popover but should not trigger a byte-level animation.
     var onTrafficEvent: ((TrafficDirection?) -> Void)?
-    /// Called on the main actor once per finalized request (success or error).
-    /// Used by the menu bar icon to spawn a cost-transformation particle.
+    /// Called on the main actor once per successfully finalized request.
+    /// `ProxySessionStore.markRequestDone` gates this on `!errored`, so
+    /// failed requests do not fire — they don't accrue provider cost and
+    /// shouldn't spawn a cost-transformation particle on the menu bar icon.
     var onRequestDone: (() -> Void)?
     /// Called on the main actor whenever `isRunning` transitions between
     /// true and false. Used so the menu bar icon can redraw the proxy-off

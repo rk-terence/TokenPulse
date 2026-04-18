@@ -8,7 +8,7 @@ import AppKit
 struct IconAnimation: Sendable {
     /// Per-arrow state (one instance for upload, one for download).
     struct ArrowState: Sendable {
-        /// 0 = dim (idle baseline), 1 = full-color glowing.
+        /// 0 = labelColor rest, 1 = full-color glowing accent.
         var intensity: CGFloat
 
         static let idle = ArrowState(intensity: 0)
@@ -22,7 +22,7 @@ struct IconAnimation: Sendable {
 
     /// Bar state. `carrying` is driven to 1 while any particle is in flight
     /// and decays back to 0 when the bar is idle, producing a smooth color
-    /// crossfade between neutral gray and the warm carrying tint.
+    /// crossfade between the rest-state labelColor and the warm carrying tint.
     struct BarState: Sendable {
         var carrying: CGFloat
 
@@ -92,14 +92,15 @@ enum BarIconRenderer {
 
     // MARK: Palette
 
-    /// Appearance-specific color set. The light-mode variants are darker and
-    /// more saturated so they remain legible against a bright menu bar, while
-    /// the dark-mode variants are the lighter, airier tones that read well on
-    /// the translucent dark menu bar.
+    /// Appearance-specific accents. These tints are only applied while the
+    /// corresponding track is animating; the rest-state color is always
+    /// `labelColor(isDarkAppearance:)` so the glyph reads like a stock menu
+    /// extra between ticks. Light-mode tints are deeper and more saturated so
+    /// they survive wallpaper-tinted bars; dark-mode tints stay airy for the
+    /// translucent dark bar.
     private struct Palette {
         let upload: NSColor
         let download: NSColor
-        let barNeutral: NSColor
         let barCarrying: NSColor
         let percent: NSColor
         let percentAlert: NSColor
@@ -107,20 +108,33 @@ enum BarIconRenderer {
         static let dark = Palette(
             upload:       NSColor(srgbRed: 0.310, green: 0.765, blue: 0.969, alpha: 1), // #4FC3F7 sky-300
             download:     NSColor(srgbRed: 0.204, green: 0.827, blue: 0.600, alpha: 1), // #34D399 emerald-400
-            barNeutral:   NSColor(srgbRed: 0.612, green: 0.639, blue: 0.686, alpha: 1), // #9CA3AF gray-400
-            barCarrying:  NSColor(srgbRed: 0.984, green: 0.749, blue: 0.141, alpha: 1), // #FBBF24 amber-400 (pure amber)
+            barCarrying:  NSColor(srgbRed: 0.984, green: 0.749, blue: 0.141, alpha: 1), // #FBBF24 amber-400
             percent:      NSColor(srgbRed: 0.961, green: 0.620, blue: 0.043, alpha: 1), // #F59E0B amber-500
-            percentAlert: NSColor(srgbRed: 0.937, green: 0.267, blue: 0.267, alpha: 1)  // #EF4444 red-500 (alert only)
+            percentAlert: NSColor(srgbRed: 0.937, green: 0.267, blue: 0.267, alpha: 1)  // #EF4444 red-500
         )
 
+        // Light-mode accents sit at mid-weight (500–600) rather than the
+        // deep 700–800 tones. Idle is effectively black in light mode, so
+        // the crossfade target has to carry enough luminance for the
+        // animation to be visible — a too-dark accent just reads as the
+        // same black glyph pulsing in place. These weights also keep
+        // hue-distinct contrast against wallpaper-tinted menu bars.
         static let light = Palette(
-            upload:       NSColor(srgbRed: 0.118, green: 0.251, blue: 0.686, alpha: 1), // #1E40AF blue-800
-            download:     NSColor(srgbRed: 0.024, green: 0.373, blue: 0.275, alpha: 1), // #065F46 emerald-800
-            barNeutral:   NSColor(srgbRed: 0.216, green: 0.255, blue: 0.318, alpha: 1), // #374151 gray-700
-            barCarrying:  NSColor(srgbRed: 0.631, green: 0.384, blue: 0.027, alpha: 1), // #A16207 yellow-700 (gold, low-red)
-            percent:      NSColor(srgbRed: 0.522, green: 0.302, blue: 0.055, alpha: 1), // #854D0E yellow-800 (deep gold)
-            percentAlert: NSColor(srgbRed: 0.725, green: 0.110, blue: 0.110, alpha: 1)  // #B91C1C red-700 (alert only)
+            upload:       NSColor(srgbRed: 0.231, green: 0.510, blue: 0.965, alpha: 1), // #3B82F6 blue-500
+            download:     NSColor(srgbRed: 0.063, green: 0.725, blue: 0.506, alpha: 1), // #10B981 emerald-500
+            barCarrying:  NSColor(srgbRed: 0.961, green: 0.620, blue: 0.043, alpha: 1), // #F59E0B amber-500
+            percent:      NSColor(srgbRed: 0.851, green: 0.467, blue: 0.024, alpha: 1), // #D97706 amber-600
+            percentAlert: NSColor(srgbRed: 0.863, green: 0.149, blue: 0.149, alpha: 1)  // #DC2626 red-600
         )
+    }
+
+    /// At-rest color for every part. Matches `NSColor.labelColor` for the
+    /// given appearance so the idle glyph blends in with Wi-Fi, Battery,
+    /// and other stock menu bar icons.
+    private static func labelColor(isDarkAppearance: Bool) -> NSColor {
+        isDarkAppearance
+            ? NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.85)
+            : NSColor(srgbRed: 0, green: 0, blue: 0, alpha: 0.85)
     }
 
     // MARK: Public entry point
@@ -132,6 +146,7 @@ enum BarIconRenderer {
         isDarkAppearance: Bool = true
     ) -> NSImage {
         let palette: Palette = isDarkAppearance ? .dark : .light
+        let labelC = labelColor(isDarkAppearance: isDarkAppearance)
         // Compute total icon width. The digits slot is fixed at `digitSlotChars`
         // monospaced chars wide so the menu bar icon does not jitter as the
         // percentage changes. "FUL" intentionally renders at the same width.
@@ -149,7 +164,12 @@ enum BarIconRenderer {
         let image = NSImage(size: size, flipped: false) { rect in
             guard let ctx = NSGraphicsContext.current?.cgContext else { return true }
 
-            let resolved = resolvePercent(model: model, animation: animation, palette: palette)
+            let resolved = resolvePercent(
+                model: model,
+                animation: animation,
+                palette: palette,
+                labelColor: labelC
+            )
 
             // Positions
             let upX  = padLeading
@@ -168,27 +188,33 @@ enum BarIconRenderer {
             let dnArrowY   = baseArrowY + comShift
             let barY   = (iconHeight - barHeight) / 2
 
-            // 1) Arrows. `dim` multiplies the final rendered alpha (including
-            // the idle baseline) so the arrows and bar visibly recede when
-            // the proxy is off rather than staying at their idle brightness.
+            // 1) Arrows. Proxy-off pulls the left half of the icon (arrows +
+            //    bar) back to a faint trace so the user can tell at a glance
+            //    that traffic is paused. The digit slot stays at full opacity
+            //    because the percentage still reflects provider polls.
             let dim: CGFloat = animation.proxyEnabled ? 1.0 : 0.35
-            drawUpArrow(in: ctx,
-                        x: upX, y: upArrowY,
-                        intensity: animation.up.intensity,
-                        dim: dim,
-                        palette: palette)
-            drawDownArrow(in: ctx,
-                          x: dnX, y: dnArrowY,
-                          intensity: animation.down.intensity,
-                          dim: dim,
-                          palette: palette)
+            drawArrow(in: ctx,
+                      x: upX, y: upArrowY,
+                      intensity: animation.up.intensity,
+                      dim: dim,
+                      idle: labelC,
+                      accent: palette.upload,
+                      pointsUp: true)
+            drawArrow(in: ctx,
+                      x: dnX, y: dnArrowY,
+                      intensity: animation.down.intensity,
+                      dim: dim,
+                      idle: labelC,
+                      accent: palette.download,
+                      pointsUp: false)
 
             // 2) Bar + particles + trail
             drawBar(in: ctx,
                     x: barX, y: barY,
                     carrying: animation.bar.carrying,
                     dim: dim,
-                    palette: palette)
+                    idle: labelC,
+                    carryingColor: palette.barCarrying)
 
             drawParticles(in: ctx,
                           bar: (x: barX, y: barY),
@@ -198,13 +224,16 @@ enum BarIconRenderer {
                           opacity: dim,
                           palette: palette)
 
-            // 3) Digits — not dimmed by proxyEnabled; the % is independent.
+            // 3) Digits — independent of `dim`. Their own opacity already
+            //    reflects refreshing / stale / errored states via
+            //    `resolved.opacity`.
             drawDigits(in: ctx,
                        x: digitsX,
                        slotWidth: digitSlot,
                        font: digitFont,
                        text: resolved.text,
-                       color: resolved.color,
+                       baseColor: resolved.baseColor,
+                       pulseTarget: resolved.pulseTarget,
                        baseOpacity: resolved.opacity,
                        percent: animation.percent)
             _ = rect
@@ -216,63 +245,76 @@ enum BarIconRenderer {
 
     // MARK: Percent resolution (digits text + color)
 
+    /// `baseColor` is the color the digits sit at when no pulse is active.
+    /// `pulseTarget`, when non-nil, is the palette accent the digits fade
+    /// toward during a `highlight` or `settle` pulse — that is the only
+    /// time color appears. Alert (≥100%) is the exception: it stays red
+    /// steady-state so the over-quota signal does not hide between ticks.
     private struct ResolvedPercent {
         let text: String
-        let color: NSColor
+        let baseColor: NSColor
+        let pulseTarget: NSColor?
         let opacity: CGFloat
     }
 
     private static func resolvePercent(
         model: StatusBarIconModel,
         animation: IconAnimation,
-        palette: Palette
+        palette: Palette,
+        labelColor: NSColor
     ) -> ResolvedPercent {
-        let displayText: String
-        let baseColor: NSColor
-        let opacity: CGFloat
+        // A placeholder (?, !, ~, ---) always sits at labelColor and does
+        // not flash — nothing to predict, nothing to settle.
+        func placeholder(_ text: String, opacity: CGFloat) -> ResolvedPercent {
+            ResolvedPercent(text: text, baseColor: labelColor, pulseTarget: nil, opacity: opacity)
+        }
+
+        // A real percentage reads as labelColor at rest and crossfades to
+        // the palette accent while a pulse is active. Alert short-circuits
+        // that — we want to see the red even with no pulse in flight.
+        func numeric(_ text: String, opacity: CGFloat) -> ResolvedPercent {
+            if animation.percent.alert {
+                return ResolvedPercent(
+                    text: text,
+                    baseColor: palette.percentAlert,
+                    pulseTarget: nil,
+                    opacity: opacity
+                )
+            }
+            return ResolvedPercent(
+                text: text,
+                baseColor: labelColor,
+                pulseTarget: palette.percent,
+                opacity: opacity
+            )
+        }
 
         switch model.state {
         case .unconfigured:
-            displayText = " ? "
-            baseColor = .secondaryLabelColor
-            opacity = 1
+            // Dim right half: the provider can't tell us anything.
+            return placeholder(" ? ", opacity: 0.55)
         case .error:
-            displayText = " ! "
-            baseColor = .secondaryLabelColor
-            opacity = 1
+            // Dim right half on errored usage, matching the stale treatment.
+            return placeholder(" ! ", opacity: 0.55)
         case .refreshing:
             if let u = model.utilization {
-                displayText = percentText(for: u)
-                baseColor = animation.percent.alert ? palette.percentAlert : palette.percent
-                opacity = 0.55
+                return numeric(percentText(for: u), opacity: 0.55)
             } else {
-                displayText = " ~ "
-                baseColor = .secondaryLabelColor
-                opacity = 0.55
+                return placeholder(" ~ ", opacity: 0.55)
             }
         case .ready:
             if let u = model.utilization {
-                displayText = percentText(for: u)
-                baseColor = animation.percent.alert ? palette.percentAlert : palette.percent
-                opacity = 1
+                return numeric(percentText(for: u), opacity: 1)
             } else {
-                displayText = " ? "
-                baseColor = .secondaryLabelColor
-                opacity = 1
+                return placeholder(" ? ", opacity: 1)
             }
         case .stale:
             if let u = model.utilization {
-                displayText = percentText(for: u)
-                baseColor = animation.percent.alert ? palette.percentAlert : palette.percent
-                opacity = 0.55
+                return numeric(percentText(for: u), opacity: 0.55)
             } else {
-                displayText = "---"
-                baseColor = .secondaryLabelColor
-                opacity = 0.55
+                return placeholder("---", opacity: 0.55)
             }
         }
-
-        return ResolvedPercent(text: displayText, color: baseColor, opacity: opacity)
     }
 
     /// "FUL" at 100%, otherwise "NN%" padded to 3 chars.
@@ -348,20 +390,13 @@ enum BarIconRenderer {
         return path
     }
 
-    private static func drawUpArrow(in ctx: CGContext, x: CGFloat, y: CGFloat, intensity: CGFloat, dim: CGFloat, palette: Palette) {
-        drawArrow(in: ctx, x: x, y: y, intensity: intensity, dim: dim, color: palette.upload, pointsUp: true)
-    }
-
-    private static func drawDownArrow(in ctx: CGContext, x: CGFloat, y: CGFloat, intensity: CGFloat, dim: CGFloat, palette: Palette) {
-        drawArrow(in: ctx, x: x, y: y, intensity: intensity, dim: dim, color: palette.download, pointsUp: false)
-    }
-
     private static func drawArrow(
         in ctx: CGContext,
         x: CGFloat, y: CGFloat,
         intensity: CGFloat,
         dim: CGFloat,
-        color: NSColor,
+        idle: NSColor,
+        accent: NSColor,
         pointsUp: Bool
     ) {
         let path = arrowPath(pointsUp: pointsUp, width: arrowWidth, height: arrowHeight)
@@ -369,27 +404,29 @@ enum BarIconRenderer {
         ctx.saveGState()
         ctx.translateBy(x: x, y: y)
 
-        // Dim baseline (always visible). Glows fade in with intensity.
-        // `dim` further attenuates the final alpha so the proxy-off state
-        // recedes even when no traffic animation is active.
-        let dimAlpha: CGFloat = 0.22
-        let baseAlpha = (dimAlpha + (1.0 - dimAlpha) * intensity) * dim
+        // Crossfade the fill color from labelColor (rest) to the palette
+        // accent (full animation). `idle` already carries 85% alpha, so the
+        // rest-state glyph matches Wi-Fi, Battery, and other stock icons;
+        // at full intensity we reach the accent's native alpha. `dim`
+        // multiplies the resulting alpha so proxy-off visibly recedes.
+        let color = blend(from: idle, to: accent, t: intensity)
+        let finalAlpha = color.alphaComponent * dim
         let effectiveIntensity = intensity * dim
 
-        // Soft glow halo when active.
+        // Soft glow halo while animating.
         if effectiveIntensity > 0.02 {
             ctx.saveGState()
             ctx.setShadow(
                 offset: .zero,
                 blur: 3.0 * effectiveIntensity,
-                color: color.withAlphaComponent(0.75 * effectiveIntensity).cgColor
+                color: accent.withAlphaComponent(0.75 * effectiveIntensity).cgColor
             )
-            ctx.setFillColor(color.withAlphaComponent(baseAlpha).cgColor)
+            ctx.setFillColor(color.withAlphaComponent(finalAlpha).cgColor)
             ctx.addPath(path)
             ctx.fillPath()
             ctx.restoreGState()
         } else {
-            ctx.setFillColor(color.withAlphaComponent(baseAlpha).cgColor)
+            ctx.setFillColor(color.withAlphaComponent(finalAlpha).cgColor)
             ctx.addPath(path)
             ctx.fillPath()
         }
@@ -404,13 +441,15 @@ enum BarIconRenderer {
         x: CGFloat, y: CGFloat,
         carrying: CGFloat,
         dim: CGFloat,
-        palette: Palette
+        idle: NSColor,
+        carryingColor: NSColor
     ) {
         let rect = CGRect(x: x, y: y, width: barWidth, height: barHeight)
-        let neutralAlpha: CGFloat = 0.75
 
-        let color = blend(from: palette.barNeutral, to: palette.barCarrying, t: carrying)
-        let alpha = (neutralAlpha + (1.0 - neutralAlpha) * carrying) * dim
+        // Same story as the arrows: rest-state = labelColor, carrying-state =
+        // palette accent, crossfade between them on `carrying`.
+        let color = blend(from: idle, to: carryingColor, t: carrying)
+        let finalAlpha = color.alphaComponent * dim
         let effectiveCarrying = carrying * dim
 
         if effectiveCarrying > 0.02 {
@@ -418,15 +457,15 @@ enum BarIconRenderer {
             ctx.setShadow(
                 offset: .zero,
                 blur: 2.5 * effectiveCarrying,
-                color: palette.barCarrying.withAlphaComponent(0.6 * effectiveCarrying).cgColor
+                color: carryingColor.withAlphaComponent(0.6 * effectiveCarrying).cgColor
             )
-            ctx.setFillColor(color.withAlphaComponent(alpha).cgColor)
+            ctx.setFillColor(color.withAlphaComponent(finalAlpha).cgColor)
             let path = CGPath(roundedRect: rect, cornerWidth: barWidth / 2, cornerHeight: barWidth / 2, transform: nil)
             ctx.addPath(path)
             ctx.fillPath()
             ctx.restoreGState()
         } else {
-            ctx.setFillColor(color.withAlphaComponent(alpha).cgColor)
+            ctx.setFillColor(color.withAlphaComponent(finalAlpha).cgColor)
             let path = CGPath(roundedRect: rect, cornerWidth: barWidth / 2, cornerHeight: barWidth / 2, transform: nil)
             ctx.addPath(path)
             ctx.fillPath()
@@ -513,16 +552,31 @@ enum BarIconRenderer {
         slotWidth: CGFloat,
         font: NSFont,
         text: String,
-        color: NSColor,
+        baseColor: NSColor,
+        pulseTarget: NSColor?,
         baseOpacity: CGFloat,
         percent: IconAnimation.PercentState
     ) {
         // The settling animation briefly dips the opacity at mid-transition
         // and recovers — simulated here as a subtle additional fade.
-        let settleDip = 0.5 * percent.settle   // up to 50% dip
+        let settleDip = 0.5 * percent.settle
         let settledOpacity = max(0.15, baseOpacity - settleDip * baseOpacity)
 
-        let finalColor = color.withAlphaComponent(settledOpacity)
+        // Crossfade to the palette accent while a pulse is in flight. At
+        // rest (no highlight, no settle) the digits stay at labelColor and
+        // read like a stock menu extra — color only blooms on tick events.
+        let pulse = max(percent.highlight, percent.settle)
+        let color: NSColor
+        if let target = pulseTarget {
+            color = blend(from: baseColor, to: target, t: pulse)
+        } else {
+            color = baseColor
+        }
+
+        // Multiply opacity through so labelColor's built-in 85% alpha
+        // survives instead of being silently replaced.
+        let finalAlpha = color.alphaComponent * settledOpacity
+        let finalColor = color.withAlphaComponent(finalAlpha)
 
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = .center
@@ -536,19 +590,19 @@ enum BarIconRenderer {
         let textSize = attrStr.size()
         let textY = (iconHeight - textSize.height) / 2 + 0.5   // optical nudge
 
-        // Highlight pulse — a subtle glow behind the digits.
-        if percent.highlight > 0.02 {
+        // Highlight pulse — glow only makes sense when there's a pulse target
+        // to glow toward (i.e. the digits carry an animatable accent).
+        if let target = pulseTarget, percent.highlight > 0.02 {
             ctx.saveGState()
             ctx.setShadow(
                 offset: .zero,
                 blur: 3.5 * percent.highlight,
-                color: color.withAlphaComponent(0.85 * percent.highlight).cgColor
+                color: target.withAlphaComponent(0.85 * percent.highlight).cgColor
             )
             attrStr.draw(in: CGRect(x: x, y: textY, width: slotWidth, height: textSize.height))
             ctx.restoreGState()
         }
 
-        // Normal draw.
         attrStr.draw(in: CGRect(x: x, y: textY, width: slotWidth, height: textSize.height))
     }
 
