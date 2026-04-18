@@ -92,20 +92,46 @@ enum BarIconRenderer {
 
     // MARK: Palette
 
-    private static let cUpload   = NSColor(srgbRed: 0.310, green: 0.765, blue: 0.969, alpha: 1)   // #4FC3F7
-    private static let cDownload = NSColor(srgbRed: 0.204, green: 0.827, blue: 0.600, alpha: 1)   // #34D399
-    private static let cBarN     = NSColor(srgbRed: 0.612, green: 0.639, blue: 0.686, alpha: 1)   // #9CA3AF
-    private static let cBarC     = NSColor(srgbRed: 0.984, green: 0.573, blue: 0.235, alpha: 1)   // #FB923C
-    private static let cPct      = NSColor(srgbRed: 0.961, green: 0.620, blue: 0.043, alpha: 1)   // #F59E0B
-    private static let cPctHi    = NSColor(srgbRed: 0.937, green: 0.267, blue: 0.267, alpha: 1)   // #EF4444
+    /// Appearance-specific color set. The light-mode variants are darker and
+    /// more saturated so they remain legible against a bright menu bar, while
+    /// the dark-mode variants are the lighter, airier tones that read well on
+    /// the translucent dark menu bar.
+    private struct Palette {
+        let upload: NSColor
+        let download: NSColor
+        let barNeutral: NSColor
+        let barCarrying: NSColor
+        let percent: NSColor
+        let percentAlert: NSColor
+
+        static let dark = Palette(
+            upload:       NSColor(srgbRed: 0.310, green: 0.765, blue: 0.969, alpha: 1), // #4FC3F7 sky-300
+            download:     NSColor(srgbRed: 0.204, green: 0.827, blue: 0.600, alpha: 1), // #34D399 emerald-400
+            barNeutral:   NSColor(srgbRed: 0.612, green: 0.639, blue: 0.686, alpha: 1), // #9CA3AF gray-400
+            barCarrying:  NSColor(srgbRed: 0.984, green: 0.749, blue: 0.141, alpha: 1), // #FBBF24 amber-400 (pure amber)
+            percent:      NSColor(srgbRed: 0.961, green: 0.620, blue: 0.043, alpha: 1), // #F59E0B amber-500
+            percentAlert: NSColor(srgbRed: 0.937, green: 0.267, blue: 0.267, alpha: 1)  // #EF4444 red-500 (alert only)
+        )
+
+        static let light = Palette(
+            upload:       NSColor(srgbRed: 0.118, green: 0.251, blue: 0.686, alpha: 1), // #1E40AF blue-800
+            download:     NSColor(srgbRed: 0.024, green: 0.373, blue: 0.275, alpha: 1), // #065F46 emerald-800
+            barNeutral:   NSColor(srgbRed: 0.216, green: 0.255, blue: 0.318, alpha: 1), // #374151 gray-700
+            barCarrying:  NSColor(srgbRed: 0.631, green: 0.384, blue: 0.027, alpha: 1), // #A16207 yellow-700 (gold, low-red)
+            percent:      NSColor(srgbRed: 0.522, green: 0.302, blue: 0.055, alpha: 1), // #854D0E yellow-800 (deep gold)
+            percentAlert: NSColor(srgbRed: 0.725, green: 0.110, blue: 0.110, alpha: 1)  // #B91C1C red-700 (alert only)
+        )
+    }
 
     // MARK: Public entry point
 
     @MainActor
     static func renderIcon(
         _ model: StatusBarIconModel,
-        animation: IconAnimation = .idle
+        animation: IconAnimation = .idle,
+        isDarkAppearance: Bool = true
     ) -> NSImage {
+        let palette: Palette = isDarkAppearance ? .dark : .light
         // Compute total icon width. The digits slot is fixed at `digitSlotChars`
         // monospaced chars wide so the menu bar icon does not jitter as the
         // percentage changes. "FUL" intentionally renders at the same width.
@@ -123,7 +149,7 @@ enum BarIconRenderer {
         let image = NSImage(size: size, flipped: false) { rect in
             guard let ctx = NSGraphicsContext.current?.cgContext else { return true }
 
-            let resolved = resolvePercent(model: model, animation: animation)
+            let resolved = resolvePercent(model: model, animation: animation, palette: palette)
 
             // Positions
             let upX  = padLeading
@@ -149,24 +175,28 @@ enum BarIconRenderer {
             drawUpArrow(in: ctx,
                         x: upX, y: upArrowY,
                         intensity: animation.up.intensity,
-                        dim: dim)
+                        dim: dim,
+                        palette: palette)
             drawDownArrow(in: ctx,
                           x: dnX, y: dnArrowY,
                           intensity: animation.down.intensity,
-                          dim: dim)
+                          dim: dim,
+                          palette: palette)
 
             // 2) Bar + particles + trail
             drawBar(in: ctx,
                     x: barX, y: barY,
                     carrying: animation.bar.carrying,
-                    dim: dim)
+                    dim: dim,
+                    palette: palette)
 
             drawParticles(in: ctx,
                           bar: (x: barX, y: barY),
                           digitsX: digitsX,
                           gap: gapBarToDigits,
                           particles: animation.particles,
-                          opacity: dim)
+                          opacity: dim,
+                          palette: palette)
 
             // 3) Digits — not dimmed by proxyEnabled; the % is independent.
             drawDigits(in: ctx,
@@ -194,7 +224,8 @@ enum BarIconRenderer {
 
     private static func resolvePercent(
         model: StatusBarIconModel,
-        animation: IconAnimation
+        animation: IconAnimation,
+        palette: Palette
     ) -> ResolvedPercent {
         let displayText: String
         let baseColor: NSColor
@@ -212,7 +243,7 @@ enum BarIconRenderer {
         case .refreshing:
             if let u = model.utilization {
                 displayText = percentText(for: u)
-                baseColor = animation.percent.alert ? cPctHi : cPct
+                baseColor = animation.percent.alert ? palette.percentAlert : palette.percent
                 opacity = 0.55
             } else {
                 displayText = " ~ "
@@ -222,7 +253,7 @@ enum BarIconRenderer {
         case .ready:
             if let u = model.utilization {
                 displayText = percentText(for: u)
-                baseColor = animation.percent.alert ? cPctHi : cPct
+                baseColor = animation.percent.alert ? palette.percentAlert : palette.percent
                 opacity = 1
             } else {
                 displayText = " ? "
@@ -232,7 +263,7 @@ enum BarIconRenderer {
         case .stale:
             if let u = model.utilization {
                 displayText = percentText(for: u)
-                baseColor = animation.percent.alert ? cPctHi : cPct
+                baseColor = animation.percent.alert ? palette.percentAlert : palette.percent
                 opacity = 0.55
             } else {
                 displayText = "---"
@@ -317,12 +348,12 @@ enum BarIconRenderer {
         return path
     }
 
-    private static func drawUpArrow(in ctx: CGContext, x: CGFloat, y: CGFloat, intensity: CGFloat, dim: CGFloat) {
-        drawArrow(in: ctx, x: x, y: y, intensity: intensity, dim: dim, color: cUpload, pointsUp: true)
+    private static func drawUpArrow(in ctx: CGContext, x: CGFloat, y: CGFloat, intensity: CGFloat, dim: CGFloat, palette: Palette) {
+        drawArrow(in: ctx, x: x, y: y, intensity: intensity, dim: dim, color: palette.upload, pointsUp: true)
     }
 
-    private static func drawDownArrow(in ctx: CGContext, x: CGFloat, y: CGFloat, intensity: CGFloat, dim: CGFloat) {
-        drawArrow(in: ctx, x: x, y: y, intensity: intensity, dim: dim, color: cDownload, pointsUp: false)
+    private static func drawDownArrow(in ctx: CGContext, x: CGFloat, y: CGFloat, intensity: CGFloat, dim: CGFloat, palette: Palette) {
+        drawArrow(in: ctx, x: x, y: y, intensity: intensity, dim: dim, color: palette.download, pointsUp: false)
     }
 
     private static func drawArrow(
@@ -372,12 +403,13 @@ enum BarIconRenderer {
         in ctx: CGContext,
         x: CGFloat, y: CGFloat,
         carrying: CGFloat,
-        dim: CGFloat
+        dim: CGFloat,
+        palette: Palette
     ) {
         let rect = CGRect(x: x, y: y, width: barWidth, height: barHeight)
         let neutralAlpha: CGFloat = 0.75
 
-        let color = blend(from: cBarN, to: cBarC, t: carrying)
+        let color = blend(from: palette.barNeutral, to: palette.barCarrying, t: carrying)
         let alpha = (neutralAlpha + (1.0 - neutralAlpha) * carrying) * dim
         let effectiveCarrying = carrying * dim
 
@@ -386,7 +418,7 @@ enum BarIconRenderer {
             ctx.setShadow(
                 offset: .zero,
                 blur: 2.5 * effectiveCarrying,
-                color: cBarC.withAlphaComponent(0.6 * effectiveCarrying).cgColor
+                color: palette.barCarrying.withAlphaComponent(0.6 * effectiveCarrying).cgColor
             )
             ctx.setFillColor(color.withAlphaComponent(alpha).cgColor)
             let path = CGPath(roundedRect: rect, cornerWidth: barWidth / 2, cornerHeight: barWidth / 2, transform: nil)
@@ -411,7 +443,8 @@ enum BarIconRenderer {
         digitsX: CGFloat,
         gap: CGFloat,
         particles: [IconAnimation.Particle],
-        opacity: CGFloat
+        opacity: CGFloat,
+        palette: Palette
     ) {
         guard !particles.isEmpty, opacity > 0.01 else { return }
 
@@ -431,16 +464,17 @@ enum BarIconRenderer {
                 in: ctx,
                 from: CGPoint(x: trailStart, y: yCenter),
                 to: CGPoint(x: px, y: yCenter),
-                opacity: 0.85 * opacity
+                opacity: 0.85 * opacity,
+                palette: palette
             )
 
             // Particle dot with glow.
             ctx.setShadow(
                 offset: .zero,
                 blur: 2.5,
-                color: cBarC.withAlphaComponent(0.9 * opacity).cgColor
+                color: palette.barCarrying.withAlphaComponent(0.9 * opacity).cgColor
             )
-            ctx.setFillColor(cBarC.withAlphaComponent(1.0 * opacity).cgColor)
+            ctx.setFillColor(palette.barCarrying.withAlphaComponent(1.0 * opacity).cgColor)
             let dotDiameter: CGFloat = 2.4
             let dot = CGRect(
                 x: px - dotDiameter / 2,
@@ -458,12 +492,13 @@ enum BarIconRenderer {
         in ctx: CGContext,
         from: CGPoint,
         to: CGPoint,
-        opacity: CGFloat
+        opacity: CGFloat,
+        palette: Palette
     ) {
         ctx.saveGState()
         ctx.setLineCap(.round)
         ctx.setLineWidth(1.2)
-        ctx.setStrokeColor(cBarC.withAlphaComponent(opacity).cgColor)
+        ctx.setStrokeColor(palette.barCarrying.withAlphaComponent(opacity).cgColor)
         ctx.move(to: from)
         ctx.addLine(to: to)
         ctx.strokePath()

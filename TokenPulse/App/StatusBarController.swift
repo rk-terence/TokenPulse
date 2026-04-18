@@ -75,6 +75,7 @@ final class StatusBarController {
     // MARK: - State
 
     nonisolated(unsafe) private var animationTimer: Timer?
+    nonisolated(unsafe) private var appearanceObservation: NSKeyValueObservation?
     private var upTrack = ArrowTrack()
     private var downTrack = ArrowTrack()
     private var barTrack = BarTrack()
@@ -136,12 +137,20 @@ final class StatusBarController {
             self?.render()
         }
 
+        // Re-render on system appearance changes so the icon palette tracks
+        // the light/dark menu bar. KVO on NSApp.effectiveAppearance fires on
+        // both manual theme changes and Auto-switch sunset/sunrise.
+        appearanceObservation = NSApp.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
+            Task { @MainActor [weak self] in self?.render() }
+        }
+
         // Initial render
         render()
     }
 
     deinit {
         animationTimer?.invalidate()
+        appearanceObservation?.invalidate()
         if let eventMonitor    { NSEvent.removeMonitor(eventMonitor) }
         if let localEventMonitor { NSEvent.removeMonitor(localEventMonitor) }
     }
@@ -297,7 +306,16 @@ final class StatusBarController {
             ),
             proxyEnabled: proxyController?.isRunning ?? false
         )
-        let image = BarIconRenderer.renderIcon(currentIconModel, animation: animation)
+        // Read from NSApp directly: that's what the KVO observes, and the
+        // button's effectiveAppearance can lag by a tick on theme switches,
+        // causing the first render after a toggle to pick the stale palette.
+        let isDark = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+
+        let image = BarIconRenderer.renderIcon(
+            currentIconModel,
+            animation: animation,
+            isDarkAppearance: isDark
+        )
         statusItem.button?.image = image
         statusItem.length = image.size.width
     }
