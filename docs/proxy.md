@@ -104,9 +104,11 @@ For OpenAI `previous_response_id` bodies with no messages, the tree force-links 
 
 Sessions are a thin UI grouping layer; they do not drive tree matching.
 
-- Sessions with a recognized flavor (Anthropic / OpenAI) keep their session summary for up to 24 hours; `other` traffic expires after 60 seconds of inactivity when no requests are in flight.
+- Sessions with a recognized flavor (Anthropic / OpenAI) keep their session summary for up to 24 hours; `other` traffic expires after 5 minutes of inactivity when no requests are in flight.
+- Session tracking and logging continue to use the underlying `ProxySessionStore`; the UI applies its own visibility filter on top of those tracked sessions for popup display.
 - Active (in-flight) requests are always shown.
-- Done requests in flavored sessions come from `ContentTree.displayableRequests()` — a successful request is displayable until its node has any descendant carrying a succeeded request. If a descendant has only in-flight requests, the parent's row is still displayed but **dimmed** pending completion. In untracked (`other`) sessions, done requests follow the 60-second cutoff.
+- Done requests in flavored sessions come from `ContentTree.displayableRequests()` — a successful request is displayable until its node has any descendant carrying a succeeded request. If a descendant has only in-flight requests, the parent's row is still displayed but **dimmed** pending completion. In untracked (`other`) sessions, done requests follow the same 5-minute cutoff.
+- Identified sessions remain visible in the popup while any request is in flight, or until 10 minutes have passed since the most recent completed request.
 - Errored / cancelled requests disappear from the "active" section on termination and do not become displayable; they remain in the tree as auditable records until they age out.
 
 ## Message normalization
@@ -404,7 +406,7 @@ If the initial insert fails, the logger falls back to a standalone insert with t
 
 # Status snapshots
 
-When `ProxyEventLogger` is enabled (`saveProxyEventLog == true`), the proxy writes an atomic JSON snapshot to `~/.tokenpulse/proxy_status.json` after forwarded proxy request completions and during forced proxy shutdown. The writes are throttled, so multiple completions inside the throttle window may collapse into one later snapshot.
+When `ProxyEventLogger` is enabled (`saveProxyEventLog == true`), the proxy writes an atomic JSON snapshot to `~/.tokenpulse/proxy_status.json` after forwarded proxy request completions and during forced proxy shutdown. `activeSessions` is the raw tracked session count from `sessionStore.activeSessions()`, not the popup's UI-filtered visible-session count. The writes are throttled, so multiple completions inside the throttle window may collapse into one later snapshot.
 
 ## Format
 
@@ -459,10 +461,10 @@ Legacy `proxyUpstreamURL` is still read during config migration and mapped to `a
 | Max Content-Length | 50 MB (`50_000_000`) | `ProxyHTTPServer.processRequest()` |
 | Max header size | 64 KB (`65_536`) | `ProxyHTTPServer.readRequest()` |
 | Tracked session retention (Anthropic / OpenAI) | 24 hours since last activity | `LocalProxyController.sessionRetentionSeconds` + `ProxySessionID.usesShortRetentionWindow(...)` |
-| `other` session retention | 60 seconds since last activity | `LocalProxyController.otherTrafficRetentionSeconds` |
-| Tracked session UI visibility | 10 minutes since last activity, or any in-flight request | `LocalProxyController.visibleSessionActivities(...)` |
+| `other` session retention | 5 minutes since last activity | `LocalProxyController.otherTrafficRetentionSeconds` |
+| Tracked session UI visibility | 10 minutes since last completion, or any in-flight request | `LocalProxyController.visibleSessionActivities(...)` |
 | Content-tree request retention | 24 hours since terminal finish time | `LocalProxyController.contentTreePruneRetention` + `ContentTree.prune(...)` |
-| Untracked / `other` done request retention | 60 seconds | `LocalProxyController.otherTrafficRetentionSeconds` + `ProxySessionStore.pruneStaleDoneRequests(...)` |
+| Untracked / `other` done request retention | 5 minutes | `LocalProxyController.otherTrafficRetentionSeconds` + `ProxySessionStore.pruneStaleDoneRequests(...)` |
 | Event retention | 24 hours | `ProxyEventLogger.maxEventAge` |
 | Event prune pass | Opportunistic on write after 5 minutes have elapsed since the last prune | `ProxyEventLogger.pruneInterval` |
 | Status snapshot throttle | 1 second minimum interval | `ProxyEventLogger.statusSnapshotThrottleInterval` |

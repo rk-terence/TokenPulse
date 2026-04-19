@@ -1,6 +1,6 @@
 # TokenPulse
 
-A macOS menu bar app that monitors AI platform token usage and optimizes API costs through a local proxy. A compact `↑ ↓ | NN%` menu bar icon shows the active provider's primary-window utilization at a glance, while the optional proxy supports manual cache-warming keepalives to reduce cache-write costs when you need them.
+A macOS menu bar app that monitors AI platform token usage and adds local proxy observability for supported AI tools. A compact `↑ ↓ | NN%` menu bar icon shows the active provider's primary-window utilization at a glance, while the optional proxy tracks per-session traffic, token usage, and estimated cost.
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-blue) ![Swift 5](https://img.shields.io/badge/Swift-5-orange)
 
@@ -42,13 +42,13 @@ A macOS menu bar app that monitors AI platform token usage and optimizes API cos
 
 [CodexBar](https://github.com/steipete/CodexBar) is an excellent menu bar usage tracker with 15+ providers and an active community. TokenPulse exists because it makes different trade-offs:
 
-- **Local caching proxy** — TokenPulse can sit between your AI tools and the upstream API, with manual cache-warming keepalives available from the popover for tracked Anthropic sessions. This is a cost optimization layer that can save you money rather than just reporting what you've spent.
+- **Local observability proxy** — TokenPulse can sit between your AI tools and the upstream API, adding per-session traffic, token, and cost visibility plus a universal lineage tree for popup display and payload deduplication. It gives you a view into usage that upstream tools usually do not expose locally.
 - **ZenMux support** — TokenPulse supports ZenMux out of the box via their official Management API. ZenMux is a niche provider that CodexBar doesn't cover, and likely too niche for them to want to maintain.
 - **One glance, no mode switch** — CodexBar shows two stacked bars per provider with multiple display modes. TokenPulse shows the active provider's primary-window utilization directly in the icon, so you can read current usage without opening a detail view.
 - **Minimal by design** — TokenPulse is ~28 source files with a simple `UsageProvider` protocol and an actor-based proxy subsystem. No SwiftSyntax macros, no helper processes, no multi-strategy fallback chains. The entire codebase is easy to audit, fork, and modify.
 - **Machine-readable output** — Provider refresh results write a normalized snapshot to `~/.tokenpulse/raw_usage.json`, and the proxy can write status snapshots to `~/.tokenpulse/proxy_status.json` whenever proxy logging infrastructure is enabled. Shell scripts and external tools can consume both without scraping or IPC.
 
-If you use many AI providers and want comprehensive coverage, use CodexBar. If you use Codex, Claude, and/or ZenMux and want something small and direct — especially with manual cache-warming support for tracked Anthropic sessions — TokenPulse is for you.
+If you use many AI providers and want comprehensive coverage, use CodexBar. If you use Codex, Claude, and/or ZenMux and want something small and direct with local proxy observability, TokenPulse is for you.
 
 ## Install
 
@@ -110,7 +110,7 @@ When the proxy is off, the arrows and bar dim; the percentage stays at its norma
 
 ## Local proxy
 
-TokenPulse includes an optional local HTTP proxy that sits between your AI tools and upstream APIs. It currently serves **Anthropic Messages** (`/v1/messages`) and **OpenAI Responses** (`/v1/responses`) on the same local port. It forwards requests transparently while adding two capabilities: **manual cache-warming keepalives** for tracked Anthropic sessions, and **per-session observability** that tracks token usage, bytes, and estimated cost.
+TokenPulse includes an optional local HTTP proxy that sits between your AI tools and upstream APIs. It currently serves **Anthropic Messages** (`/v1/messages`) and **OpenAI Responses** (`/v1/responses`) on the same local port. It forwards requests transparently while adding two capabilities: a **universal lineage tree** for popup display and payload deduplication, and **per-session observability** that tracks token usage, bytes, and estimated cost.
 
 ### Setup
 
@@ -126,23 +126,21 @@ The proxy listens on `127.0.0.1` only (IPv4 loopback) and never binds all interf
 
 ### How it works
 
-The proxy is a full HTTP/1.1 server built on Network.framework. Anthropic Messages traffic uses `X-Claude-Code-Session-Id` for tracked sessions; OpenAI Responses traffic is tracked when Codex session headers are present, and Codex subagent threads are recursively folded back into the root Codex session when parent thread metadata is available. Non-Codex OpenAI traffic is grouped as `Other`.
+The proxy is a full HTTP/1.1 server built on Network.framework. Anthropic Messages traffic uses `X-Claude-Code-Session-Id` for tracked sessions; OpenAI Responses traffic is tracked as Codex session traffic when `session_id` is present and matches the `x-codex-window-id` prefix (`<session_id>:<window_generation>`). The UI groups that traffic by session while the lineage tree handles content-level conversation grouping. Non-Codex OpenAI traffic is grouped as `Other`.
 
 - **Forwarding** — Requests are forwarded to the upstream URL with streaming SSE passthrough. Token usage is parsed from JSON responses and from terminal usage events in SSE streams.
 - **Cost tracking** — Per-session counters track input/output/cache-read/cache-write tokens and estimate cost using per-model pricing tables. The popover shows active sessions with their request counts and running cost.
 - **Traffic indicator** — When the proxy forwards a request, the menu bar arrows glow and the bar/particle track animates to reflect request and completion activity.
 
-### Manual keepalives
+### Keepalive status
 
-Anthropic's prompt cache has a 5-minute TTL. If your next request arrives after the cache expires, the full prompt is re-cached at a cost of ~1.25x base input tokens. Keepalives prevent this by sending minimal requests (`max_tokens=1`) that read the cache at ~0.10x base input tokens — a net saving of ~1.15x per avoided cache write.
-
-When TokenPulse establishes Anthropic lineage for a session, the popover can expose a per-session **Manual** keepalive mode. Sending one keepalive replays cache-relevant fields (system prompt, messages, tools, tool_choice, thinking config) as a minimal Anthropic request using the stored tracked path. If a newer same-lineage request has already received an upstream `2xx` but is still streaming, TokenPulse may prefer that active request as the keepalive source on the working hypothesis that upstream acceptance usually means the cached prompt state was usable, even though Anthropic does not document `2xx` as a strict cache-hit signal. Otherwise it falls back to the last completed tracked request. The result is logged and counted in session metrics; there is no automatic background keepalive loop in the current implementation.
+Keep-alive (cache-warming replay requests) is not currently implemented. The previous Anthropic-specific manual keepalive surface was removed in favor of the universal lineage tree and shared observability model. A future iteration may reintroduce cache-warming on top of that tree, but it is not part of the live product today.
 
 ### Observability
 
 When `saveProxyEventLog` is enabled, the proxy writes structured event logs to `~/.tokenpulse/proxy_events.sqlite` (SQLite, WAL mode) and atomic status snapshots to `~/.tokenpulse/proxy_status.json` (throttled to 1-second intervals). Events are pruned after 24 hours with 5-minute sweep cycles.
 
-Payload capture is now part of the same `saveProxyEventLog` toggle. Per-request extras and lineage refs live in `proxy_request_content`; the actual prompt content (system, tools, messages) is stored once per conversation in `proxy_conversations` + `proxy_lineage_segments` and referenced from each request. Streaming response capture is truncated to 4 MB per request.
+Payload capture is now part of the same `saveProxyEventLog` toggle. Per-request extras live in `proxy_request_content`; conversation fingerprints live in `proxy_conversations`; content-tree node deltas are stored in `proxy_nodes.delta_messages_json`; request rows live in `proxy_requests`; and lifecycle events live in `proxy_lifecycle`. Streaming response capture is truncated to 4 MB per request.
 
 For the full proxy architecture, request flow, lineage-tree semantics, and SQLite schema, see [docs/proxy.md](docs/proxy.md).
 
@@ -182,9 +180,7 @@ TokenPulse sends macOS notifications for important usage events:
 | **Primary window above 80%** | Utilization crosses the 80% threshold (entering red zone) |
 | **Primary quota reset** | The provider's primary quota window resets |
 | **Secondary quota reset** | The provider's secondary quota window resets |
-| **Proxy keepalive disabled** | A tracked Anthropic session loses manual keepalive availability |
-
-Provider usage notifications are sent per provider, and proxy keepalive notifications are sent per tracked session. Grant notification permission when prompted on first launch.
+Provider usage notifications are sent per provider. Grant notification permission when prompted on first launch.
 
 ## Project structure
 
