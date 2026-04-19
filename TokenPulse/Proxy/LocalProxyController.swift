@@ -8,7 +8,7 @@ final class LocalProxyController {
     private static let sessionExpirationSweepInterval: TimeInterval = 10
     private static let sessionRetentionSeconds: TimeInterval = 24 * 60 * 60
     private static let sessionVisibilitySeconds: TimeInterval = 10 * 60
-    private static let otherTrafficRetentionSeconds: TimeInterval = 60
+    private static let otherTrafficRetentionSeconds: TimeInterval = 5 * 60
     private static let contentTreePruneRetention: TimeInterval = 24 * 60 * 60
     private static let restartAttempts = 3
     private static let restartStopDelay: Duration = .milliseconds(150)
@@ -540,29 +540,50 @@ final class LocalProxyController {
         from snapshots: [ProxySessionStore.SessionSnapshot],
         now: Date
     ) -> [SessionActivity] {
-        let sessionCutoff = now.addingTimeInterval(-sessionVisibilitySeconds)
+        let identifiedCutoff = now.addingTimeInterval(-sessionVisibilitySeconds)
         let otherCutoff = now.addingTimeInterval(-otherTrafficRetentionSeconds)
 
-        return snapshots
-            .filter {
-                let cutoff = ProxySessionID.usesShortRetentionWindow(for: $0.sessionID) ? otherCutoff : sessionCutoff
-                return $0.lastSeenAt >= cutoff || !$0.activeRequests.isEmpty || !$0.doneRequests.isEmpty
+        var result: [SessionActivity] = []
+        for snap in snapshots {
+            let sortedActive = snap.activeRequests.sorted { $0.startedAt > $1.startedAt }
+            let sortedDone = snap.doneRequests.sorted {
+                ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt)
             }
-            .map { snap in
-                SessionActivity(
-                    sessionID: snap.sessionID,
-                    completedRequests: snap.completedRequestCount,
-                    erroredRequests: snap.erroredRequestCount,
-                    activeRequests: snap.activeRequests.sorted { $0.startedAt > $1.startedAt },
-                    doneRequests: snap.doneRequests.sorted {
-                        ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt)
-                    },
-                    totalInputTokens: snap.totalInputTokens,
-                    totalOutputTokens: snap.totalOutputTokens,
-                    totalCacheReadInputTokens: snap.totalCacheReadInputTokens,
-                    totalCacheCreationInputTokens: snap.totalCacheCreationInputTokens,
-                    estimatedCostUSD: snap.estimatedCostUSD
-                )
+
+            let visibleActive: [ProxyRequestActivity]
+            let visibleDone: [ProxyRequestActivity]
+
+            if ProxySessionID.usesShortRetentionWindow(for: snap.sessionID) {
+                // Other group: filter done rows by age; active rows always render.
+                // Drop the whole row when nothing is left to show.
+                visibleActive = sortedActive
+                visibleDone = sortedDone.filter {
+                    ($0.completedAt ?? $0.startedAt) >= otherCutoff
+                }
+                if visibleActive.isEmpty && visibleDone.isEmpty { continue }
+            } else {
+                // Identified: visible while in-flight, or while the most
+                // recent request finished within the visibility window.
+                let lastDone = snap.lastRequestDoneAt ?? .distantPast
+                let isLive = !sortedActive.isEmpty || lastDone >= identifiedCutoff
+                guard isLive else { continue }
+                visibleActive = sortedActive
+                visibleDone = sortedDone
             }
+
+            result.append(SessionActivity(
+                sessionID: snap.sessionID,
+                completedRequests: snap.completedRequestCount,
+                erroredRequests: snap.erroredRequestCount,
+                activeRequests: visibleActive,
+                doneRequests: visibleDone,
+                totalInputTokens: snap.totalInputTokens,
+                totalOutputTokens: snap.totalOutputTokens,
+                totalCacheReadInputTokens: snap.totalCacheReadInputTokens,
+                totalCacheCreationInputTokens: snap.totalCacheCreationInputTokens,
+                estimatedCostUSD: snap.estimatedCostUSD
+            ))
+        }
+        return result
     }
 }

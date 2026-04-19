@@ -19,6 +19,7 @@ actor ProxySessionStore {
     struct Session: Sendable {
         var sessionID: String
         var lastSeenAt: Date
+        var lastRequestDoneAt: Date?
         var inFlightRequestCount: Int
         var completedRequestCount: Int
         var erroredRequestCount: Int
@@ -33,6 +34,7 @@ actor ProxySessionStore {
     struct SessionSnapshot: Sendable {
         let sessionID: String
         let lastSeenAt: Date
+        let lastRequestDoneAt: Date?
         let completedRequestCount: Int
         let erroredRequestCount: Int
         let activeRequests: [ProxyRequestActivity]
@@ -141,6 +143,7 @@ actor ProxySessionStore {
             let session = Session(
                 sessionID: sessionID,
                 lastSeenAt: now,
+                lastRequestDoneAt: nil,
                 inFlightRequestCount: 0,
                 completedRequestCount: 0,
                 erroredRequestCount: 0,
@@ -425,6 +428,7 @@ actor ProxySessionStore {
             } else {
                 session.erroredRequestCount += 1
             }
+            session.lastRequestDoneAt = completedAt
             sessions[entry.sessionID] = session
         }
         onTraffic?(nil)
@@ -495,6 +499,7 @@ actor ProxySessionStore {
             SessionSnapshot(
                 sessionID: session.sessionID,
                 lastSeenAt: session.lastSeenAt,
+                lastRequestDoneAt: session.lastRequestDoneAt,
                 completedRequestCount: session.completedRequestCount,
                 erroredRequestCount: session.erroredRequestCount,
                 activeRequests: activeRequestsBySession[session.sessionID] ?? [],
@@ -515,12 +520,17 @@ actor ProxySessionStore {
 
     /// Remove sessions that have been idle since the given date.
     /// Skips sessions with in-flight requests to avoid dropping state mid-stream.
+    /// Idleness is measured against the more recent of `lastSeenAt` (when a
+    /// request last started) and `lastRequestDoneAt` (when one last finished);
+    /// otherwise a long-running request could complete after the sweep cutoff
+    /// yet be evicted before its retention window elapses.
     /// Returns the session IDs that were removed.
     func expireSessions(olderThan date: Date, otherOlderThan otherDate: Date) -> [String] {
         var expired: [String] = []
         for (id, session) in sessions {
             let cutoff = ProxySessionID.usesShortRetentionWindow(for: id) ? otherDate : date
-            guard session.lastSeenAt < cutoff,
+            let lastActivity = max(session.lastSeenAt, session.lastRequestDoneAt ?? .distantPast)
+            guard lastActivity < cutoff,
                   session.inFlightRequestCount == 0 else {
                 continue
             }
