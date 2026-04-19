@@ -34,7 +34,10 @@ struct ContentTree: Sendable {
 
     // MARK: - Normalized message
 
-    /// A message after stripping transient markers (cache_control, ephemeral, etc.).
+    /// One provider-normalized lineage item. Anthropic strips prompt-caching
+    /// markers and coalesces equivalent consecutive turns; OpenAI keeps the
+    /// full ordered `input` item list while normalizing only documented
+    /// shorthands. `role` is a display/debug label (message role or item type).
     /// `contentHash` is the canonical SHA-256 used for prefix folding;
     /// `rawJSON` is the normalized JSON kept for payload reconstruction.
     struct NormalizedMessage: Sendable, Equatable {

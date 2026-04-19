@@ -209,6 +209,18 @@ final class ProxyForwarder: Sendable {
         requestStartedAt: Date,
         loggedRequestID: Int64?
     ) async -> Bool {
+        var upstreamStatusCode = 0
+        var capturedResponseHeaders: [(name: String, value: String)] = []
+        let shouldCaptureResponseBody = eventLogger != nil
+        var capturedResponseBody = Data()
+        var capturedRawResponseBody = Data()
+        var capturedResponseBytes = 0
+        // Tail ring-buffer for terminal-signal parsing. Accumulates every
+        // chunk and trims back to `maxParseTailBytes` after each append so
+        // we always have the end of the stream even when the body exceeds
+        // `maxLoggedStreamingResponseBytes`.
+        var parseTailBuffer = Data()
+
         do {
             let streamingDelegate = StreamingDelegate()
             streamingDelegate.onUploadProgress = { totalBytesSent in
@@ -240,17 +252,6 @@ final class ProxyForwarder: Sendable {
 
             dataTask.resume()
 
-            var upstreamStatusCode = 0
-            var capturedResponseHeaders: [(name: String, value: String)] = []
-            let shouldCaptureResponseBody = eventLogger != nil
-            var capturedResponseBody = Data()
-            var capturedResponseBytes = 0
-            // Tail ring-buffer for terminal-signal parsing. Accumulates every
-            // chunk and trims back to `maxParseTailBytes` after each append so
-            // we always have the end of the stream even when the body exceeds
-            // `maxLoggedStreamingResponseBytes`.
-            var parseTailBuffer = Data()
-
             try await withTaskCancellationHandler {
                 let httpResponse = try await streamingDelegate.awaitResponse()
                 upstreamStatusCode = httpResponse.statusCode
@@ -276,6 +277,7 @@ final class ProxyForwarder: Sendable {
                             to: &capturedResponseBody,
                             maxBytes: Self.maxLoggedStreamingResponseBytes
                         )
+                        capturedRawResponseBody.append(chunk)
                     }
                     // Tail ring buffer for terminal-signal parsing. Appended
                     // unconditionally and trimmed so the tail never exceeds
@@ -344,6 +346,7 @@ final class ProxyForwarder: Sendable {
                     model: model,
                     request: requestLog,
                     response: responseLog,
+                    rawResponseBody: capturedRawResponseBody,
                     durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
                     error: errorString,
                     lineage: lineageContext,
@@ -356,6 +359,7 @@ final class ProxyForwarder: Sendable {
                     model: model,
                     request: requestLog,
                     response: responseLog,
+                    rawResponseBody: capturedRawResponseBody,
                     durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
                     statusCode: upstreamStatusCode,
                     tokenUsage: tokenUsage,
@@ -382,6 +386,7 @@ final class ProxyForwarder: Sendable {
                 model: model,
                 request: requestLog,
                 response: nil,
+                rawResponseBody: nil,
                 durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
                 error: "client disconnected",
                 lineage: lineageContext
@@ -397,21 +402,46 @@ final class ProxyForwarder: Sendable {
             let lineageContext = await sessionStore.lineageContext(for: requestID)
             await sessionStore.markRequestDone(id: requestID, errored: true, tokenUsage: nil, estimatedCost: nil)
             await metrics.recordFailed()
-            let response = proxyErrorResponse(
-                status: 502,
-                message: String(localized: "Bad Gateway: upstream error: \(error.localizedDescription)")
-            )
-            await eventLogger?.logRequestFailed(
-                requestID: loggedRequestID,
-                session: sessionID,
-                model: model,
-                request: requestLog,
-                response: response.loggedResponse,
-                durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
-                error: error.localizedDescription,
-                lineage: lineageContext
-            )
-            writeErrorToClient(writer: writer, response: response)
+            let observedUpstreamResponse = upstreamStatusCode > 0 || !capturedResponseHeaders.isEmpty || capturedResponseBytes > 0
+            if observedUpstreamResponse {
+                let responseLog = ProxyEventLogger.LoggedResponse(
+                    statusCode: upstreamStatusCode,
+                    headers: capturedResponseHeaders,
+                    body: capturedResponseBody,
+                    source: "upstream",
+                    bodyBytes: capturedResponseBytes,
+                    bodyTruncated: capturedResponseBytes > capturedResponseBody.count
+                )
+                await eventLogger?.logRequestFailed(
+                    requestID: loggedRequestID,
+                    session: sessionID,
+                    model: model,
+                    request: requestLog,
+                    response: responseLog,
+                    rawResponseBody: capturedRawResponseBody,
+                    durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
+                    error: error.localizedDescription,
+                    lineage: lineageContext
+                )
+                writer.end()
+            } else {
+                let response = proxyErrorResponse(
+                    status: 502,
+                    message: String(localized: "Bad Gateway: upstream error: \(error.localizedDescription)")
+                )
+                await eventLogger?.logRequestFailed(
+                    requestID: loggedRequestID,
+                    session: sessionID,
+                    model: model,
+                    request: requestLog,
+                    response: response.loggedResponse,
+                    rawResponseBody: response.loggedResponse.body,
+                    durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
+                    error: error.localizedDescription,
+                    lineage: lineageContext
+                )
+                writeErrorToClient(writer: writer, response: response)
+            }
             return true
         }
     }
@@ -514,6 +544,7 @@ final class ProxyForwarder: Sendable {
                         model: model,
                         request: requestLog,
                         response: responseLog,
+                        rawResponseBody: responseData,
                         durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
                         error: "incomplete response (no terminal signal)",
                         lineage: lineageContext,
@@ -526,6 +557,7 @@ final class ProxyForwarder: Sendable {
                         model: model,
                         request: requestLog,
                         response: responseLog,
+                        rawResponseBody: responseData,
                         durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
                         statusCode: httpResponse.statusCode,
                         tokenUsage: tokenUsage,
@@ -554,6 +586,7 @@ final class ProxyForwarder: Sendable {
                 model: model,
                 request: requestLog,
                 response: nil,
+                rawResponseBody: nil,
                 durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
                 error: "client disconnected",
                 lineage: lineageContext

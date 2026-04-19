@@ -17,11 +17,11 @@ A macOS menu bar app that monitors AI platform token usage and adds local proxy 
 
 ### Local proxy
 
-- **Universal lineage tree** — Groups proxied requests by cache-identity fingerprint (model + system + tools + `thinking`) across both Anthropic Messages and OpenAI Responses, so the popup shows one leaf per conversation and the event log deduplicates payloads per conversation
+- **Universal lineage tree** — Groups proxied requests by provider-specific cache identity (model + system/instructions + tools + `tool_choice` + thinking/reasoning). Anthropic strips prompt-caching markers; OpenAI preserves ordered `input` items, including non-message items, while normalizing string content shorthands to typed text input.
 - **Per-session cost tracking** — Tracks token usage, bytes transferred, and estimated cost per tracked proxy session
 - **Streaming support** — Full HTTP/1.1 proxy with SSE streaming passthrough; parses token usage from both JSON and SSE responses
 - **Traffic indicator** — Menu bar arrows and bar animate when the proxy forwards requests and completions
-- **Event logging** — Structured SQLite event log with 24-hour retention; deduplicated request/response capture via the lineage tree
+- **Event logging** — Structured SQLite event log with 24-hour retention, lineage-deduplicated payload capture, and a bounded raw request/response table for exact source-of-truth copies
 - **Status snapshots** — Atomic JSON snapshots at `~/.tokenpulse/proxy_status.json` for external tooling whenever `saveProxyEventLog` is enabled
 
 ### General
@@ -42,7 +42,7 @@ A macOS menu bar app that monitors AI platform token usage and adds local proxy 
 
 [CodexBar](https://github.com/steipete/CodexBar) is an excellent menu bar usage tracker with 15+ providers and an active community. TokenPulse exists because it makes different trade-offs:
 
-- **Local observability proxy** — TokenPulse can sit between your AI tools and the upstream API, adding per-session traffic, token, and cost visibility plus a universal lineage tree for popup display and payload deduplication. It gives you a view into usage that upstream tools usually do not expose locally.
+- **Local observability proxy** — TokenPulse can sit between your AI tools and the upstream API, adding per-session traffic, token, and cost visibility plus a universal lineage tree for popup display, lineage-aware payload deduplication, and bounded raw request/response capture. It gives you a view into usage that upstream tools usually do not expose locally.
 - **ZenMux support** — TokenPulse supports ZenMux out of the box via their official Management API. ZenMux is a niche provider that CodexBar doesn't cover, and likely too niche for them to want to maintain.
 - **One glance, no mode switch** — CodexBar shows two stacked bars per provider with multiple display modes. TokenPulse shows the active provider's primary-window utilization directly in the icon, so you can read current usage without opening a detail view.
 - **Minimal by design** — TokenPulse is ~28 source files with a simple `UsageProvider` protocol and an actor-based proxy subsystem. No SwiftSyntax macros, no helper processes, no multi-strategy fallback chains. The entire codebase is easy to audit, fork, and modify.
@@ -110,7 +110,7 @@ When the proxy is off, the arrows and bar dim; the percentage stays at its norma
 
 ## Local proxy
 
-TokenPulse includes an optional local HTTP proxy that sits between your AI tools and upstream APIs. It currently serves **Anthropic Messages** (`/v1/messages`) and **OpenAI Responses** (`/v1/responses`) on the same local port. It forwards requests transparently while adding two capabilities: a **universal lineage tree** for popup display and payload deduplication, and **per-session observability** that tracks token usage, bytes, and estimated cost.
+TokenPulse includes an optional local HTTP proxy that sits between your AI tools and upstream APIs. It currently serves **Anthropic Messages** (`/v1/messages`) and **OpenAI Responses** (`/v1/responses`) on the same local port. It forwards requests transparently while adding two capabilities: a **universal lineage tree** for popup display and lineage-aware payload capture, and **per-session observability** that tracks token usage, bytes, and estimated cost.
 
 ### Setup
 
@@ -138,9 +138,9 @@ Keep-alive (cache-warming replay requests) is not currently implemented. The pre
 
 ### Observability
 
-When `saveProxyEventLog` is enabled, the proxy writes structured event logs to `~/.tokenpulse/proxy_events.sqlite` (SQLite, WAL mode) and atomic status snapshots to `~/.tokenpulse/proxy_status.json` (throttled to 1-second intervals). Events are pruned after 24 hours with 5-minute sweep cycles.
+When `saveProxyEventLog` is enabled, the proxy writes structured event logs to `~/.tokenpulse/proxy_events.sqlite` (SQLite with WAL mode and `synchronous = NORMAL`) and atomic status snapshots to `~/.tokenpulse/proxy_status.json` (throttled to 1-second intervals). Events are pruned after 24 hours with 5-minute sweep cycles.
 
-Payload capture is now part of the same `saveProxyEventLog` toggle. Per-request extras live in `proxy_request_content`; conversation fingerprints live in `proxy_conversations`; content-tree node deltas are stored in `proxy_nodes.delta_messages_json`; request rows live in `proxy_requests`; and lifecycle events live in `proxy_lifecycle`. Streaming response capture is truncated to 4 MB per request.
+Payload capture is part of the same `saveProxyEventLog` toggle; there is no separate raw-capture opt-in. Lineage-deduplicated per-request extras live in `proxy_request_content`; conversation fingerprints live in `proxy_conversations`; content-tree node deltas are stored in `proxy_nodes.delta_messages_json`; request rows live in `proxy_requests`; lifecycle events live in `proxy_lifecycle`; and exact request/response copies are also stored in `proxy_raw_request_response`, capped to the newest 1000 rows. Streaming response capture is truncated to 4 MB per request.
 
 For the full proxy architecture, request flow, lineage-tree semantics, and SQLite schema, see [docs/proxy.md](docs/proxy.md).
 
@@ -154,7 +154,7 @@ All fields are in `~/.tokenpulse/config.json`:
 | `proxyPort` | `8080` | Listening port on 127.0.0.1 |
 | `anthropicUpstreamURL` | `https://zenmux.ai/api/anthropic` | Anthropic Messages upstream base URL |
 | `openAIUpstreamURL` | `https://api.openai.com` | OpenAI Responses upstream base URL |
-| `saveProxyEventLog` | `true` | Master on/off for the proxy event log. When enabled, SQLite metadata + deduplicated request/response payloads + status snapshots are all written; when disabled, no database is opened |
+| `saveProxyEventLog` | `true` | Master on/off for the proxy event log. When enabled, SQLite metadata, lineage-deduplicated payloads, bounded raw request/response captures, and status snapshots are written; when disabled, no database is opened |
 
 ## Data export
 

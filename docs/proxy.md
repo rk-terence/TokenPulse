@@ -113,11 +113,16 @@ Sessions are a thin UI grouping layer; they do not drive tree matching.
 
 ## Message normalization
 
-Normalization intentionally ignores differences that should not break same-conversation matching, including:
+Normalization is provider-specific and intentionally least-destructive. It only collapses differences that the provider treats as generation-equivalent:
 
-- Claude Code billing-header noise in `system`
-- presence or absence of `cache_control`
-- string-vs-array text block encoding for message content
+- Anthropic: Claude Code billing-header noise in `system`
+- Anthropic: presence or absence of `cache_control`
+- Anthropic: string-vs-array text block encoding for message content
+- Anthropic: consecutive same-role messages, which the API coalesces server-side
+- OpenAI: top-level string `input` promoted to an explicit `{"role":"user","content":...}` message
+- OpenAI: message `content` string promoted to typed text input blocks (`{"type":"input_text","text":...}`)
+
+OpenAI non-message `input` items are preserved in order and normalized recursively; they are not dropped during lineage matching.
 
 Each normalized message is hashed (SHA-256 over canonical JSON) to drive prefix comparison efficiently.
 
@@ -285,12 +290,13 @@ Once a route is known, proxy-generated forwarder errors use that route's handler
 
 ## Database
 
-Events are persisted to `~/.tokenpulse/proxy_events.sqlite` using SQLite with WAL mode. Additional pragmas include:
+Events are persisted to `~/.tokenpulse/proxy_events.sqlite` using SQLite with:
 
 - `foreign_keys = ON`
+- `journal_mode = WAL`
 - `synchronous = NORMAL`
 
-The database is opened lazily on first write when `ProxyEventLogger` is enabled (i.e. `saveProxyEventLog == true`). A `proxy_schema` table stores the current schema version; on mismatch the whole database is dropped and rebuilt (24h retention means no meaningful loss). The actor provides serialization, so `SQLITE_OPEN_NOMUTEX` is used.
+The database is opened lazily on first write when `ProxyEventLogger` is enabled (i.e. `saveProxyEventLog == true`). That single toggle controls metadata, lineage-deduplicated payload storage, the bounded raw source-of-truth table, and status snapshots; there is no separate payload-capture opt-in. A `proxy_schema` table stores the current schema version; on mismatch the whole database is dropped and rebuilt (24h retention means no meaningful loss). The actor provides serialization, so `SQLITE_OPEN_NOMUTEX` is used.
 
 ## Tables
 
@@ -302,7 +308,7 @@ One row per conversation (cache-identity bucket).
 |--------|------|-------------|
 | `id` | TEXT PK | Conversation UUID |
 | `flavor` | TEXT NOT NULL | `anthropicMessages` \| `openAIResponses` |
-| `fingerprint_hash` | TEXT NOT NULL | SHA-256 of normalized identity (model + system + tools + tool_choice + thinking) |
+| `fingerprint_hash` | TEXT NOT NULL | SHA-256 of normalized identity (`model` + `system`/`instructions` + `tools` + `tool_choice` + `thinking`/`reasoning`) |
 | `fingerprint_json` | TEXT NOT NULL | Serialized `LineageFingerprint` for replay / diagnostics |
 | `root_node_id` | TEXT NOT NULL | UUID of the conversation's synthetic empty-messages root node |
 | `first_seen` / `last_seen` | TEXT | ISO 8601 timestamps |
@@ -375,7 +381,7 @@ Stores request/response captures. When the request has content-tree coordinates,
 }
 ```
 
-The fingerprint fields live on `proxy_conversations.fingerprint_json`; the messages array is reconstructed by walking `proxy_nodes.parent_node_id` from the node up to the root and concatenating each node's `delta_messages_json`. Request bodies without content-tree coordinates are stored in full otherwise; streaming response bodies are truncated to 4 MB.
+The fingerprint fields live on `proxy_conversations.fingerprint_json`; the messages array is reconstructed by walking `proxy_nodes.parent_node_id` from the node up to the root and concatenating each node's `delta_messages_json`. Request bodies without content-tree coordinates are stored in full otherwise. Streaming response bodies in this deduplicated table keep the first 4 MB captured for parsing/logging.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -386,12 +392,24 @@ The fingerprint fields live on `proxy_conversations.fingerprint_json`; the messa
 
 Bodies are serialized as UTF-8 when possible, otherwise base64. Bodies whose fingerprint and messages have been substituted with refs are marked with `"encoding": "utf8-refs"`.
 
+### `proxy_raw_request_response`
+
+Stores a bounded source-of-truth copy of the exact proxied exchange without lineage stripping. Each row is keyed by `request_id` and captures the raw request and the exact response bytes observed by the proxy: method, path (including query string), upstream URL, headers, and body bytes. Bodies are serialized as UTF-8 when possible, otherwise base64. For streaming failures after upstream bytes have already arrived, this table preserves the observed partial upstream response instead of replacing it with a synthetic proxy `502` body.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `request_id` | INTEGER PK | References `proxy_requests(id)` |
+| `captured_at` | TEXT NOT NULL | ISO 8601 timestamp when the raw exchange was written |
+| `request_json` | TEXT | Serialized raw request capture |
+| `response_json` | TEXT | Serialized raw response capture |
+
 ## Retention and pruning
 
 - maximum event age: 24 hours
 - prune check interval: at most once every 5 minutes, opportunistically on writes
 - SQLite prune targets: `proxy_requests`, `proxy_lifecycle`
 - `proxy_request_content` is cascade-deleted with its parent `proxy_requests` row
+- `proxy_raw_request_response` is cascade-deleted with its parent `proxy_requests` row and independently capped to the newest 1000 rows
 - `proxy_nodes` and `proxy_conversations` rows are removed via `ProxyEventLogger.pruneLineageMirror(...)` after the in-memory `ContentTree.prune(...)` drops them, so both sides stay in sync
 - `PRAGMA wal_checkpoint(PASSIVE)` runs after each prune pass
 
@@ -446,7 +464,7 @@ Proxy settings live in `~/.tokenpulse/config.json` and are managed by `ConfigSer
 | `proxyPort` | Int | `8080` | TCP port to bind on `127.0.0.1` |
 | `anthropicUpstreamURL` | String | `"https://zenmux.ai/api/anthropic"` | Base URL for Anthropic Messages forwarding |
 | `openAIUpstreamURL` | String | `"https://api.openai.com"` | Base URL for OpenAI Responses forwarding |
-| `saveProxyEventLog` | Bool | `true` | Master on/off for `ProxyEventLogger`. When enabled, the logger persists metadata to SQLite and captures deduplicated request/response payloads via the lineage tree. When disabled, no SQLite database is opened and no status snapshot is written. |
+| `saveProxyEventLog` | Bool | `true` | Master on/off for `ProxyEventLogger`. When enabled, the logger persists SQLite metadata, lineage-deduplicated request/response payloads, bounded raw exact request/response captures, and status snapshots. When disabled, no SQLite database is opened and no status snapshot is written. |
 
 The legacy `keepaliveEnabled`, `keepaliveIntervalSeconds`, `proxyInactivityTimeoutSeconds`, and `saveProxyPayloads` fields are still tolerated by the config migration (they were fields in version 6) but are no longer written or read by the live code. The current config schema version is `7`.
 
@@ -482,6 +500,6 @@ Legacy `proxyUpstreamURL` is still read during config migration and mapped to `a
 | `Proxy/OpenAIResponsesProxyAPIHandler.swift` | OpenAI Responses route semantics, strict Codex session detection, `previous_response_id` extraction, token parsing, OpenAI error bodies |
 | `Proxy/LineageTree.swift` | In-memory content tree: conversations, content nodes, per-request attach/finish, prefix-fold matching, prune/reconstruction |
 | `Proxy/ProxySessionStore.swift` | Actor; session lifecycle, request state machine, token accumulation, content-tree ownership and mirror context construction |
-| `Proxy/ProxyEventLogger.swift` | Actor; SQLite event persistence, content-tree mirror tables, deduplicated payload storage, status snapshots with throttling |
+| `Proxy/ProxyEventLogger.swift` | Actor; SQLite event persistence, content-tree mirror tables, lineage-deduplicated payload storage, bounded raw exact exchange capture, status snapshots with throttling |
 | `Proxy/ProxyMetricsStore.swift` | Actor; aggregate counters and savings formula |
 | `Proxy/ProxyModels.swift` | Shared value types and helpers: `ProxyAPIFlavor`, `ProxySessionID`, `LineageFingerprint`, `TokenUsage`, `ModelPricingTable`, `ProxyHTTPUtils` |

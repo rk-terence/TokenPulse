@@ -17,7 +17,10 @@ actor ProxyEventLogger {
     /// `proxy_requests.segment_id`/`tail_index` → `node_id`. Body refs changed
     /// to `{conversation_id, node_id}`. `proxy_conversations` gained
     /// `root_node_id`.
-    private static let currentSchemaVersion: Int = 5
+    /// v6: added `proxy_raw_request_response`, a bounded source-of-truth table
+    /// that stores exact request/response captures without lineage stripping.
+    private static let currentSchemaVersion: Int = 6
+    private static let maxRawRequestResponseRows: Int = 1000
 
     struct LoggedRequest: Sendable {
         let method: String
@@ -98,6 +101,11 @@ actor ProxyEventLogger {
         let responseJSON: String?
     }
 
+    private struct RawExchangeContent {
+        let requestJSON: String?
+        let responseJSON: String?
+    }
+
     // MARK: - Properties
 
     let enabled: Bool
@@ -173,6 +181,7 @@ actor ProxyEventLogger {
         model: String?,
         request: LoggedRequest,
         response: LoggedResponse,
+        rawResponseBody: Data? = nil,
         durationMs: Int,
         statusCode: Int,
         tokenUsage: TokenUsage,
@@ -227,6 +236,11 @@ actor ProxyEventLogger {
                     requestID: requestID,
                     in: database
                 )
+                try insertRawExchangeIfNeeded(
+                    serializeRawExchange(request: request, response: response, rawResponseBody: rawResponseBody),
+                    requestID: requestID,
+                    in: database
+                )
             } else {
                 // Standalone INSERT for cases where logRequestStarted failed
                 try pruneExpiredIfNeeded(in: database)
@@ -275,6 +289,11 @@ actor ProxyEventLogger {
                 let insertedID = sqlite3_last_insert_rowid(database)
                 try insertContentIfNeeded(
                     serializeContent(request: request, response: response, lineage: lineage),
+                    requestID: insertedID,
+                    in: database
+                )
+                try insertRawExchangeIfNeeded(
+                    serializeRawExchange(request: request, response: response, rawResponseBody: rawResponseBody),
                     requestID: insertedID,
                     in: database
                 )
@@ -427,6 +446,7 @@ actor ProxyEventLogger {
         model: String?,
         request: LoggedRequest,
         response: LoggedResponse?,
+        rawResponseBody: Data? = nil,
         durationMs: Int,
         error: String,
         lineage: LineageContext? = nil,
@@ -480,6 +500,11 @@ actor ProxyEventLogger {
                     requestID: requestID,
                     in: database
                 )
+                try insertRawExchangeIfNeeded(
+                    serializeRawExchange(request: request, response: response, rawResponseBody: rawResponseBody),
+                    requestID: requestID,
+                    in: database
+                )
             } else {
                 // Standalone INSERT for cases where logRequestStarted was not called
                 try pruneExpiredIfNeeded(in: database)
@@ -520,6 +545,11 @@ actor ProxyEventLogger {
                 let insertedID = sqlite3_last_insert_rowid(database)
                 try insertContentIfNeeded(
                     serializeContent(request: request, response: response, lineage: lineage),
+                    requestID: insertedID,
+                    in: database
+                )
+                try insertRawExchangeIfNeeded(
+                    serializeRawExchange(request: request, response: response, rawResponseBody: rawResponseBody),
                     requestID: insertedID,
                     in: database
                 )
@@ -626,6 +656,7 @@ actor ProxyEventLogger {
                 let dropTables = [
                     "proxy_event_content", "proxy_events", "proxy_keepalives",
                     "proxy_request_content", "proxy_requests",
+                    "proxy_raw_request_response",
                     "proxy_lineage_segments", "proxy_nodes", "proxy_conversations",
                     "proxy_lifecycle"
                 ]
@@ -726,6 +757,19 @@ actor ProxyEventLogger {
                 in: database
             )
 
+            try execute(
+                """
+                CREATE TABLE IF NOT EXISTS proxy_raw_request_response (
+                    request_id INTEGER PRIMARY KEY,
+                    captured_at TEXT NOT NULL,
+                    request_json TEXT,
+                    response_json TEXT,
+                    FOREIGN KEY(request_id) REFERENCES proxy_requests(id) ON DELETE CASCADE
+                );
+                """,
+                in: database
+            )
+
             // Indexes
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_requests_started_at ON proxy_requests(started_at);", in: database)
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_requests_session ON proxy_requests(session, started_at);", in: database)
@@ -740,6 +784,7 @@ actor ProxyEventLogger {
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_conversations_fingerprint ON proxy_conversations(fingerprint_hash);", in: database)
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_nodes_conversation ON proxy_nodes(conversation_id);", in: database)
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_nodes_parent ON proxy_nodes(parent_node_id);", in: database)
+            try execute("CREATE INDEX IF NOT EXISTS idx_proxy_raw_request_response_captured_at ON proxy_raw_request_response(captured_at);", in: database)
         } catch {
             sqlite3_close(database)
             throw error
@@ -854,6 +899,27 @@ actor ProxyEventLogger {
         )
     }
 
+    private func serializeRawExchange(
+        request: LoggedRequest?,
+        response: LoggedResponse?,
+        rawResponseBody: Data?
+    ) -> RawExchangeContent? {
+        let requestJSON = request.flatMap { jsonString(for: serializeContent(request: $0, lineage: nil)) }
+        let responseJSON = response.flatMap { response in
+            let rawResponse = rawLoggedResponse(response, rawBody: rawResponseBody)
+            return jsonString(for: serializeContent(response: rawResponse))
+        }
+
+        if requestJSON == nil && responseJSON == nil {
+            return nil
+        }
+
+        return RawExchangeContent(
+            requestJSON: requestJSON,
+            responseJSON: responseJSON
+        )
+    }
+
     private func serializeContent(request: LoggedRequest, lineage: LineageContext?) -> [String: Any] {
         [
             "method": request.method,
@@ -876,6 +942,18 @@ actor ProxyEventLogger {
                 truncated: response.bodyTruncated
             ),
         ]
+    }
+
+    private func rawLoggedResponse(_ response: LoggedResponse, rawBody: Data?) -> LoggedResponse {
+        let exactBody = rawBody ?? response.body
+        return LoggedResponse(
+            statusCode: response.statusCode,
+            headers: response.headers,
+            body: exactBody,
+            source: response.source,
+            bodyBytes: exactBody.count,
+            bodyTruncated: false
+        )
     }
 
     private func serialize(headers: [(name: String, value: String)]) -> [[String: String]] {
@@ -985,6 +1063,51 @@ actor ProxyEventLogger {
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
         }
+    }
+
+    private func insertRawExchangeIfNeeded(
+        _ content: RawExchangeContent?,
+        requestID: Int64,
+        in database: OpaquePointer
+    ) throws {
+        guard let content else { return }
+
+        let sql = """
+            INSERT OR REPLACE INTO proxy_raw_request_response (
+                request_id, captured_at, request_json, response_json
+            ) VALUES (?, ?, ?, ?)
+            """
+
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw LoggerStorageError.prepareFailed(message: errorMessage(from: database))
+        }
+        defer { sqlite3_finalize(statement) }
+
+        bind(requestID, to: 1, in: statement)
+        bind(isoFormatter.string(from: Date()), to: 2, in: statement)
+        bind(content.requestJSON, to: 3, in: statement)
+        bind(content.responseJSON, to: 4, in: statement)
+
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
+        }
+
+        try pruneRawExchangeLimit(in: database)
+    }
+
+    private func pruneRawExchangeLimit(in database: OpaquePointer) throws {
+        let sql = """
+            DELETE FROM proxy_raw_request_response
+            WHERE request_id NOT IN (
+                SELECT request_id
+                FROM proxy_raw_request_response
+                ORDER BY request_id DESC
+                LIMIT \(Self.maxRawRequestResponseRows)
+            )
+            """
+
+        try execute(sql, in: database)
     }
 
     private func jsonString(for value: [String: Any]) -> String? {

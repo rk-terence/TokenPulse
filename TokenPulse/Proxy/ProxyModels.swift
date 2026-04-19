@@ -181,6 +181,8 @@ enum ProxyRequestBody {
 
     /// Build a `LineageFingerprint` from a request body. Returns nil only when
     /// the body lacks a `model` field — all other cache-key fields are optional.
+    /// Anthropic fingerprint values strip prompt-caching markers; OpenAI
+    /// fingerprint values stay otherwise lossless.
     static func lineageFingerprint(from body: Data, flavor: ProxyAPIFlavor) -> LineageFingerprint? {
         guard let json = jsonObject(from: body),
               let model = json["model"] as? String else {
@@ -189,25 +191,25 @@ enum ProxyRequestBody {
         let systemKey = (flavor == .openAIResponses) ? "instructions" : "system"
         let thinkingKey = (flavor == .openAIResponses) ? "reasoning" : "thinking"
         let systemStr: String?
-        if let sys = normalizedSystemPrompt(json[systemKey]) {
+        if let sys = normalizedFingerprintValue(json[systemKey], flavor: flavor, isSystemPrompt: true) {
             systemStr = canonicalString(for: sys)
         } else {
             systemStr = nil
         }
         let toolsStr: String?
-        if let tools = json["tools"] as? [Any], !tools.isEmpty {
+        if let tools = normalizedFingerprintValue(json["tools"], flavor: flavor) as? [Any], !tools.isEmpty {
             toolsStr = canonicalString(for: tools)
         } else {
             toolsStr = nil
         }
         let toolChoiceStr: String?
-        if let tc = json["tool_choice"] {
+        if let tc = normalizedFingerprintValue(json["tool_choice"], flavor: flavor) {
             toolChoiceStr = canonicalString(for: tc)
         } else {
             toolChoiceStr = nil
         }
         let thinkingStr: String?
-        if let thinking = json[thinkingKey] {
+        if let thinking = normalizedFingerprintValue(json[thinkingKey], flavor: flavor) {
             thinkingStr = canonicalString(for: thinking)
         } else {
             thinkingStr = nil
@@ -222,22 +224,21 @@ enum ProxyRequestBody {
         )
     }
 
-    /// Extract the normalized messages list (for Anthropic) or input list (for OpenAI Responses).
-    /// Returns an empty array when neither field is present (e.g. OpenAI using `previous_response_id` alone).
+    /// Extract the provider-normalized conversation/input items used for
+    /// lineage matching. Returns an empty array when neither field is present
+    /// (e.g. OpenAI using `previous_response_id` alone).
     static func normalizedLineageMessages(
         from body: Data,
         flavor: ProxyAPIFlavor
     ) -> [ContentTree.NormalizedMessage] {
         guard let json = jsonObject(from: body) else { return [] }
         let field = (flavor == .openAIResponses) ? "input" : "messages"
-        // OpenAI's `input` may be a string OR an array; Anthropic's `messages` is always an array.
         if let rawArray = json[field] as? [Any] {
-            return normalizedLineageMessages(from: rawArray)
+            return normalizedLineageMessages(from: rawArray, flavor: flavor)
         }
         if flavor == .openAIResponses, let rawString = json[field] as? String {
-            // Promote a bare string to a synthetic single-user-message array.
             let promoted: [[String: Any]] = [["role": "user", "content": rawString]]
-            return normalizedLineageMessages(from: promoted)
+            return normalizedLineageMessages(from: promoted, flavor: flavor)
         }
         return []
     }
@@ -248,22 +249,56 @@ enum ProxyRequestBody {
         return json["previous_response_id"] as? String
     }
 
-    private static func normalizedLineageMessages(from rawArray: [Any]) -> [ContentTree.NormalizedMessage] {
+    private static func normalizedLineageMessages(
+        from rawArray: [Any],
+        flavor: ProxyAPIFlavor
+    ) -> [ContentTree.NormalizedMessage] {
+        switch flavor {
+        case .anthropicMessages:
+            return normalizedAnthropicLineageMessages(from: rawArray)
+        case .openAIResponses:
+            return normalizedOpenAILineageMessages(from: rawArray)
+        }
+    }
+
+    private static func normalizedAnthropicLineageMessages(from rawArray: [Any]) -> [ContentTree.NormalizedMessage] {
+        let normalized = rawArray.compactMap { normalizedAnthropicMessage($0) }
+        let coalesced = coalesceConsecutiveAnthropicMessages(normalized)
+        return coalesced.compactMap { message in
+            guard let role = message["role"] as? String else { return nil }
+            return normalizedLineageMessage(label: role, normalized: message)
+        }
+    }
+
+    private static func normalizedOpenAILineageMessages(from rawArray: [Any]) -> [ContentTree.NormalizedMessage] {
         var result: [ContentTree.NormalizedMessage] = []
         result.reserveCapacity(rawArray.count)
         for element in rawArray {
-            guard let normalized = normalizedValue(element) as? [String: Any],
-                  let role = normalized["role"] as? String else { continue }
-            let canonical = canonicalString(for: normalized) ?? ""
-            let contentHash = LineageHash.sha256Hex(canonical)
-            let rawJSON = (try? JSONSerialization.data(withJSONObject: normalized, options: [.sortedKeys])) ?? Data()
-            result.append(ContentTree.NormalizedMessage(
-                role: role,
-                contentHash: contentHash,
-                rawJSON: rawJSON
-            ))
+            guard let normalized = normalizedOpenAIInputItem(element) as? [String: Any] else {
+                continue
+            }
+            let label = (normalized["role"] as? String)
+                ?? (normalized["type"] as? String)
+                ?? "input"
+            if let message = normalizedLineageMessage(label: label, normalized: normalized) {
+                result.append(message)
+            }
         }
         return result
+    }
+
+    private static func normalizedLineageMessage(
+        label: String,
+        normalized: [String: Any]
+    ) -> ContentTree.NormalizedMessage? {
+        let canonical = canonicalString(for: normalized) ?? ""
+        let contentHash = LineageHash.sha256Hex(canonical)
+        let rawJSON = (try? JSONSerialization.data(withJSONObject: normalized, options: [.sortedKeys])) ?? Data()
+        return ContentTree.NormalizedMessage(
+            role: label,
+            contentHash: contentHash,
+            rawJSON: rawJSON
+        )
     }
 
     private static func jsonObject(from body: Data) -> [String: Any]? {
@@ -330,17 +365,37 @@ enum ProxyRequestBody {
         return escaped
     }
 
-    private static func normalizedSystemPrompt(_ value: Any?) -> Any? {
+    private static func normalizedFingerprintValue(
+        _ value: Any?,
+        flavor: ProxyAPIFlavor,
+        isSystemPrompt: Bool = false
+    ) -> Any? {
+        switch flavor {
+        case .anthropicMessages:
+            if isSystemPrompt {
+                return normalizedAnthropicSystemPrompt(value)
+            }
+            return normalizedAnthropicValue(value)
+        case .openAIResponses:
+            return value
+        }
+    }
+
+    private static func normalizedAnthropicSystemPrompt(_ value: Any?) -> Any? {
         guard let value else {
             return nil
         }
 
         if let entries = value as? [[String: Any]] {
-            let filtered = entries.filter { entry in
-                guard let text = entry["text"] as? String else {
-                    return true
+            let filtered = entries.compactMap { entry -> [String: Any]? in
+                guard let normalized = normalizedAnthropicValue(entry) as? [String: Any] else {
+                    return nil
                 }
-                return !text.hasPrefix("x-anthropic-billing-header:")
+                if let text = normalized["text"] as? String,
+                   text.hasPrefix("x-anthropic-billing-header:") {
+                    return nil
+                }
+                return normalized
             }
             return filtered.isEmpty ? nil : filtered
         }
@@ -349,24 +404,24 @@ enum ProxyRequestBody {
             return nil
         }
 
-        return value
+        return normalizedAnthropicValue(value)
     }
 
-    private static func normalizedValue(_ value: Any?) -> Any? {
+    private static func normalizedAnthropicValue(_ value: Any?) -> Any? {
         guard let value else {
             return nil
         }
 
         if let dictionary = value as? [String: Any] {
             if let role = dictionary["role"] as? String,
-               let normalizedMessage = normalizedMessage(role: role, dictionary: dictionary) {
+               let normalizedMessage = normalizedAnthropicMessage(role: role, dictionary: dictionary) {
                 return normalizedMessage
             }
 
             var normalized: [String: Any] = [:]
             for key in dictionary.keys.sorted() where key != "cache_control" {
                 guard let rawValue = dictionary[key],
-                      let cleanedValue = normalizedValue(rawValue) else {
+                      let cleanedValue = normalizedAnthropicValue(rawValue) else {
                     continue
                 }
                 normalized[key] = cleanedValue
@@ -375,23 +430,31 @@ enum ProxyRequestBody {
         }
 
         if let array = value as? [Any] {
-            let normalized = array.compactMap { normalizedValue($0) }
+            let normalized = array.compactMap { normalizedAnthropicValue($0) }
             return normalized.isEmpty ? nil : normalized
         }
 
         return value
     }
 
-    private static func normalizedMessage(role: String, dictionary: [String: Any]) -> [String: Any]? {
+    private static func normalizedAnthropicMessage(_ value: Any?) -> [String: Any]? {
+        guard let dictionary = value as? [String: Any],
+              let role = dictionary["role"] as? String else {
+            return nil
+        }
+        return normalizedAnthropicMessage(role: role, dictionary: dictionary)
+    }
+
+    private static func normalizedAnthropicMessage(role: String, dictionary: [String: Any]) -> [String: Any]? {
         var normalized: [String: Any] = ["role": role]
 
-        if let content = normalizedMessageContent(dictionary["content"]) {
+        if let content = normalizedAnthropicMessageContent(dictionary["content"]) {
             normalized["content"] = content
         }
 
         for key in dictionary.keys.sorted() where key != "role" && key != "content" && key != "cache_control" {
             guard let rawValue = dictionary[key],
-                  let cleanedValue = normalizedValue(rawValue) else {
+                  let cleanedValue = normalizedAnthropicValue(rawValue) else {
                 continue
             }
             normalized[key] = cleanedValue
@@ -400,7 +463,7 @@ enum ProxyRequestBody {
         return normalized
     }
 
-    private static func normalizedMessageContent(_ value: Any?) -> Any? {
+    private static func normalizedAnthropicMessageContent(_ value: Any?) -> Any? {
         guard let value else {
             return nil
         }
@@ -409,7 +472,117 @@ enum ProxyRequestBody {
             return [["type": "text", "text": string]]
         }
 
-        return normalizedValue(value)
+        return normalizedAnthropicValue(value)
+    }
+
+    private static func coalesceConsecutiveAnthropicMessages(_ messages: [[String: Any]]) -> [[String: Any]] {
+        var result: [[String: Any]] = []
+        result.reserveCapacity(messages.count)
+
+        for message in messages {
+            guard let role = message["role"] as? String else { continue }
+            guard var last = result.last,
+                  let lastRole = last["role"] as? String,
+                  lastRole == role,
+                  canCoalesceAnthropicMessages(lhs: last, rhs: message) else {
+                result.append(message)
+                continue
+            }
+
+            let mergedContent = anthropicContentBlocks(from: last["content"])
+                + anthropicContentBlocks(from: message["content"])
+            if mergedContent.isEmpty {
+                last.removeValue(forKey: "content")
+            } else {
+                last["content"] = mergedContent
+            }
+            result[result.count - 1] = last
+        }
+
+        return result
+    }
+
+    private static func canCoalesceAnthropicMessages(
+        lhs: [String: Any],
+        rhs: [String: Any]
+    ) -> Bool {
+        var lhsMetadata = lhs
+        lhsMetadata.removeValue(forKey: "content")
+        var rhsMetadata = rhs
+        rhsMetadata.removeValue(forKey: "content")
+        return canonicalString(for: lhsMetadata) == canonicalString(for: rhsMetadata)
+    }
+
+    private static func anthropicContentBlocks(from value: Any?) -> [[String: Any]] {
+        guard let blocks = value as? [Any] else { return [] }
+        return blocks.compactMap { $0 as? [String: Any] }
+    }
+
+    private static func normalizedOpenAIInputItem(_ value: Any?) -> Any? {
+        guard let value else {
+            return nil
+        }
+
+        if let dictionary = value as? [String: Any] {
+            if let role = dictionary["role"] as? String,
+               let normalizedMessage = normalizedOpenAIMessage(role: role, dictionary: dictionary) {
+                return normalizedMessage
+            }
+            return normalizedDictionary(dictionary, valueNormalizer: normalizedOpenAIInputItem)
+        }
+
+        if let array = value as? [Any] {
+            let normalized = array.compactMap { normalizedOpenAIInputItem($0) }
+            return normalized.isEmpty ? nil : normalized
+        }
+
+        return value
+    }
+
+    private static func normalizedOpenAIMessage(role: String, dictionary: [String: Any]) -> [String: Any]? {
+        var normalized: [String: Any] = ["role": role]
+
+        if let content = normalizedOpenAIMessageContent(dictionary["content"]) {
+            normalized["content"] = content
+        }
+
+        for key in dictionary.keys.sorted() where key != "role" && key != "content" {
+            guard let rawValue = dictionary[key],
+                  let cleanedValue = normalizedOpenAIInputItem(rawValue) else {
+                continue
+            }
+            normalized[key] = cleanedValue
+        }
+
+        return normalized
+    }
+
+    private static func normalizedOpenAIMessageContent(_ value: Any?) -> Any? {
+        guard let value else {
+            return nil
+        }
+
+        if let string = value as? String {
+            // Responses API message-content shorthand expands to typed text input.
+            return [["type": "input_text", "text": string]]
+        }
+
+        return normalizedOpenAIInputItem(value)
+    }
+
+    private static func normalizedDictionary(
+        _ dictionary: [String: Any],
+        valueNormalizer: (Any?) -> Any?
+    ) -> [String: Any]? {
+        var normalized: [String: Any] = [:]
+        for key in dictionary.keys.sorted() {
+            guard let rawValue = dictionary[key],
+                  let cleanedValue = valueNormalizer(rawValue) else {
+                continue
+            }
+            normalized[key] = cleanedValue
+        }
+        return normalized.isEmpty ? nil : normalized
     }
 }
 
