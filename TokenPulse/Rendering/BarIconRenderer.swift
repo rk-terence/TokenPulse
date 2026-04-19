@@ -74,6 +74,7 @@ enum BarIconRenderer {
     private static let arrowHeight: CGFloat = 13
     private static let arrowHeadFraction: CGFloat = 0.54  // head takes 54% of arrow height
     private static let arrowStemFraction: CGFloat = 0.36  // stem is 36% of arrow width
+    private static let downArrowDrop: CGFloat = 1         // down-arrow vertical nudge (pts, AppKit)
 
     // Bar geometry
     private static let barWidth: CGFloat    = 1.6
@@ -95,38 +96,47 @@ enum BarIconRenderer {
     /// Appearance-specific accents. These tints are only applied while the
     /// corresponding track is animating; the rest-state color is always
     /// `labelColor(isDarkAppearance:)` so the glyph reads like a stock menu
-    /// extra between ticks. Light-mode tints are deeper and more saturated so
-    /// they survive wallpaper-tinted bars; dark-mode tints stay airy for the
-    /// translucent dark bar.
+    /// extra between ticks. `rimColor` is the crisp stroke wrapped around
+    /// the fill while animating so the silhouette has a clear boundary
+    /// against the menu bar — black in light mode, white in dark mode.
     private struct Palette {
         let upload: NSColor
         let download: NSColor
         let barCarrying: NSColor
         let percent: NSColor
         let percentAlert: NSColor
+        let rimColor: NSColor
 
         static let dark = Palette(
             upload:       NSColor(srgbRed: 0.310, green: 0.765, blue: 0.969, alpha: 1), // #4FC3F7 sky-300
             download:     NSColor(srgbRed: 0.204, green: 0.827, blue: 0.600, alpha: 1), // #34D399 emerald-400
             barCarrying:  NSColor(srgbRed: 0.984, green: 0.749, blue: 0.141, alpha: 1), // #FBBF24 amber-400
             percent:      NSColor(srgbRed: 0.961, green: 0.620, blue: 0.043, alpha: 1), // #F59E0B amber-500
-            percentAlert: NSColor(srgbRed: 0.937, green: 0.267, blue: 0.267, alpha: 1)  // #EF4444 red-500
+            percentAlert: NSColor(srgbRed: 0.937, green: 0.267, blue: 0.267, alpha: 1), // #EF4444 red-500
+            rimColor:     NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
         )
 
-        // Light-mode accents sit at mid-weight (500–600) rather than the
-        // deep 700–800 tones. Idle is effectively black in light mode, so
-        // the crossfade target has to carry enough luminance for the
-        // animation to be visible — a too-dark accent just reads as the
-        // same black glyph pulsing in place. These weights also keep
-        // hue-distinct contrast against wallpaper-tinted menu bars.
+        // Light-mode accents are bright + saturated (400-tier). Idle is near
+        // black on a light bar; animating to a dark accent preserves contrast
+        // but collapses the *change* signal (dark → dark reads as a hue shift
+        // the eye barely catches). A 400-tier accent creates a clear
+        // luminance jump from black idle. The black `rimColor` then wraps
+        // the bright fill in a crisp boundary so it doesn't melt into the
+        // near-white bar.
         static let light = Palette(
-            upload:       NSColor(srgbRed: 0.231, green: 0.510, blue: 0.965, alpha: 1), // #3B82F6 blue-500
-            download:     NSColor(srgbRed: 0.063, green: 0.725, blue: 0.506, alpha: 1), // #10B981 emerald-500
-            barCarrying:  NSColor(srgbRed: 0.961, green: 0.620, blue: 0.043, alpha: 1), // #F59E0B amber-500
+            upload:       NSColor(srgbRed: 0.376, green: 0.647, blue: 0.980, alpha: 1), // #60A5FA blue-400
+            download:     NSColor(srgbRed: 0.204, green: 0.827, blue: 0.600, alpha: 1), // #34D399 emerald-400
+            barCarrying:  NSColor(srgbRed: 0.984, green: 0.749, blue: 0.141, alpha: 1), // #FBBF24 amber-400
             percent:      NSColor(srgbRed: 0.851, green: 0.467, blue: 0.024, alpha: 1), // #D97706 amber-600
-            percentAlert: NSColor(srgbRed: 0.863, green: 0.149, blue: 0.149, alpha: 1)  // #DC2626 red-600
+            percentAlert: NSColor(srgbRed: 0.863, green: 0.149, blue: 0.149, alpha: 1), // #DC2626 red-600
+            rimColor:     NSColor(srgbRed: 0, green: 0, blue: 0, alpha: 1)
         )
     }
+
+    /// Total stroke width for rim. Because stroke is centered on the path,
+    /// only half (rimWidth / 2) is visible outside the shape; the inside
+    /// half is overpainted by the fill. 1.0 pt → ~0.5 pt crisp rim.
+    private static let rimWidth: CGFloat = 1.0
 
     /// At-rest color for every part. Matches `NSColor.labelColor` for the
     /// given appearance so the idle glyph blends in with Wi-Fi, Battery,
@@ -177,15 +187,13 @@ enum BarIconRenderer {
             let barX = dnX + arrowWidth + gapArrowToBar
             let digitsX = barX + barWidth + gapBarToDigits
 
-            // Arrow vertical placement: with a triangular head + rectangular
-            // stem, each arrow's visual center of mass is offset from its
-            // bounding-box midpoint. Shift each arrow so the CoM lands on the
-            // icon's vertical centerline; the up-arrow and down-arrow get
-            // mirrored offsets and so end up optically aligned with each other.
+            // Arrow vertical placement. The up-arrow centers in the icon;
+            // the down-arrow gets a small downward nudge (AppKit coords:
+            // smaller y = lower) so its head lands below the up-arrow's
+            // head and the pair doesn't look top-heavy.
             let baseArrowY = (iconHeight - arrowHeight) / 2
-            let comShift   = arrowCenterOfMassYOffset
-            let upArrowY   = baseArrowY - comShift
-            let dnArrowY   = baseArrowY + comShift
+            let upArrowY   = baseArrowY
+            let dnArrowY   = baseArrowY - downArrowDrop
             let barY   = (iconHeight - barHeight) / 2
 
             // 1) Arrows. Proxy-off pulls the left half of the icon (arrows +
@@ -199,6 +207,7 @@ enum BarIconRenderer {
                       dim: dim,
                       idle: labelC,
                       accent: palette.upload,
+                      rim: palette.rimColor,
                       pointsUp: true)
             drawArrow(in: ctx,
                       x: dnX, y: dnArrowY,
@@ -206,6 +215,7 @@ enum BarIconRenderer {
                       dim: dim,
                       idle: labelC,
                       accent: palette.download,
+                      rim: palette.rimColor,
                       pointsUp: false)
 
             // 2) Bar + particles + trail
@@ -214,7 +224,8 @@ enum BarIconRenderer {
                     carrying: animation.bar.carrying,
                     dim: dim,
                     idle: labelC,
-                    carryingColor: palette.barCarrying)
+                    carryingColor: palette.barCarrying,
+                    rim: palette.rimColor)
 
             drawParticles(in: ctx,
                           bar: (x: barX, y: barY),
@@ -337,25 +348,6 @@ enum BarIconRenderer {
 
     // MARK: Arrow drawing
 
-    /// Vertical offset of the up-arrow's center of mass from its bounding-box
-    /// midpoint. The down-arrow offset is the negative of this. Used to
-    /// optically align the two arrows on a common horizontal line even though
-    /// the head+stem shape is not symmetric about its own midpoint.
-    private static var arrowCenterOfMassYOffset: CGFloat {
-        let headH = arrowHeight * arrowHeadFraction
-        let stemH = arrowHeight - headH
-        let stemW = arrowWidth * arrowStemFraction
-        let aHead = 0.5 * arrowWidth * headH       // triangle area
-        let aStem = stemW * stemH                  // rectangle area
-        // Centroids, in the up-arrow's local frame (origin bottom-left).
-        // Head triangle peaks at y=arrowHeight with base at y=arrowHeight-headH.
-        // Its centroid sits one-third of its height above the base.
-        let yHead = arrowHeight - (2.0 / 3.0) * headH
-        let yStem = stemH / 2
-        let comY  = (aHead * yHead + aStem * yStem) / (aHead + aStem)
-        return comY - arrowHeight / 2
-    }
-
     /// Arrow shape: triangular head, narrow stem.
     /// NSImage(flipped: false) uses AppKit coordinates — y=0 is at the BOTTOM,
     /// y=height is at the TOP. Paths are authored in that convention.
@@ -397,6 +389,7 @@ enum BarIconRenderer {
         dim: CGFloat,
         idle: NSColor,
         accent: NSColor,
+        rim: NSColor,
         pointsUp: Bool
     ) {
         let path = arrowPath(pointsUp: pointsUp, width: arrowWidth, height: arrowHeight)
@@ -413,23 +406,19 @@ enum BarIconRenderer {
         let finalAlpha = color.alphaComponent * dim
         let effectiveIntensity = intensity * dim
 
-        // Soft glow halo while animating.
+        // Crisp rim stroke while animating. Drawn first so the fill
+        // overpaints the inside half; only the outside half (~rimWidth/2)
+        // shows as a clean boundary against the bar.
         if effectiveIntensity > 0.02 {
-            ctx.saveGState()
-            ctx.setShadow(
-                offset: .zero,
-                blur: 3.0 * effectiveIntensity,
-                color: accent.withAlphaComponent(0.75 * effectiveIntensity).cgColor
-            )
-            ctx.setFillColor(color.withAlphaComponent(finalAlpha).cgColor)
+            ctx.setStrokeColor(rim.withAlphaComponent(min(1.0, effectiveIntensity)).cgColor)
+            ctx.setLineWidth(rimWidth)
             ctx.addPath(path)
-            ctx.fillPath()
-            ctx.restoreGState()
-        } else {
-            ctx.setFillColor(color.withAlphaComponent(finalAlpha).cgColor)
-            ctx.addPath(path)
-            ctx.fillPath()
+            ctx.strokePath()
         }
+
+        ctx.setFillColor(color.withAlphaComponent(finalAlpha).cgColor)
+        ctx.addPath(path)
+        ctx.fillPath()
 
         ctx.restoreGState()
     }
@@ -442,34 +431,29 @@ enum BarIconRenderer {
         carrying: CGFloat,
         dim: CGFloat,
         idle: NSColor,
-        carryingColor: NSColor
+        carryingColor: NSColor,
+        rim: NSColor
     ) {
         let rect = CGRect(x: x, y: y, width: barWidth, height: barHeight)
 
         // Same story as the arrows: rest-state = labelColor, carrying-state =
-        // palette accent, crossfade between them on `carrying`.
+        // palette accent, crossfade between them on `carrying`. Rim stroke
+        // wraps the fill while animating so the bar has a crisp boundary.
         let color = blend(from: idle, to: carryingColor, t: carrying)
         let finalAlpha = color.alphaComponent * dim
         let effectiveCarrying = carrying * dim
+        let path = CGPath(roundedRect: rect, cornerWidth: barWidth / 2, cornerHeight: barWidth / 2, transform: nil)
 
         if effectiveCarrying > 0.02 {
-            ctx.saveGState()
-            ctx.setShadow(
-                offset: .zero,
-                blur: 2.5 * effectiveCarrying,
-                color: carryingColor.withAlphaComponent(0.6 * effectiveCarrying).cgColor
-            )
-            ctx.setFillColor(color.withAlphaComponent(finalAlpha).cgColor)
-            let path = CGPath(roundedRect: rect, cornerWidth: barWidth / 2, cornerHeight: barWidth / 2, transform: nil)
+            ctx.setStrokeColor(rim.withAlphaComponent(min(1.0, effectiveCarrying)).cgColor)
+            ctx.setLineWidth(rimWidth)
             ctx.addPath(path)
-            ctx.fillPath()
-            ctx.restoreGState()
-        } else {
-            ctx.setFillColor(color.withAlphaComponent(finalAlpha).cgColor)
-            let path = CGPath(roundedRect: rect, cornerWidth: barWidth / 2, cornerHeight: barWidth / 2, transform: nil)
-            ctx.addPath(path)
-            ctx.fillPath()
+            ctx.strokePath()
         }
+
+        ctx.setFillColor(color.withAlphaComponent(finalAlpha).cgColor)
+        ctx.addPath(path)
+        ctx.fillPath()
     }
 
     // MARK: Particles
