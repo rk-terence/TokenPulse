@@ -15,7 +15,7 @@ protocol ProxyAPIHandler: Sendable {
 
     /// Normalized messages / input stack carried by the request body. Empty when
     /// the provider uses `previous_response_id` alone (OpenAI path).
-    func normalizedLineageMessages(from body: Data) -> [LineageTree.NormalizedMessage]
+    func normalizedLineageMessages(from body: Data) -> [ContentTree.NormalizedMessage]
 
     /// OpenAI `previous_response_id` if present; always nil for Anthropic.
     func previousResponseID(from body: Data) -> String?
@@ -68,7 +68,7 @@ struct AnthropicProxyAPIHandler: ProxyAPIHandler {
         ProxyRequestBody.lineageFingerprint(from: body, flavor: flavor)
     }
 
-    func normalizedLineageMessages(from body: Data) -> [LineageTree.NormalizedMessage] {
+    func normalizedLineageMessages(from body: Data) -> [ContentTree.NormalizedMessage] {
         ProxyRequestBody.normalizedLineageMessages(from: body, flavor: flavor)
     }
 

@@ -9,7 +9,7 @@ final class LocalProxyController {
     private static let sessionRetentionSeconds: TimeInterval = 24 * 60 * 60
     private static let sessionVisibilitySeconds: TimeInterval = 10 * 60
     private static let otherTrafficRetentionSeconds: TimeInterval = 60
-    private static let lineageTreePruneRetention: TimeInterval = 24 * 60 * 60
+    private static let contentTreePruneRetention: TimeInterval = 24 * 60 * 60
     private static let restartAttempts = 3
     private static let restartStopDelay: Duration = .milliseconds(150)
     private static let restartStartupTimeout: Duration = .milliseconds(900)
@@ -486,14 +486,14 @@ final class LocalProxyController {
                     await sessStore.pruneStaleDoneRequests(
                         otherOlderThan: now.addingTimeInterval(-Self.otherTrafficRetentionSeconds)
                     )
-                    let pruneResult = await sessStore.pruneLineageTree(
-                        retention: Self.lineageTreePruneRetention
+                    let pruneResult = await sessStore.pruneContentTree(
+                        retention: Self.contentTreePruneRetention
                     )
-                    if !pruneResult.removedConversationIDs.isEmpty || !pruneResult.removedSegmentIDs.isEmpty {
+                    if !pruneResult.removedConversationIDs.isEmpty || !pruneResult.removedNodeIDs.isEmpty {
                         let logger = await MainActor.run { self?.eventLogger }
                         await logger?.pruneLineageMirror(
                             conversationIDs: pruneResult.removedConversationIDs,
-                            segmentIDs: pruneResult.removedSegmentIDs
+                            nodeIDs: pruneResult.removedNodeIDs
                         )
                     }
                 }

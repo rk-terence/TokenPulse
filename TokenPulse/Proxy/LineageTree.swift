@@ -1,21 +1,17 @@
 import CryptoKit
 import Foundation
 
-/// In-memory lineage tree that tracks the conversation structure of every
-/// proxied request whose body carries a messages-style stack (or, for
-/// OpenAI Responses, a `previous_response_id`).
+/// In-memory content tree. Each tree represents the conversation space for a
+/// single cache-identity fingerprint (same model / system / tools / thinking).
+/// Nodes are content checkpoints — a node stores only the messages it appends
+/// to its parent's cumulative prefix. Requests are separate records attached
+/// to a node; a node may own multiple requests (retries, repeats, or two
+/// sessions arriving at the exact same content state).
 ///
-/// A tree is rooted at a `Conversation` (one per unique cache-identity
-/// fingerprint) and grows by appending descendants; nodes are never
-/// re-parented. Segments hold a non-branching run of normalized messages
-/// so that a 50-turn conversation needs only one segment in memory and
-/// one row in SQLite.
-///
-/// This type is a value-semantic struct that must be owned by an actor
-/// (`ProxySessionStore`) so mutations are serialized. It is pure Swift
-/// and has no I/O side effects — callers are responsible for mirroring
+/// The tree is a value-semantic struct owned by an actor (`ProxySessionStore`)
+/// so mutations are serialized. It has no I/O side effects — callers mirror
 /// changes to SQLite via `ProxyEventLogger`.
-struct LineageTree: Sendable {
+struct ContentTree: Sendable {
 
     // MARK: - Conversation
 
@@ -24,112 +20,106 @@ struct LineageTree: Sendable {
         let fingerprintHash: String
     }
 
-    /// A conversation is the tree root. Beyond the routing key, it also owns the
-    /// full `LineageFingerprint` so downstream callers (UI rows, SQLite mirror,
-    /// future keep-alive replay) never need to carry model/system/tools through
-    /// per-request activity state — they ask the conversation instead.
+    /// A conversation is the tree root. Beyond the routing key, it also owns
+    /// the full `LineageFingerprint` so downstream callers (UI rows, SQLite
+    /// mirror) can resolve a node back to its model/system/tools without
+    /// re-parsing the original request body.
     struct Conversation: Sendable {
         let id: UUID
         let key: ConversationKey
         let fingerprint: LineageFingerprint
-        let rootSegmentID: UUID
+        let rootNodeID: UUID
         var lastActivityAt: Date
     }
 
     // MARK: - Normalized message
 
     /// A message after stripping transient markers (cache_control, ephemeral, etc.).
-    /// `contentHash` is the canonical SHA256 used for prefix comparison; `rawJSON`
-    /// is the normalized JSON kept for payload reconstruction.
+    /// `contentHash` is the canonical SHA-256 used for prefix folding;
+    /// `rawJSON` is the normalized JSON kept for payload reconstruction.
     struct NormalizedMessage: Sendable, Equatable {
         let role: String
         let contentHash: String
         let rawJSON: Data
     }
 
-    // MARK: - Segment
+    // MARK: - Node (content checkpoint)
 
-    /// A non-branching run of messages. Segments grow in place when a
-    /// descendant extends the current leaf; branching creates a new
-    /// segment whose parent is the existing segment at `parentSplitIndex`.
-    struct Segment: Sendable {
+    /// A point in the conversation's message-prefix space. The root node of
+    /// every conversation has an empty `deltaMessages` list; descendant nodes
+    /// carry the messages their attach added on top of the parent's cumulative
+    /// prefix. `cumulativeHash` is the fold-hash of the full prefix at this
+    /// node and is the key under which the node is looked up during attach.
+    struct Node: Sendable {
         let id: UUID
         let conversationID: UUID
-        let parentSegmentID: UUID?
-        /// Index in the parent segment where this segment branches off.
-        /// `-1` for the conversation's root segment.
-        let parentSplitIndex: Int
-        var messages: [NormalizedMessage]
-        /// Requests whose tail lands somewhere inside this segment, sorted by `tailIndex`.
-        var nodes: [Node]
+        let parentNodeID: UUID?
+        var deltaMessages: [NormalizedMessage]
+        let cumulativeHash: String
         var lastActivityAt: Date
-        /// Cached canonical JSON serialization of `messages`. Populated lazily by
-        /// `cachedMessagesJSON(for:)` and invalidated whenever `messages` mutates
-        /// (only `extendOrBranch`'s in-place extension path does that).
-        var messagesJSONCache: String?
+        /// Canonical JSON of `deltaMessages`, populated lazily by
+        /// `cachedDeltaMessagesJSON(for:)`. Deltas are immutable after
+        /// creation so the cache never needs invalidation.
+        var deltaMessagesJSONCache: String?
     }
 
-    // MARK: - Node (one recorded request)
+    // MARK: - Request (one attempt attached to a node)
 
-    struct Node: Sendable {
-        let requestID: UUID
-        /// Inclusive index into the segment's `messages` array — the last message this
-        /// request sent. For OpenAI-linked nodes without a messages body this may still
-        /// be set from the parent's tail.
-        let tailIndex: Int
-        /// Anthropic `msg_*` or OpenAI `resp_*` returned by upstream once known.
-        var responseID: String?
-        /// OpenAI `previous_response_id` from the request body, if any.
-        let previousResponseID: String?
-        var done: Bool
-        let createdAt: Date
-        var doneAt: Date?
-        var tokenUsage: TokenUsage?
-        /// Anthropic-style session ID (e.g. `X-Claude-Code-Session-Id`) or
-        /// OpenAI `session_id` header, for UI grouping. Decoupled from the
-        /// conversation (which is keyed by fingerprint, not session).
+    /// One proxy request attached to a content node. A node may hold many of
+    /// these — retries, two sessions arriving at the same prefix, or the same
+    /// client hammering a turn. `finishedAt == nil` means the request is
+    /// still in flight; `succeeded` distinguishes successful completion from
+    /// an errored / cancelled terminal state.
+    struct Request: Sendable {
+        let id: UUID
+        let nodeID: UUID
         let sessionID: String
+        let previousResponseID: String?
+        var responseID: String?
+        let createdAt: Date
+        var finishedAt: Date?
+        var succeeded: Bool
+        var tokenUsage: TokenUsage?
+
+        var isTerminal: Bool { finishedAt != nil }
     }
 
     // MARK: - State
 
-    /// Conversations keyed by their stable conversation key.
     private(set) var conversations: [ConversationKey: Conversation] = [:]
-    /// Every segment, indexed by UUID for O(1) lookup.
-    private(set) var segments: [UUID: Segment] = [:]
-    /// Map from request UUID to its location (segment + index into `Segment.nodes`).
-    private(set) var nodeLocations: [UUID: (segmentID: UUID, nodeIndex: Int)] = [:]
-    /// Map from upstream response ID (when known) to the owning request UUID.
-    /// Enables OpenAI `previous_response_id` linkage.
+    private(set) var nodes: [UUID: Node] = [:]
+    private(set) var requests: [UUID: Request] = [:]
+    /// Direct children of a node (parent → child IDs).
+    private(set) var childrenByNode: [UUID: [UUID]] = [:]
+    /// Requests attached to a node.
+    private(set) var requestsByNode: [UUID: [UUID]] = [:]
+    /// Per-conversation trim-and-match index: cumulative prefix hash → node.
+    private(set) var nodesByHash: [ConversationKey: [String: UUID]] = [:]
+    /// Upstream-response-ID → owning node. Used for OpenAI
+    /// `previous_response_id` linkage across requests.
     private(set) var responseIDIndex: [String: UUID] = [:]
 
     // MARK: - Attach
 
-    /// Result of attaching a request to the tree.
     struct AttachResult: Sendable {
         let conversationID: UUID
-        let segmentID: UUID
-        let tailIndex: Int
-        /// Whether this attach created a new conversation root.
+        let nodeID: UUID
         let createdConversation: Bool
-        /// Whether this attach created a new segment (branch or first segment in a conversation).
-        let createdSegment: Bool
-        /// Messages that were appended to the segment as part of this attach (could be empty
-        /// when a duplicate prefix matches an existing segment tail exactly).
-        let appendedMessages: [NormalizedMessage]
+        let createdNode: Bool
     }
 
-    /// Record a new request in the tree. Called the moment upstream returns 2xx.
+    /// Attach a newly-parsed proxy request to the tree. The request starts in
+    /// the in-flight state; callers must call `finishRequest` on completion.
     ///
     /// - Parameters:
-    ///   - requestID: Unique identifier for the request.
-    ///   - sessionID: UI grouping key (session header prefix); does not affect tree shape.
-    ///   - fingerprint: Full cache-identity fingerprint. Persisted on the conversation the
-    ///     first time it is seen; reused as the routing key (`fingerprint.conversationKey`).
-    ///   - messages: Normalized messages carried by the request body. Empty when the
-    ///     provider used `previous_response_id` alone (OpenAI path).
+    ///   - requestID: Unique ID for this request.
+    ///   - sessionID: UI grouping key; does not affect tree shape.
+    ///   - fingerprint: Cache-identity fingerprint; persisted on the
+    ///     conversation the first time it is seen.
+    ///   - messages: Normalized messages carried by the request body. Empty
+    ///     when the provider used `previous_response_id` alone (OpenAI).
     ///   - previousResponseID: OpenAI `previous_response_id`, if any.
-    ///   - now: Timestamp injected for deterministic testing.
+    @discardableResult
     mutating func attach(
         requestID: UUID,
         sessionID: String,
@@ -139,343 +129,447 @@ struct LineageTree: Sendable {
         now: Date = Date()
     ) -> AttachResult {
         let key = fingerprint.conversationKey
-        // 1) OpenAI `previous_response_id` path — forced parent linkage.
+
+        // 1) OpenAI previous_response_id with no body messages: force-link to
+        //    the node that produced the referenced upstream response.
         if messages.isEmpty,
            let previousResponseID,
-           let ownerRequestID = responseIDIndex[previousResponseID],
-           let ownerLocation = nodeLocations[ownerRequestID],
-           let ownerSegment = segments[ownerLocation.segmentID] {
-            let ownerNode = ownerSegment.nodes[ownerLocation.nodeIndex]
-            let result = extendOrBranch(
-                conversationID: ownerSegment.conversationID,
-                parentSegmentID: ownerSegment.id,
-                parentTailIndex: ownerNode.tailIndex,
-                newMessages: [],
-                requestID: requestID,
+           let ownerNodeID = responseIDIndex[previousResponseID],
+           let ownerNode = nodes[ownerNodeID] {
+            recordRequest(
+                id: requestID,
+                nodeID: ownerNode.id,
                 sessionID: sessionID,
                 previousResponseID: previousResponseID,
                 now: now
             )
-            touchConversation(id: ownerSegment.conversationID, at: now)
+            touch(nodeID: ownerNode.id, now: now)
+            touch(conversationID: ownerNode.conversationID, at: now)
             return AttachResult(
-                conversationID: ownerSegment.conversationID,
-                segmentID: result.segmentID,
-                tailIndex: result.tailIndex,
+                conversationID: ownerNode.conversationID,
+                nodeID: ownerNode.id,
                 createdConversation: false,
-                createdSegment: result.createdSegment,
-                appendedMessages: result.appendedMessages
+                createdNode: false
             )
         }
 
-        // 2) Resolve (or create) the conversation.
-        if let existing = conversations[key] {
-            let result = attachToConversation(
-                conversation: existing,
-                messages: messages,
-                requestID: requestID,
-                sessionID: sessionID,
-                previousResponseID: previousResponseID,
-                now: now
-            )
-            touchConversation(id: existing.id, at: now)
-            return AttachResult(
-                conversationID: existing.id,
-                segmentID: result.segmentID,
-                tailIndex: result.tailIndex,
-                createdConversation: false,
-                createdSegment: result.createdSegment,
-                appendedMessages: result.appendedMessages
-            )
-        }
-
-        // 3) Brand-new conversation — create root segment seeded with the full messages list.
-        //    When `messages` is empty (OpenAI `previous_response_id` path where the
-        //    pointed-at response is no longer resolvable in memory, e.g. after a
-        //    restart or prune), we still need the request to become a tracked node
-        //    so completion and mirror logging work. The node sits at tailIndex=-1
-        //    (pre-first-message) so `reconstructMessages` returns [].
-        let conversationID = UUID()
-        let rootSegmentID = UUID()
-        let rootTailIndex = messages.isEmpty ? -1 : messages.count - 1
-        let rootNode = Node(
-            requestID: requestID,
-            tailIndex: rootTailIndex,
-            responseID: nil,
-            previousResponseID: previousResponseID,
-            done: false,
-            createdAt: now,
-            doneAt: nil,
-            tokenUsage: nil,
-            sessionID: sessionID
-        )
-        let rootSegment = Segment(
-            id: rootSegmentID,
-            conversationID: conversationID,
-            parentSegmentID: nil,
-            parentSplitIndex: -1,
-            messages: messages,
-            nodes: [rootNode],
-            lastActivityAt: now,
-            messagesJSONCache: nil
-        )
-        segments[rootSegmentID] = rootSegment
-        nodeLocations[requestID] = (rootSegmentID, 0)
-        conversations[key] = Conversation(
-            id: conversationID,
+        // 2) Resolve / create the conversation.
+        let (conversation, createdConversation) = resolveOrCreateConversation(
             key: key,
             fingerprint: fingerprint,
-            rootSegmentID: rootSegmentID,
-            lastActivityAt: now
+            now: now
         )
+
+        // 3) Brand-new conversation with no messages and no resolvable
+        //    previous_response_id: attach to the root node (empty prefix) and
+        //    return. Descendants cannot match against this request unless a
+        //    later one produces a responseID linkage.
+        if messages.isEmpty {
+            recordRequest(
+                id: requestID,
+                nodeID: conversation.rootNodeID,
+                sessionID: sessionID,
+                previousResponseID: previousResponseID,
+                now: now
+            )
+            touch(nodeID: conversation.rootNodeID, now: now)
+            touch(conversationID: conversation.id, at: now)
+            return AttachResult(
+                conversationID: conversation.id,
+                nodeID: conversation.rootNodeID,
+                createdConversation: createdConversation,
+                createdNode: false
+            )
+        }
+
+        // 4) Precompute prefix hashes once (O(N)) and trim-and-match against
+        //    `nodesByHash[key]` from k=N down to k=0. The root node is always
+        //    registered at k=0 so the loop always terminates.
+        let prefixHashes = Self.computePrefixHashes(messages: messages)
+        let convHashes = nodesByHash[key] ?? [:]
+        var matchedK = 0
+        var matchedNodeID = conversation.rootNodeID
+        for k in stride(from: messages.count, through: 0, by: -1) {
+            if let id = convHashes[prefixHashes[k]] {
+                matchedK = k
+                matchedNodeID = id
+                break
+            }
+        }
+
+        // 5) Full prefix already exists — attach to the matched node.
+        if matchedK == messages.count {
+            recordRequest(
+                id: requestID,
+                nodeID: matchedNodeID,
+                sessionID: sessionID,
+                previousResponseID: previousResponseID,
+                now: now
+            )
+            touch(nodeID: matchedNodeID, now: now)
+            touch(conversationID: conversation.id, at: now)
+            return AttachResult(
+                conversationID: conversation.id,
+                nodeID: matchedNodeID,
+                createdConversation: createdConversation,
+                createdNode: false
+            )
+        }
+
+        // 6) Partial match — create a new child node with the trimmed-off
+        //    suffix as its delta.
+        let delta = Array(messages[matchedK..<messages.count])
+        let newNodeID = UUID()
+        let newNode = Node(
+            id: newNodeID,
+            conversationID: conversation.id,
+            parentNodeID: matchedNodeID,
+            deltaMessages: delta,
+            cumulativeHash: prefixHashes[messages.count],
+            lastActivityAt: now,
+            deltaMessagesJSONCache: nil
+        )
+        nodes[newNodeID] = newNode
+        childrenByNode[matchedNodeID, default: []].append(newNodeID)
+        nodesByHash[key, default: [:]][newNode.cumulativeHash] = newNodeID
+        recordRequest(
+            id: requestID,
+            nodeID: newNodeID,
+            sessionID: sessionID,
+            previousResponseID: previousResponseID,
+            now: now
+        )
+        touch(conversationID: conversation.id, at: now)
         return AttachResult(
-            conversationID: conversationID,
-            segmentID: rootSegmentID,
-            tailIndex: rootTailIndex,
-            createdConversation: true,
-            createdSegment: true,
-            appendedMessages: messages
+            conversationID: conversation.id,
+            nodeID: newNodeID,
+            createdConversation: createdConversation,
+            createdNode: true
         )
     }
 
-    // MARK: - Done transition
+    // MARK: - Request transitions
 
-    /// Mark a node as done (response fully received). Subsequent descendants may attach to it.
-    mutating func markDone(
+    /// Mark a request as terminal. `succeeded == true` indicates the stream
+    /// completed cleanly; `false` covers upstream errors, client disconnects,
+    /// and incomplete streams alike.
+    mutating func finishRequest(
         requestID: UUID,
+        succeeded: Bool,
         tokenUsage: TokenUsage?,
         responseID: String?,
         now: Date = Date()
     ) {
-        guard let location = nodeLocations[requestID] else { return }
-        guard var segment = segments[location.segmentID] else { return }
-        var node = segment.nodes[location.nodeIndex]
-        node.done = true
-        node.doneAt = now
-        node.tokenUsage = tokenUsage
+        guard var request = requests[requestID] else { return }
+        request.finishedAt = now
+        request.succeeded = succeeded
+        request.tokenUsage = tokenUsage
         if let responseID {
-            node.responseID = responseID
-            responseIDIndex[responseID] = requestID
+            request.responseID = responseID
+            // Only index successful responses as `previous_response_id`
+            // parents. A partial / errored turn (Anthropic or OpenAI
+            // `response.incomplete`) can still surface a response ID, but we
+            // must not let follow-up requests force-link onto an unresolved
+            // content state — those fall back to cumulative-hash matching.
+            if succeeded {
+                responseIDIndex[responseID] = request.nodeID
+            }
         }
-        segment.nodes[location.nodeIndex] = node
-        segment.lastActivityAt = now
-        segments[location.segmentID] = segment
-        touchConversation(id: segment.conversationID, at: now)
+        requests[requestID] = request
+        touch(nodeID: request.nodeID, now: now)
+        if let node = nodes[request.nodeID] {
+            touch(conversationID: node.conversationID, at: now)
+        }
     }
 
-    // MARK: - Leaf query
+    // MARK: - Displayable requests
 
-    /// Look up a conversation by its UUID. Used by the UI and SQLite mirror to
-    /// resolve a node back to its `LineageFingerprint` (model / system / tools).
-    func conversation(withID id: UUID) -> Conversation? {
-        for conversation in conversations.values where conversation.id == id {
-            return conversation
-        }
-        return nil
-    }
-
-    /// A done-true node considered *displayable* in the popup.
-    ///
-    /// - `isPendingReplacement == false`: the node is a true leaf — no descendant
-    ///   exists at all. It represents the current state of the conversation.
-    /// - `isPendingReplacement == true`: the node has at least one `done == false`
-    ///   descendant (a new active request extended from it) but no `done == true`
-    ///   descendant yet. We still show the node — the new active request hasn't
-    ///   produced a result — but the UI dims it to signal "about to be replaced".
-    struct DisplayableLeaf: Sendable {
+    /// A successful request the UI should render in the popover's Done section.
+    /// `isPendingReplacement` is true iff the owning node has at least one
+    /// descendant node with an in-flight request (so the row should be dimmed
+    /// until that descendant either succeeds — at which point this row stops
+    /// being displayable — or fails — at which point the flag clears).
+    struct DisplayableRequest: Sendable {
         let conversationID: UUID
+        let nodeID: UUID
         let requestID: UUID
         let isPendingReplacement: Bool
     }
 
-    /// Return every done-true node that has no done-true descendant anywhere
-    /// below it. Nodes with `done=false` descendants are flagged as pending.
-    /// Callers drive popup rendering from this result.
-    func displayableDoneLeaves() -> [DisplayableLeaf] {
-        var result: [DisplayableLeaf] = []
-        for segment in segments.values {
-            for (index, node) in segment.nodes.enumerated() where node.done {
-                if hasDoneTrueDescendant(of: node, atIndex: index, inSegment: segment) {
-                    continue
-                }
-                let pending = hasAnyDescendant(of: node, atIndex: index, inSegment: segment)
-                result.append(
-                    DisplayableLeaf(
-                        conversationID: segment.conversationID,
-                        requestID: node.requestID,
-                        isPendingReplacement: pending
-                    )
-                )
+    /// Every successful request whose node has no descendant node carrying a
+    /// successful request. Descendants with only in-flight requests leave the
+    /// owner flagged as pending replacement.
+    func displayableRequests() -> [DisplayableRequest] {
+        var result: [DisplayableRequest] = []
+        for (nodeID, node) in nodes {
+            let doneRequests = (requestsByNode[nodeID] ?? [])
+                .compactMap { requests[$0] }
+                .filter { $0.succeeded }
+            guard !doneRequests.isEmpty else { continue }
+            if subtreeContainsSuccessfulRequest(startingAtChildrenOf: nodeID) {
+                continue
+            }
+            let pending = subtreeContainsInFlightRequest(startingAtChildrenOf: nodeID)
+            for req in doneRequests {
+                result.append(DisplayableRequest(
+                    conversationID: node.conversationID,
+                    nodeID: nodeID,
+                    requestID: req.id,
+                    isPendingReplacement: pending
+                ))
             }
         }
         return result
     }
 
-    /// Legacy accessor retained for pruning: only true leaves with no descendants.
-    /// Pruning still targets these (pending nodes are kept alive because their
-    /// `done=false` descendant is by invariant itself a leaf that holds activity).
-    private func isStrictLeaf(
-        node: Node,
-        atIndex index: Int,
-        inSegment segment: Segment
-    ) -> Bool {
-        if index < segment.nodes.count - 1 {
-            return false
-        }
-        for candidate in segments.values where candidate.parentSegmentID == segment.id {
-            if candidate.parentSplitIndex >= node.tailIndex {
-                return false
-            }
-        }
-        return true
-    }
-
-    /// Any done-true node that descends from `node` (either further along the
-    /// same segment or in any child segment branching at or after `node.tailIndex`).
-    private func hasDoneTrueDescendant(
-        of node: Node,
-        atIndex index: Int,
-        inSegment segment: Segment
-    ) -> Bool {
-        var nextIndex = index + 1
-        while nextIndex < segment.nodes.count {
-            if segment.nodes[nextIndex].done { return true }
-            nextIndex += 1
-        }
-        for child in segments.values
-        where child.parentSegmentID == segment.id && child.parentSplitIndex >= node.tailIndex {
-            if subtreeContainsDoneTrueNode(child.id) {
-                return true
-            }
+    private func subtreeContainsSuccessfulRequest(startingAtChildrenOf nodeID: UUID) -> Bool {
+        var stack = childrenByNode[nodeID] ?? []
+        while let current = stack.popLast() {
+            let nodeRequests = (requestsByNode[current] ?? []).compactMap { requests[$0] }
+            if nodeRequests.contains(where: { $0.succeeded }) { return true }
+            stack.append(contentsOf: childrenByNode[current] ?? [])
         }
         return false
     }
 
-    private func subtreeContainsDoneTrueNode(_ segmentID: UUID) -> Bool {
-        guard let segment = segments[segmentID] else { return false }
-        for node in segment.nodes where node.done {
-            return true
-        }
-        for child in segments.values where child.parentSegmentID == segmentID {
-            if subtreeContainsDoneTrueNode(child.id) { return true }
+    private func subtreeContainsInFlightRequest(startingAtChildrenOf nodeID: UUID) -> Bool {
+        var stack = childrenByNode[nodeID] ?? []
+        while let current = stack.popLast() {
+            let nodeRequests = (requestsByNode[current] ?? []).compactMap { requests[$0] }
+            if nodeRequests.contains(where: { $0.finishedAt == nil }) { return true }
+            stack.append(contentsOf: childrenByNode[current] ?? [])
         }
         return false
     }
 
-    /// Whether any descendant node exists below `node` (regardless of done state).
-    private func hasAnyDescendant(
-        of node: Node,
-        atIndex index: Int,
-        inSegment segment: Segment
-    ) -> Bool {
-        if index < segment.nodes.count - 1 { return true }
-        for child in segments.values
-        where child.parentSegmentID == segment.id && child.parentSplitIndex >= node.tailIndex {
-            return true
+    // MARK: - Lookup helpers
+
+    func conversation(withID id: UUID) -> Conversation? {
+        conversations.values.first(where: { $0.id == id })
+    }
+
+    /// Walk from root to `nodeID`, returning nodes in root → target order.
+    func ancestorChain(for nodeID: UUID) -> [Node] {
+        var chain: [Node] = []
+        var cursor: UUID? = nodeID
+        while let id = cursor, let node = nodes[id] {
+            chain.append(node)
+            cursor = node.parentNodeID
         }
-        return false
+        return chain.reversed()
+    }
+
+    /// Reconstruct the full messages list at a node by walking root → target
+    /// and concatenating per-node deltas.
+    func reconstructMessages(nodeID: UUID) -> [NormalizedMessage] {
+        var result: [NormalizedMessage] = []
+        for node in ancestorChain(for: nodeID) {
+            result.append(contentsOf: node.deltaMessages)
+        }
+        return result
+    }
+
+    // MARK: - Cached delta JSON
+
+    /// Canonical JSON serialization of a node's `deltaMessages`. Cached on
+    /// the node so repeated mirror writes don't re-encode. Returns "[]" for
+    /// unknown IDs or empty deltas.
+    mutating func cachedDeltaMessagesJSON(for nodeID: UUID) -> String {
+        guard var node = nodes[nodeID] else { return "[]" }
+        if let cached = node.deltaMessagesJSONCache { return cached }
+        let encoded = Self.encodeDeltaMessagesJSON(node.deltaMessages)
+        node.deltaMessagesJSONCache = encoded
+        nodes[nodeID] = node
+        return encoded
     }
 
     // MARK: - Pruning
 
-    /// Result of a prune pass: IDs of segments and conversations removed,
-    /// plus the request IDs whose nodes were deleted. Callers use this to mirror deletions to SQLite.
     struct PruneResult: Sendable {
-        var removedSegmentIDs: Set<UUID>
         var removedConversationIDs: Set<UUID>
+        var removedNodeIDs: Set<UUID>
         var removedRequestIDs: Set<UUID>
     }
 
-    /// Prune leaves whose most recent activity is older than `retention` seconds,
-    /// cascading upward through now-empty segments and then conversations.
+    /// Drop terminal requests older than `retention`, then cascade-remove
+    /// empty leaf nodes and conversations whose last activity predates the
+    /// cutoff. In-flight requests are never pruned regardless of age — they
+    /// finalize on their own schedule via `finishRequest`.
     mutating func prune(retention: TimeInterval, now: Date = Date()) -> PruneResult {
-        var result = PruneResult(
-            removedSegmentIDs: [],
-            removedConversationIDs: [],
-            removedRequestIDs: []
-        )
+        var result = PruneResult(removedConversationIDs: [], removedNodeIDs: [], removedRequestIDs: [])
         let cutoff = now.addingTimeInterval(-retention)
+        let rootSet: Set<UUID> = Set(conversations.values.map { $0.rootNodeID })
 
-        // Repeatedly walk leaves and prune until a fixed point is reached.
-        // Branching is rare; typical fixed point is reached in 1–2 passes.
+        for (id, request) in requests {
+            guard let finishedAt = request.finishedAt, finishedAt < cutoff else { continue }
+            requests.removeValue(forKey: id)
+            if let responseID = request.responseID {
+                responseIDIndex.removeValue(forKey: responseID)
+            }
+            if var list = requestsByNode[request.nodeID] {
+                list.removeAll(where: { $0 == id })
+                if list.isEmpty {
+                    requestsByNode.removeValue(forKey: request.nodeID)
+                } else {
+                    requestsByNode[request.nodeID] = list
+                }
+            }
+            result.removedRequestIDs.insert(id)
+        }
+
         var changed = true
         while changed {
             changed = false
-
-            // 1) Prune leaf nodes that are older than the cutoff.
-            for (segmentID, segment) in segments {
-                var survivingNodes: [Node] = []
-                survivingNodes.reserveCapacity(segment.nodes.count)
-                for (index, node) in segment.nodes.enumerated() {
-                    let isTerminal = isStrictLeaf(node: node, atIndex: index, inSegment: segment)
-                    let referenceTime = node.doneAt ?? node.createdAt
-                    if isTerminal && referenceTime < cutoff {
-                        nodeLocations.removeValue(forKey: node.requestID)
-                        if let responseID = node.responseID {
-                            responseIDIndex.removeValue(forKey: responseID)
-                        }
-                        result.removedRequestIDs.insert(node.requestID)
-                        changed = true
+            for (nodeID, node) in nodes {
+                if rootSet.contains(nodeID) { continue }
+                let hasRequests = !(requestsByNode[nodeID]?.isEmpty ?? true)
+                let hasChildren = !(childrenByNode[nodeID]?.isEmpty ?? true)
+                if hasRequests || hasChildren { continue }
+                if let parentID = node.parentNodeID,
+                   var siblings = childrenByNode[parentID] {
+                    siblings.removeAll(where: { $0 == nodeID })
+                    if siblings.isEmpty {
+                        childrenByNode.removeValue(forKey: parentID)
                     } else {
-                        survivingNodes.append(node)
+                        childrenByNode[parentID] = siblings
                     }
                 }
-                if survivingNodes.count != segment.nodes.count {
-                    var updated = segment
-                    updated.nodes = survivingNodes
-                    segments[segmentID] = updated
+                childrenByNode.removeValue(forKey: nodeID)
+                if let convKey = conversationKey(forConversationID: node.conversationID) {
+                    nodesByHash[convKey]?.removeValue(forKey: node.cumulativeHash)
                 }
-            }
-
-            // 2) Drop non-root segments that have no nodes AND no child segments.
-            let segmentIDsWithChildren: Set<UUID> = Set(segments.values.compactMap { $0.parentSegmentID })
-            let rootSegmentIDs: Set<UUID> = Set(conversations.values.map { $0.rootSegmentID })
-            for (segmentID, segment) in segments where segment.nodes.isEmpty && !segmentIDsWithChildren.contains(segmentID) {
-                guard !rootSegmentIDs.contains(segmentID) else { continue }
-                segments.removeValue(forKey: segmentID)
-                result.removedSegmentIDs.insert(segmentID)
+                nodes.removeValue(forKey: nodeID)
+                result.removedNodeIDs.insert(nodeID)
                 changed = true
             }
+        }
 
-            // 3) Drop conversations whose root segment is empty AND has no live children.
-            for (key, conversation) in conversations {
-                guard let root = segments[conversation.rootSegmentID] else {
-                    conversations.removeValue(forKey: key)
-                    result.removedConversationIDs.insert(conversation.id)
-                    changed = true
-                    continue
-                }
-                let hasChildren = segments.values.contains(where: { $0.parentSegmentID == root.id })
-                if root.nodes.isEmpty && !hasChildren {
-                    segments.removeValue(forKey: root.id)
-                    result.removedSegmentIDs.insert(root.id)
-                    conversations.removeValue(forKey: key)
-                    result.removedConversationIDs.insert(conversation.id)
-                    changed = true
-                }
+        for (key, conversation) in conversations {
+            guard let root = nodes[conversation.rootNodeID] else {
+                conversations.removeValue(forKey: key)
+                nodesByHash.removeValue(forKey: key)
+                result.removedConversationIDs.insert(conversation.id)
+                continue
+            }
+            let rootRequests = requestsByNode[conversation.rootNodeID] ?? []
+            let rootChildren = childrenByNode[conversation.rootNodeID] ?? []
+            if rootRequests.isEmpty && rootChildren.isEmpty && conversation.lastActivityAt < cutoff {
+                nodes.removeValue(forKey: root.id)
+                result.removedNodeIDs.insert(root.id)
+                nodesByHash.removeValue(forKey: key)
+                conversations.removeValue(forKey: key)
+                result.removedConversationIDs.insert(conversation.id)
             }
         }
 
         return result
     }
 
-    // MARK: - Cached messages JSON
+    // MARK: - Prefix hashing (single-pass, no redundant work)
 
-    /// Canonical JSON serialization of the segment's messages array, cached on
-    /// the segment to amortize repeated mirror writes. First call after any
-    /// mutation (or initial population) serializes once; subsequent calls hit
-    /// the cache. Returns "[]" for unknown segment IDs.
-    mutating func cachedMessagesJSON(for segmentID: UUID) -> String {
-        guard var segment = segments[segmentID] else { return "[]" }
-        if let cached = segment.messagesJSONCache {
-            return cached
-        }
-        let encoded = Self.encodeMessagesJSON(segment.messages)
-        segment.messagesJSONCache = encoded
-        segments[segmentID] = segment
-        return encoded
+    /// Hash of the empty prefix (H_0). Serves as the root node's cumulative hash.
+    static func emptyPrefixHash() -> String {
+        LineageHash.sha256Hex("")
     }
 
-    private static func encodeMessagesJSON(_ messages: [NormalizedMessage]) -> String {
+    /// Fold one more message's content hash into the running prefix hash.
+    /// H_k = SHA256(H_{k-1} + ":" + msg_k.contentHash).
+    static func foldPrefixHash(previous: String, messageContentHash: String) -> String {
+        LineageHash.sha256Hex(previous + ":" + messageContentHash)
+    }
+
+    /// Compute H_0..H_N for `messages` in one O(N) pass. Each message's
+    /// `contentHash` is folded exactly once, so repeated trim-and-match
+    /// lookups reuse the array without re-hashing anything.
+    static func computePrefixHashes(messages: [NormalizedMessage]) -> [String] {
+        var result: [String] = []
+        result.reserveCapacity(messages.count + 1)
+        var running = emptyPrefixHash()
+        result.append(running)
+        for message in messages {
+            running = foldPrefixHash(previous: running, messageContentHash: message.contentHash)
+            result.append(running)
+        }
+        return result
+    }
+
+    // MARK: - Private helpers
+
+    private mutating func resolveOrCreateConversation(
+        key: ConversationKey,
+        fingerprint: LineageFingerprint,
+        now: Date
+    ) -> (Conversation, Bool) {
+        if let existing = conversations[key] {
+            return (existing, false)
+        }
+        let rootHash = Self.emptyPrefixHash()
+        let rootID = UUID()
+        let conversationID = UUID()
+        let rootNode = Node(
+            id: rootID,
+            conversationID: conversationID,
+            parentNodeID: nil,
+            deltaMessages: [],
+            cumulativeHash: rootHash,
+            lastActivityAt: now,
+            deltaMessagesJSONCache: "[]"
+        )
+        let conversation = Conversation(
+            id: conversationID,
+            key: key,
+            fingerprint: fingerprint,
+            rootNodeID: rootID,
+            lastActivityAt: now
+        )
+        nodes[rootID] = rootNode
+        conversations[key] = conversation
+        nodesByHash[key, default: [:]][rootHash] = rootID
+        return (conversation, true)
+    }
+
+    private mutating func recordRequest(
+        id: UUID,
+        nodeID: UUID,
+        sessionID: String,
+        previousResponseID: String?,
+        now: Date
+    ) {
+        let request = Request(
+            id: id,
+            nodeID: nodeID,
+            sessionID: sessionID,
+            previousResponseID: previousResponseID,
+            responseID: nil,
+            createdAt: now,
+            finishedAt: nil,
+            succeeded: false,
+            tokenUsage: nil
+        )
+        requests[id] = request
+        requestsByNode[nodeID, default: []].append(id)
+    }
+
+    private mutating func touch(nodeID: UUID, now: Date) {
+        guard var node = nodes[nodeID] else { return }
+        node.lastActivityAt = now
+        nodes[nodeID] = node
+    }
+
+    private mutating func touch(conversationID: UUID, at now: Date) {
+        for (key, conversation) in conversations where conversation.id == conversationID {
+            var updated = conversation
+            updated.lastActivityAt = now
+            conversations[key] = updated
+            return
+        }
+    }
+
+    private func conversationKey(forConversationID id: UUID) -> ConversationKey? {
+        conversations.values.first(where: { $0.id == id })?.key
+    }
+
+    private static func encodeDeltaMessagesJSON(_ messages: [NormalizedMessage]) -> String {
         let array = messages.compactMap { message -> [String: Any]? in
             try? JSONSerialization.jsonObject(with: message.rawJSON) as? [String: Any]
         }
@@ -485,380 +579,19 @@ struct LineageTree: Sendable {
         }
         return "[]"
     }
-
-    // MARK: - Path reconstruction (for SQLite reads / diagnostics)
-
-    /// Walk the parent chain of `segmentID` and concatenate the prefix up to `tailIndex`,
-    /// returning the full messages list for that node.
-    func reconstructMessages(segmentID: UUID, tailIndex: Int) -> [NormalizedMessage]? {
-        guard let segment = segments[segmentID] else { return nil }
-        var result: [NormalizedMessage] = []
-        if let parentID = segment.parentSegmentID {
-            let parentMessages = reconstructMessages(
-                segmentID: parentID,
-                tailIndex: segment.parentSplitIndex
-            )
-            if let parentMessages {
-                result = parentMessages
-            }
-        }
-        let safeTail = min(max(-1, tailIndex), segment.messages.count - 1)
-        if safeTail >= 0 {
-            result.append(contentsOf: segment.messages[0...safeTail])
-        }
-        return result
-    }
-
-    // MARK: - Private helpers
-
-    private mutating func touchConversation(id: UUID, at now: Date) {
-        for (key, conversation) in conversations where conversation.id == id {
-            var updated = conversation
-            updated.lastActivityAt = now
-            conversations[key] = updated
-            return
-        }
-    }
-
-    private func conversationRootSegmentID(for conversationID: UUID) -> UUID? {
-        for conversation in conversations.values where conversation.id == conversationID {
-            return conversation.rootSegmentID
-        }
-        return nil
-    }
-
-    private struct ExtendResult {
-        let segmentID: UUID
-        let tailIndex: Int
-        let createdSegment: Bool
-        let appendedMessages: [NormalizedMessage]
-    }
-
-    private mutating func attachToConversation(
-        conversation: Conversation,
-        messages: [NormalizedMessage],
-        requestID: UUID,
-        sessionID: String,
-        previousResponseID: String?,
-        now: Date
-    ) -> ExtendResult {
-        guard !messages.isEmpty else {
-            // Empty messages and no resolvable previous_response_id — degenerate attach.
-            // Treat as a zero-length node at the root tail.
-            guard let root = segments[conversation.rootSegmentID] else {
-                // Shouldn't happen; fabricate a fresh root.
-                return seedConversationRoot(
-                    conversationID: conversation.id,
-                    messages: [],
-                    requestID: requestID,
-                    sessionID: sessionID,
-                    previousResponseID: previousResponseID,
-                    now: now
-                )
-            }
-            return appendNodeToSegment(
-                segmentID: root.id,
-                tailIndex: max(-1, root.messages.count - 1),
-                requestID: requestID,
-                sessionID: sessionID,
-                previousResponseID: previousResponseID,
-                now: now
-            )
-        }
-
-        // Find the closest done-true ancestor whose messages form a proper prefix.
-        if let best = findClosestDoneAncestor(conversationID: conversation.id, messages: messages) {
-            return extendOrBranch(
-                conversationID: conversation.id,
-                parentSegmentID: best.segmentID,
-                parentTailIndex: best.tailIndex,
-                newMessages: Array(messages[(best.tailIndex + 1)...]),
-                requestID: requestID,
-                sessionID: sessionID,
-                previousResponseID: previousResponseID,
-                now: now
-            )
-        }
-
-        // No ancestor — attach at root or branch from root's split index -1.
-        return extendOrBranch(
-            conversationID: conversation.id,
-            parentSegmentID: conversation.rootSegmentID,
-            parentTailIndex: -1,
-            newMessages: messages,
-            requestID: requestID,
-            sessionID: sessionID,
-            previousResponseID: previousResponseID,
-            now: now
-        )
-    }
-
-    private mutating func seedConversationRoot(
-        conversationID: UUID,
-        messages: [NormalizedMessage],
-        requestID: UUID,
-        sessionID: String,
-        previousResponseID: String?,
-        now: Date
-    ) -> ExtendResult {
-        let rootID = UUID()
-        let segment = Segment(
-            id: rootID,
-            conversationID: conversationID,
-            parentSegmentID: nil,
-            parentSplitIndex: -1,
-            messages: messages,
-            nodes: [],
-            lastActivityAt: now,
-            messagesJSONCache: nil
-        )
-        segments[rootID] = segment
-        return appendNodeToSegment(
-            segmentID: rootID,
-            tailIndex: max(-1, messages.count - 1),
-            requestID: requestID,
-            sessionID: sessionID,
-            previousResponseID: previousResponseID,
-            now: now
-        )
-    }
-
-    /// Extend an existing segment in place, or create a new child segment for a branch.
-    private mutating func extendOrBranch(
-        conversationID: UUID,
-        parentSegmentID: UUID,
-        parentTailIndex: Int,
-        newMessages: [NormalizedMessage],
-        requestID: UUID,
-        sessionID: String,
-        previousResponseID: String?,
-        now: Date
-    ) -> ExtendResult {
-        guard var parent = segments[parentSegmentID] else {
-            // Parent vanished — fabricate a new root under conversation.
-            return seedConversationRoot(
-                conversationID: conversationID,
-                messages: newMessages,
-                requestID: requestID,
-                sessionID: sessionID,
-                previousResponseID: previousResponseID,
-                now: now
-            )
-        }
-
-        let extensionStart = parentTailIndex + 1
-        let canExtendInPlace =
-            extensionStart == parent.messages.count &&
-            !hasChildSegment(ofParent: parentSegmentID, atOrAfter: extensionStart) &&
-            !hasNode(inSegment: parent, afterIndex: parentTailIndex)
-
-        if canExtendInPlace {
-            // Extend the segment's messages (if any) and append a new node at the new tail.
-            parent.messages.append(contentsOf: newMessages)
-            if !newMessages.isEmpty {
-                parent.messagesJSONCache = nil
-            }
-            parent.lastActivityAt = now
-            segments[parentSegmentID] = parent
-            let newTailIndex = parent.messages.count - 1
-            let finalTailIndex = newMessages.isEmpty ? parentTailIndex : newTailIndex
-            let node = Node(
-                requestID: requestID,
-                tailIndex: finalTailIndex,
-                responseID: nil,
-                previousResponseID: previousResponseID,
-                done: false,
-                createdAt: now,
-                doneAt: nil,
-                tokenUsage: nil,
-                sessionID: sessionID
-            )
-            parent.nodes.append(node)
-            parent.lastActivityAt = now
-            segments[parentSegmentID] = parent
-            nodeLocations[requestID] = (parentSegmentID, parent.nodes.count - 1)
-            return ExtendResult(
-                segmentID: parentSegmentID,
-                tailIndex: finalTailIndex,
-                createdSegment: false,
-                appendedMessages: newMessages
-            )
-        }
-
-        // Branch: create a new child segment.
-        let childID = UUID()
-        let childTailIndex = max(-1, newMessages.count - 1)
-        let childNode = Node(
-            requestID: requestID,
-            tailIndex: childTailIndex,
-            responseID: nil,
-            previousResponseID: previousResponseID,
-            done: false,
-            createdAt: now,
-            doneAt: nil,
-            tokenUsage: nil,
-            sessionID: sessionID
-        )
-        let child = Segment(
-            id: childID,
-            conversationID: conversationID,
-            parentSegmentID: parentSegmentID,
-            parentSplitIndex: parentTailIndex,
-            messages: newMessages,
-            nodes: [childNode],
-            lastActivityAt: now,
-            messagesJSONCache: nil
-        )
-        segments[childID] = child
-        nodeLocations[requestID] = (childID, 0)
-        return ExtendResult(
-            segmentID: childID,
-            tailIndex: childNode.tailIndex,
-            createdSegment: true,
-            appendedMessages: newMessages
-        )
-    }
-
-    private mutating func appendNodeToSegment(
-        segmentID: UUID,
-        tailIndex: Int,
-        requestID: UUID,
-        sessionID: String,
-        previousResponseID: String?,
-        now: Date
-    ) -> ExtendResult {
-        guard var segment = segments[segmentID] else {
-            return ExtendResult(segmentID: segmentID, tailIndex: tailIndex, createdSegment: false, appendedMessages: [])
-        }
-        let node = Node(
-            requestID: requestID,
-            tailIndex: tailIndex,
-            responseID: nil,
-            previousResponseID: previousResponseID,
-            done: false,
-            createdAt: now,
-            doneAt: nil,
-            tokenUsage: nil,
-            sessionID: sessionID
-        )
-        segment.nodes.append(node)
-        segment.lastActivityAt = now
-        segments[segmentID] = segment
-        nodeLocations[requestID] = (segmentID, segment.nodes.count - 1)
-        return ExtendResult(segmentID: segmentID, tailIndex: tailIndex, createdSegment: false, appendedMessages: [])
-    }
-
-    private func hasChildSegment(ofParent parentID: UUID, atOrAfter index: Int) -> Bool {
-        for segment in segments.values
-        where segment.parentSegmentID == parentID && segment.parentSplitIndex >= index {
-            return true
-        }
-        return false
-    }
-
-    private func hasNode(inSegment segment: Segment, afterIndex index: Int) -> Bool {
-        segment.nodes.contains(where: { $0.tailIndex > index })
-    }
-
-    /// Ancestor search: walk the tree for the done-true node whose `tailIndex` corresponds
-    /// to the longest prefix of `messages` matching a path through the tree.
-    private func findClosestDoneAncestor(
-        conversationID: UUID,
-        messages: [NormalizedMessage]
-    ) -> (segmentID: UUID, tailIndex: Int)? {
-        guard let rootSegmentID = conversationRootSegmentID(for: conversationID),
-              let root = segments[rootSegmentID] else {
-            return nil
-        }
-        return bestAncestor(
-            inSegment: root,
-            prefixLength: 0,
-            messages: messages
-        )
-    }
-
-    /// Recursive descent: given the current segment and how many messages of the incoming
-    /// request have already been matched in ancestor segments, find the deepest done-true
-    /// node whose tail aligns with a prefix of the incoming messages.
-    private func bestAncestor(
-        inSegment segment: Segment,
-        prefixLength: Int,
-        messages: [NormalizedMessage]
-    ) -> (segmentID: UUID, tailIndex: Int)? {
-        // How far can incoming messages match this segment's messages starting at index 0?
-        var matchLen = 0
-        while matchLen < segment.messages.count
-              && prefixLength + matchLen < messages.count
-              && segment.messages[matchLen].contentHash == messages[prefixLength + matchLen].contentHash {
-            matchLen += 1
-        }
-
-        // Find the deepest done-true node in this segment that lies within the matched prefix
-        // AND whose next message is still to come in `messages` (i.e., tailIndex < messages.count-1-prefixLength).
-        var best: (segmentID: UUID, tailIndex: Int)?
-        for node in segment.nodes where node.done {
-            // The node's tail must be within the match AND the incoming request must have
-            // at least one more message beyond it (strict prefix).
-            if node.tailIndex < matchLen && prefixLength + node.tailIndex + 1 <= messages.count {
-                // Deeper = better; matchLen inside same segment strictly increases with tailIndex.
-                best = (segment.id, node.tailIndex)
-            }
-        }
-
-        // Recurse into child segments whose split point is within the matched prefix.
-        for child in segments.values
-        where child.parentSegmentID == segment.id && child.parentSplitIndex < matchLen {
-            // A child segment that branches at index `parentSplitIndex` continues with the
-            // incoming messages starting at `prefixLength + parentSplitIndex + 1`.
-            let childPrefixLength = prefixLength + child.parentSplitIndex + 1
-            if childPrefixLength > messages.count { continue }
-            if let candidate = bestAncestor(
-                inSegment: child,
-                prefixLength: childPrefixLength,
-                messages: messages
-            ) {
-                if let current = best {
-                    // Prefer the candidate whose absolute match depth is greater.
-                    let candidateDepth = depthOf(segmentID: candidate.segmentID, tailIndex: candidate.tailIndex)
-                    let currentDepth = depthOf(segmentID: current.segmentID, tailIndex: current.tailIndex)
-                    if candidateDepth > currentDepth {
-                        best = candidate
-                    }
-                } else {
-                    best = candidate
-                }
-            }
-        }
-
-        return best
-    }
-
-    /// Absolute depth (messages-from-root) of a given node position.
-    private func depthOf(segmentID: UUID, tailIndex: Int) -> Int {
-        guard let segment = segments[segmentID] else { return 0 }
-        var depth = tailIndex + 1
-        var cursorParentID = segment.parentSegmentID
-        var cursorSplitIndex = segment.parentSplitIndex
-        while let parentID = cursorParentID, let parent = segments[parentID] {
-            depth += cursorSplitIndex + 1
-            cursorParentID = parent.parentSegmentID
-            cursorSplitIndex = parent.parentSplitIndex
-        }
-        return depth
-    }
 }
 
 // MARK: - Hash helpers
 
 enum LineageHash {
-    /// Stable SHA256 hex of a string. Used as the fingerprint hash inside `ConversationKey`.
+    /// Stable SHA-256 hex of a string. Used as the fingerprint hash inside
+    /// `ConversationKey` and as the per-message `contentHash`.
     static func sha256Hex(_ input: String) -> String {
         let data = Data(input.utf8)
         let digest = SHA256.hash(data: data)
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Stable SHA256 hex of raw bytes.
     static func sha256Hex(_ input: Data) -> String {
         let digest = SHA256.hash(data: input)
         return digest.map { String(format: "%02x", $0) }.joined()

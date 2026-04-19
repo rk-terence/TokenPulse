@@ -36,7 +36,7 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
         ProxyRequestBody.lineageFingerprint(from: body, flavor: flavor)
     }
 
-    func normalizedLineageMessages(from body: Data) -> [LineageTree.NormalizedMessage] {
+    func normalizedLineageMessages(from body: Data) -> [ContentTree.NormalizedMessage] {
         ProxyRequestBody.normalizedLineageMessages(from: body, flavor: flavor)
     }
 

@@ -12,10 +12,12 @@ actor ProxyEventLogger {
     private static let statusSnapshotThrottleInterval: TimeInterval = 1
     /// Bump when adding columns/tables that require an incompatible rewrite.
     /// On mismatch the whole database is dropped (24h retention means no meaningful loss).
-    /// v4: proxy_request_content.request_json renamed to request_extras_json; body
-    /// now stores only per-request extras + refs to conversation/segment, so
-    /// system/tools/tool_choice/thinking/messages are deduplicated across requests.
-    private static let currentSchemaVersion: Int = 4
+    /// v5: content-tree refactor. `proxy_lineage_segments` removed; replaced by
+    /// `proxy_nodes` where each node stores only its delta against its parent.
+    /// `proxy_requests.segment_id`/`tail_index` → `node_id`. Body refs changed
+    /// to `{conversation_id, node_id}`. `proxy_conversations` gained
+    /// `root_node_id`.
+    private static let currentSchemaVersion: Int = 5
 
     struct LoggedRequest: Sendable {
         let method: String
@@ -26,34 +28,35 @@ actor ProxyEventLogger {
         let streaming: Bool
     }
 
-    /// Lineage-tree context associated with a request. Supplied by callers so we can
-    /// write the conversation/segment/node pointer into `proxy_requests` and substitute
-    /// the heavy `messages` field in the body with a compact reference.
+    /// Content-tree context associated with a request. Supplied by callers so
+    /// we can write `conversation_id` / `node_id` into `proxy_requests` and
+    /// replace the heavy `messages` / `input` field in the body with a compact
+    /// reference. Nodes are immutable after creation, so mirror writes are
+    /// append-only: insert the root (for brand-new conversations) and the
+    /// target node (always) — everything in between was already persisted
+    /// when it was the target of its own creating request.
     struct LineageContext: Sendable {
         let conversationID: UUID
-        let segmentID: UUID
-        let tailIndex: Int
+        let nodeID: UUID
+        let rootNodeID: UUID
         let previousResponseID: String?
         let fingerprintHash: String
-        /// Full fingerprint serialized so the conversations table can rematerialize
-        /// model / system / tools / thinking without re-parsing every request body.
+        /// Full fingerprint serialized so the conversations table can
+        /// rematerialize model / system / tools / thinking without re-parsing
+        /// every request body.
         let fingerprint: LineageFingerprint
         let flavor: ProxyAPIFlavor
-        /// Ordered list of segments (root → target) used to rematerialize the messages
-        /// array on demand; each entry carries its local messages array (post-split-point).
-        let segmentChain: [SegmentRow]
+        /// Root node row — inserted on conversation creation and ignored on
+        /// every subsequent mirror pass (INSERT OR IGNORE).
+        let rootNodeRow: NodeRow
+        /// Target node row — inserted on first mirror of that node and ignored
+        /// thereafter (same node keeps the same immutable delta).
+        let targetNodeRow: NodeRow
 
-        struct SegmentRow: Sendable {
+        struct NodeRow: Sendable {
             let id: UUID
-            let parentSegmentID: UUID?
-            let parentSplitIndex: Int
-            let messagesJSON: String
-            /// True only for the single segment the request's tail lands in.
-            /// Non-target rows only touch `last_activity` on upsert; the target
-            /// rewrites `messages_json`. Segments never re-parent and only the
-            /// target could have grown since the last mirror pass, so this
-            /// avoids rewriting identical blobs for ancestors on every request.
-            let isTarget: Bool
+            let parentNodeID: UUID?
+            let deltaMessagesJSON: String
         }
     }
 
@@ -191,7 +194,7 @@ actor ProxyEventLogger {
                         input_tokens = ?, output_tokens = ?,
                         cache_read_tokens = ?, cache_creation_tokens = ?,
                         errored = ?,
-                        conversation_id = ?, segment_id = ?, tail_index = ?,
+                        conversation_id = ?, node_id = ?,
                         response_id = ?, previous_response_id = ?, done = ?
                     WHERE id = ?
                     """
@@ -211,12 +214,11 @@ actor ProxyEventLogger {
                 bind(tokenUsage.cacheCreationInputTokens, to: 9, in: statement)
                 bind(errored, to: 10, in: statement)
                 bind(lineage?.conversationID.uuidString, to: 11, in: statement)
-                bind(lineage?.segmentID.uuidString, to: 12, in: statement)
-                bind(lineage?.tailIndex, to: 13, in: statement)
-                bind(responseID, to: 14, in: statement)
-                bind(lineage?.previousResponseID, to: 15, in: statement)
-                bind(!errored, to: 16, in: statement)
-                bind(requestID, to: 17, in: statement)
+                bind(lineage?.nodeID.uuidString, to: 12, in: statement)
+                bind(responseID, to: 13, in: statement)
+                bind(lineage?.previousResponseID, to: 14, in: statement)
+                bind(!errored, to: 15, in: statement)
+                bind(requestID, to: 16, in: statement)
                 guard sqlite3_step(statement) == SQLITE_DONE else {
                     throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
                 }
@@ -236,9 +238,9 @@ actor ProxyEventLogger {
                         input_tokens, output_tokens,
                         cache_read_tokens, cache_creation_tokens,
                         errored,
-                        conversation_id, segment_id, tail_index,
+                        conversation_id, node_id,
                         response_id, previous_response_id, done
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """
                 var statement: OpaquePointer?
                 guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -263,11 +265,10 @@ actor ProxyEventLogger {
                 bind(tokenUsage.cacheCreationInputTokens, to: 15, in: statement)
                 bind(errored, to: 16, in: statement)
                 bind(lineage?.conversationID.uuidString, to: 17, in: statement)
-                bind(lineage?.segmentID.uuidString, to: 18, in: statement)
-                bind(lineage?.tailIndex, to: 19, in: statement)
-                bind(responseID, to: 20, in: statement)
-                bind(lineage?.previousResponseID, to: 21, in: statement)
-                bind(!errored, to: 22, in: statement)
+                bind(lineage?.nodeID.uuidString, to: 18, in: statement)
+                bind(responseID, to: 19, in: statement)
+                bind(lineage?.previousResponseID, to: 20, in: statement)
+                bind(!errored, to: 21, in: statement)
                 guard sqlite3_step(statement) == SQLITE_DONE else {
                     throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
                 }
@@ -287,10 +288,10 @@ actor ProxyEventLogger {
 
     private func mirrorLineage(_ context: LineageContext, in database: OpaquePointer) throws {
         let now = isoFormatter.string(from: Date())
-        // Serialize the full fingerprint so every row in this table captures the
-        // cache-identity payload (model + system + tools + tool_choice + thinking).
-        // That way keep-alive or diagnostics can reconstruct a valid replay body
-        // without needing the original request.
+        // Serialize the full fingerprint so every conversation row captures
+        // the cache-identity payload (model + system + tools + tool_choice +
+        // thinking). Keep-alive and diagnostics can rebuild a valid replay
+        // body without needing the original request.
         let fingerprintJSON: String
         if let data = try? JSONEncoder().encode(context.fingerprint),
            let text = String(data: data, encoding: .utf8) {
@@ -298,11 +299,13 @@ actor ProxyEventLogger {
         } else {
             fingerprintJSON = "{}"
         }
-        // Upsert conversation.
+        // Upsert conversation. `root_node_id` is set once on first insert and
+        // never changes; the upsert path refreshes `last_seen` only.
         do {
             let sql = """
-                INSERT INTO proxy_conversations (id, flavor, fingerprint_hash, fingerprint_json, first_seen, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO proxy_conversations
+                    (id, flavor, fingerprint_hash, fingerprint_json, root_node_id, first_seen, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     fingerprint_json = excluded.fingerprint_json,
                     last_seen = excluded.last_seen
@@ -316,70 +319,80 @@ actor ProxyEventLogger {
             bind(context.flavor.rawValue, to: 2, in: statement)
             bind(context.fingerprintHash, to: 3, in: statement)
             bind(fingerprintJSON, to: 4, in: statement)
-            bind(now, to: 5, in: statement)
+            bind(context.rootNodeID.uuidString, to: 5, in: statement)
             bind(now, to: 6, in: statement)
+            bind(now, to: 7, in: statement)
             guard sqlite3_step(statement) == SQLITE_DONE else {
                 throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
             }
         }
-        // Upsert each segment along the chain. The target segment (the one the
-        // request's tail lands in) is the only segment whose messages could have
-        // grown since the last mirror pass — invariants guarantee ancestors are
-        // frozen once a descendant branches off them. So we rewrite
-        // `messages_json` only for the target and refresh `last_activity` on
-        // ancestors. Ancestor rows that don't yet exist (first-ever write for
-        // this chain) still INSERT with their current cached messages_json.
-        for segment in context.segmentChain {
-            let sql: String
-            if segment.isTarget {
-                sql = """
-                    INSERT INTO proxy_lineage_segments
-                        (id, conversation_id, parent_segment_id, parent_split_index, messages_json, last_activity)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        messages_json = excluded.messages_json,
-                        last_activity = excluded.last_activity
-                    """
-            } else {
-                sql = """
-                    INSERT INTO proxy_lineage_segments
-                        (id, conversation_id, parent_segment_id, parent_split_index, messages_json, last_activity)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        last_activity = excluded.last_activity
-                    """
-            }
+        // Insert root and target nodes. Nodes are immutable after creation
+        // (deltas never change) so INSERT OR IGNORE is the right conflict
+        // policy — the first request in a conversation writes the row; later
+        // requests attaching to the same node skip. Each request thus pays
+        // at most two INSERTs, regardless of conversation depth.
+        try insertNodeRow(context.rootNodeRow, conversationID: context.conversationID, now: now, in: database)
+        if context.targetNodeRow.id != context.rootNodeRow.id {
+            try insertNodeRow(context.targetNodeRow, conversationID: context.conversationID, now: now, in: database)
+        }
+        // Refresh the target node's `last_activity` so pruning by last-seen
+        // works even for long-lived leaves.
+        do {
+            let sql = "UPDATE proxy_nodes SET last_activity = ? WHERE id = ?;"
             var statement: OpaquePointer?
             guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
                 throw LoggerStorageError.prepareFailed(message: errorMessage(from: database))
             }
             defer { sqlite3_finalize(statement) }
-            bind(segment.id.uuidString, to: 1, in: statement)
-            bind(context.conversationID.uuidString, to: 2, in: statement)
-            bind(segment.parentSegmentID?.uuidString, to: 3, in: statement)
-            bind(segment.parentSplitIndex, to: 4, in: statement)
-            bind(segment.messagesJSON, to: 5, in: statement)
-            bind(now, to: 6, in: statement)
+            bind(now, to: 1, in: statement)
+            bind(context.nodeID.uuidString, to: 2, in: statement)
             guard sqlite3_step(statement) == SQLITE_DONE else {
                 throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
             }
         }
     }
 
-    /// Remove lineage rows whose tree-side nodes were just pruned. Segments and
-    /// conversations cascade via ON DELETE CASCADE; request rows retain their
-    /// IDs but have `segment_id`/`conversation_id` NULLed by ON DELETE SET NULL.
+    private func insertNodeRow(
+        _ row: LineageContext.NodeRow,
+        conversationID: UUID,
+        now: String,
+        in database: OpaquePointer
+    ) throws {
+        let sql = """
+            INSERT OR IGNORE INTO proxy_nodes
+                (id, conversation_id, parent_node_id, delta_messages_json, last_activity)
+            VALUES (?, ?, ?, ?, ?)
+            """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw LoggerStorageError.prepareFailed(message: errorMessage(from: database))
+        }
+        defer { sqlite3_finalize(statement) }
+        bind(row.id.uuidString, to: 1, in: statement)
+        bind(conversationID.uuidString, to: 2, in: statement)
+        bind(row.parentNodeID?.uuidString, to: 3, in: statement)
+        bind(row.deltaMessagesJSON, to: 4, in: statement)
+        bind(now, to: 5, in: statement)
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
+        }
+    }
+
+    /// Remove lineage rows whose tree-side counterparts were just pruned.
+    /// Nodes and conversations cascade via `ON DELETE CASCADE`; request rows
+    /// retain their IDs but have `node_id`/`conversation_id` NULLed by
+    /// `ON DELETE SET NULL`.
     func pruneLineageMirror(
         conversationIDs: Set<UUID>,
-        segmentIDs: Set<UUID>
+        nodeIDs: Set<UUID>
     ) {
         guard enabled else { return }
-        guard !conversationIDs.isEmpty || !segmentIDs.isEmpty else { return }
+        guard !conversationIDs.isEmpty || !nodeIDs.isEmpty else { return }
         do {
             let database = try openDatabaseIfNeeded()
-            for id in segmentIDs {
+            for id in nodeIDs {
                 try executeDelete(
-                    "DELETE FROM proxy_lineage_segments WHERE id = ?;",
+                    "DELETE FROM proxy_nodes WHERE id = ?;",
                     value: id.uuidString,
                     in: database
                 )
@@ -416,11 +429,20 @@ actor ProxyEventLogger {
         response: LoggedResponse?,
         durationMs: Int,
         error: String,
-        lineage: LineageContext? = nil
+        lineage: LineageContext? = nil,
+        responseID: String? = nil
     ) {
         guard enabled else { return }
         do {
             let database = try openDatabaseIfNeeded()
+            // Failed requests that carry a `lineage` context must still have
+            // their conversation / node rows mirrored, otherwise the
+            // `body_refs` we stash in `proxy_request_content` point at rows
+            // that were never written — readers would have no way to
+            // reconstruct the original messages for a failure diagnosis.
+            if let lineage {
+                try mirrorLineage(lineage, in: database)
+            }
             let upstreamRequestID = response.flatMap { extractUpstreamRequestID(from: $0.headers) }
             let statusCode = response?.statusCode
 
@@ -429,7 +451,9 @@ actor ProxyEventLogger {
                 let sql = """
                     UPDATE proxy_requests SET
                         session = ?, completed_at = ?, status_code = ?, duration_ms = ?,
-                        upstream_request_id = ?, error = ?, errored = 1
+                        upstream_request_id = ?, error = ?, errored = 1,
+                        conversation_id = ?, node_id = ?,
+                        response_id = ?, previous_response_id = ?
                     WHERE id = ?
                     """
                 var statement: OpaquePointer?
@@ -443,7 +467,11 @@ actor ProxyEventLogger {
                 bind(durationMs, to: 4, in: statement)
                 bind(upstreamRequestID, to: 5, in: statement)
                 bind(error, to: 6, in: statement)
-                bind(requestID, to: 7, in: statement)
+                bind(lineage?.conversationID.uuidString, to: 7, in: statement)
+                bind(lineage?.nodeID.uuidString, to: 8, in: statement)
+                bind(responseID, to: 9, in: statement)
+                bind(lineage?.previousResponseID, to: 10, in: statement)
+                bind(requestID, to: 11, in: statement)
                 guard sqlite3_step(statement) == SQLITE_DONE else {
                     throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
                 }
@@ -459,8 +487,10 @@ actor ProxyEventLogger {
                     INSERT INTO proxy_requests (
                         session, model, method, path, upstream_url, streaming,
                         started_at, completed_at, status_code, duration_ms,
-                        upstream_request_id, error, errored
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        upstream_request_id, error, errored,
+                        conversation_id, node_id,
+                        response_id, previous_response_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
                     """
                 var statement: OpaquePointer?
                 guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -480,6 +510,10 @@ actor ProxyEventLogger {
                 bind(durationMs, to: 10, in: statement)
                 bind(upstreamRequestID, to: 11, in: statement)
                 bind(error, to: 12, in: statement)
+                bind(lineage?.conversationID.uuidString, to: 13, in: statement)
+                bind(lineage?.nodeID.uuidString, to: 14, in: statement)
+                bind(responseID, to: 15, in: statement)
+                bind(lineage?.previousResponseID, to: 16, in: statement)
                 guard sqlite3_step(statement) == SQLITE_DONE else {
                     throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
                 }
@@ -592,7 +626,7 @@ actor ProxyEventLogger {
                 let dropTables = [
                     "proxy_event_content", "proxy_events", "proxy_keepalives",
                     "proxy_request_content", "proxy_requests",
-                    "proxy_lineage_segments", "proxy_conversations",
+                    "proxy_lineage_segments", "proxy_nodes", "proxy_conversations",
                     "proxy_lifecycle"
                 ]
                 for table in dropTables {
@@ -612,6 +646,7 @@ actor ProxyEventLogger {
                     flavor TEXT NOT NULL,
                     fingerprint_hash TEXT NOT NULL,
                     fingerprint_json TEXT NOT NULL,
+                    root_node_id TEXT NOT NULL,
                     first_seen TEXT NOT NULL,
                     last_seen TEXT NOT NULL
                 );
@@ -621,12 +656,11 @@ actor ProxyEventLogger {
 
             try execute(
                 """
-                CREATE TABLE IF NOT EXISTS proxy_lineage_segments (
+                CREATE TABLE IF NOT EXISTS proxy_nodes (
                     id TEXT PRIMARY KEY,
                     conversation_id TEXT NOT NULL REFERENCES proxy_conversations(id) ON DELETE CASCADE,
-                    parent_segment_id TEXT REFERENCES proxy_lineage_segments(id) ON DELETE CASCADE,
-                    parent_split_index INTEGER NOT NULL,
-                    messages_json TEXT NOT NULL,
+                    parent_node_id TEXT REFERENCES proxy_nodes(id) ON DELETE CASCADE,
+                    delta_messages_json TEXT NOT NULL,
                     last_activity TEXT NOT NULL
                 );
                 """,
@@ -655,8 +689,7 @@ actor ProxyEventLogger {
                     error TEXT,
                     errored INTEGER,
                     conversation_id TEXT REFERENCES proxy_conversations(id) ON DELETE SET NULL,
-                    segment_id TEXT REFERENCES proxy_lineage_segments(id) ON DELETE SET NULL,
-                    tail_index INTEGER,
+                    node_id TEXT REFERENCES proxy_nodes(id) ON DELETE SET NULL,
                     response_id TEXT,
                     previous_response_id TEXT,
                     done INTEGER NOT NULL DEFAULT 0
@@ -700,13 +733,13 @@ actor ProxyEventLogger {
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_requests_status ON proxy_requests(status_code, started_at);", in: database)
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_requests_upstream_rid ON proxy_requests(upstream_request_id);", in: database)
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_requests_conversation ON proxy_requests(conversation_id);", in: database)
-            try execute("CREATE INDEX IF NOT EXISTS idx_proxy_requests_segment ON proxy_requests(segment_id);", in: database)
+            try execute("CREATE INDEX IF NOT EXISTS idx_proxy_requests_node ON proxy_requests(node_id);", in: database)
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_requests_response ON proxy_requests(response_id);", in: database)
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_lifecycle_ts ON proxy_lifecycle(ts);", in: database)
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_request_content_upstream_rid ON proxy_request_content(upstream_request_id);", in: database)
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_conversations_fingerprint ON proxy_conversations(fingerprint_hash);", in: database)
-            try execute("CREATE INDEX IF NOT EXISTS idx_proxy_segments_conversation ON proxy_lineage_segments(conversation_id);", in: database)
-            try execute("CREATE INDEX IF NOT EXISTS idx_proxy_segments_parent ON proxy_lineage_segments(parent_segment_id);", in: database)
+            try execute("CREATE INDEX IF NOT EXISTS idx_proxy_nodes_conversation ON proxy_nodes(conversation_id);", in: database)
+            try execute("CREATE INDEX IF NOT EXISTS idx_proxy_nodes_parent ON proxy_nodes(parent_node_id);", in: database)
         } catch {
             sqlite3_close(database)
             throw error
@@ -743,9 +776,9 @@ actor ProxyEventLogger {
         // while the app is running, but after a restart the tree starts empty and
         // can no longer emit pruning IDs for rows left over from prior runs. Sweep
         // by `last_seen`/`last_activity` here so the mirror tables bound their disk
-        // use across restarts. `proxy_requests.conversation_id`/`segment_id` use
-        // ON DELETE SET NULL so historical request rows survive; segments CASCADE
-        // through `conversations` → `parent_segment_id` so a single delete on the
+        // use across restarts. `proxy_requests.conversation_id`/`node_id` use
+        // ON DELETE SET NULL so historical request rows survive; nodes CASCADE
+        // through `conversations` → `parent_node_id` so a single delete on the
         // conversations table is enough to evict the whole subtree.
         try executePrune("DELETE FROM proxy_conversations WHERE last_seen < ?;", cutoff: cutoff, in: database)
         try execute("PRAGMA wal_checkpoint(PASSIVE);", in: database)
@@ -854,20 +887,23 @@ actor ProxyEventLogger {
     }
 
     /// When `lineage` is non-nil and the body is JSON, strip the cache-identity
-    /// fields (already stored once on `proxy_conversations.fingerprint_json`) and
-    /// the messages/input array (already stored on `proxy_lineage_segments.messages_json`),
-    /// keeping only per-request extras plus refs back to the conversation and segment.
+    /// fields (already stored once on `proxy_conversations.fingerprint_json`)
+    /// and the messages/input array (already stored as per-node deltas in
+    /// `proxy_nodes.delta_messages_json`), keeping only per-request extras
+    /// plus refs back to the conversation and node.
     ///
     /// Resulting shape (JSON-encoded into `body.text`):
     ///   {
     ///     "body_extras": { max_tokens, stream, temperature, stop_sequences, metadata, ... },
     ///     "body_refs":   {
-    ///       "fingerprint": "<conversation uuid>",
-    ///       "lineage":     { "segment_id": "<segment uuid>", "tail_index": N }
+    ///       "fingerprint":     "<conversation uuid>",
+    ///       "content":         { "node_id": "<node uuid>" }
     ///     }
     ///   }
-    /// A reader rebuilds the original request body by expanding `fingerprint` to the
-    /// conversation's `fingerprint_json` fields and `lineage` to a walked messages array.
+    /// A reader rebuilds the original request body by expanding `fingerprint`
+    /// to the conversation's `fingerprint_json` fields and `content.node_id`
+    /// to a messages array reconstructed by walking `parent_node_id` from the
+    /// node up to the root and concatenating each node's delta.
     private func serializeBodyContent(
         body: Data,
         byteCount: Int? = nil,
@@ -899,9 +935,8 @@ actor ProxyEventLogger {
 
             let refs: [String: Any] = [
                 "fingerprint": lineage.conversationID.uuidString,
-                "lineage": [
-                    "segment_id": lineage.segmentID.uuidString,
-                    "tail_index": lineage.tailIndex,
+                "content": [
+                    "node_id": lineage.nodeID.uuidString,
                 ],
             ]
             let compact: [String: Any] = [

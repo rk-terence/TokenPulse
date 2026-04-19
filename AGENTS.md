@@ -48,6 +48,6 @@ ditto "$(xcodebuild -scheme TokenPulse -configuration Release -showBuildSettings
 - File I/O for config and usage export must use `.atomic` writes.
 - Proxy must listen on `127.0.0.1` only, never all interfaces.
 - Keep-alive is not currently implemented; the UI and wire protocol reserve no space for it. Deferred as future work.
-- Proxy lineage tracking is universal across supported providers (Anthropic Messages, OpenAI Responses). Every 2xx response attaches its request to an in-memory `LineageTree`; nodes are never re-parented, `done == false` nodes are always leaves, and inactive leaves prune after 24 hours.
+- Proxy content-tree tracking is universal across supported providers (Anthropic Messages, OpenAI Responses). Every request with a parseable body attaches to an in-memory `ContentTree` before upstream is called; the tree's granularity is content (per-node delta messages) rather than requests, a node may own multiple requests, `done`/`active` are attributes of requests, node deltas are immutable after creation, and terminal requests prune after 24 hours.
 - Event logging uses SQLite with WAL mode and 24-hour retention. A single `saveProxyEventLog` toggle controls all logging (metadata + deduplicated payloads); there is no separate payload-capture opt-in.
 - Proxy status snapshots are written whenever `saveProxyEventLog` is true and should stay throttled.

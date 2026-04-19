@@ -1,7 +1,9 @@
 import Foundation
 
-/// Forwards incoming proxy requests to the configured upstream API and streams
-/// responses back to the local client. Feeds the lineage tree on every 2xx.
+/// Forwards incoming proxy requests to the configured upstream API and
+/// streams responses back to the local client. Attaches every
+/// fully-parsed request to the content tree before calling upstream;
+/// finalization marks the request as succeeded or errored on completion.
 final class ProxyForwarder: Sendable {
     private static let maxLoggedStreamingResponseBytes = 4 * 1024 * 1024
     /// Size of the tail ring-buffer used for terminal-signal parsing.
@@ -135,6 +137,21 @@ final class ProxyForwarder: Sendable {
         )
         await sessionStore.recordBytesSent(request.body.count)
 
+        // Attach to the content tree as soon as the request body has been
+        // parsed — every request that enters the proxy in its full form is
+        // represented in the tree, regardless of whether upstream later
+        // accepts or errors. The request starts in an in-flight state and
+        // transitions to succeeded / errored via `finishTrackedRequest`.
+        if let fingerprint {
+            await sessionStore.attachToTree(
+                requestID: requestID,
+                sessionID: sessionID,
+                fingerprint: fingerprint,
+                messages: normalizedMessages,
+                previousResponseID: previousResponseID
+            )
+        }
+
         if wantsStreaming {
             _ = await forwardStreaming(
                 urlRequest: urlRequest,
@@ -186,7 +203,7 @@ final class ProxyForwarder: Sendable {
         sessionID: String,
         model: String?,
         fingerprint: LineageFingerprint?,
-        normalizedMessages: [LineageTree.NormalizedMessage],
+        normalizedMessages: [ContentTree.NormalizedMessage],
         previousResponseID: String?,
         requestLog: ProxyEventLogger.LoggedRequest,
         requestStartedAt: Date,
@@ -248,19 +265,6 @@ final class ProxyForwarder: Sendable {
                 writer.writeHead(status: httpResponse.statusCode, headers: responseHeaders)
                 await sessionStore.markRequestReceiving(id: requestID)
 
-                // On 2xx, attach this request to the lineage tree. We do it here
-                // (as headers arrive) per the design: the tree state reflects the
-                // fact that upstream accepted the request, independent of stream completion.
-                if (200..<300).contains(httpResponse.statusCode), let fingerprint {
-                    await sessionStore.attachToTree(
-                        requestID: requestID,
-                        sessionID: sessionID,
-                        fingerprint: fingerprint,
-                        messages: normalizedMessages,
-                        previousResponseID: previousResponseID
-                    )
-                }
-
                 for try await chunk in chunks {
                     try Task.checkCancellation()
                     await sessionStore.markFirstDataReceived(id: requestID)
@@ -319,13 +323,12 @@ final class ProxyForwarder: Sendable {
             let isUpstreamError = upstreamStatusCode >= 400
             let isIncomplete = !isUpstreamError && !apiHandler.isResponseComplete(tokenUsage)
             let errored = isUpstreamError || isIncomplete
-            if !errored {
-                await sessionStore.markNodeDone(
-                    requestID: requestID,
-                    tokenUsage: tokenUsage,
-                    responseID: responseID
-                )
-            }
+            await sessionStore.finishTrackedRequest(
+                requestID: requestID,
+                succeeded: !errored,
+                tokenUsage: tokenUsage,
+                responseID: responseID
+            )
             let lineageContext = await sessionStore.lineageContext(for: requestID)
             await sessionStore.markRequestDone(id: requestID, errored: errored, tokenUsage: tokenUsage, estimatedCost: requestCost)
             let errorString: String?
@@ -343,7 +346,8 @@ final class ProxyForwarder: Sendable {
                     response: responseLog,
                     durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
                     error: errorString,
-                    lineage: lineageContext
+                    lineage: lineageContext,
+                    responseID: responseID
                 )
             } else {
                 await eventLogger?.logRequestCompleted(
@@ -363,6 +367,13 @@ final class ProxyForwarder: Sendable {
             return errored
 
         } catch is CancellationError {
+            await sessionStore.finishTrackedRequest(
+                requestID: requestID,
+                succeeded: false,
+                tokenUsage: nil,
+                responseID: nil
+            )
+            let lineageContext = await sessionStore.lineageContext(for: requestID)
             await sessionStore.markRequestDone(id: requestID, errored: true, tokenUsage: nil, estimatedCost: nil)
             ProxyLogger.log("Streaming request cancelled (client disconnect)")
             await eventLogger?.logRequestFailed(
@@ -372,10 +383,18 @@ final class ProxyForwarder: Sendable {
                 request: requestLog,
                 response: nil,
                 durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
-                error: "client disconnected"
+                error: "client disconnected",
+                lineage: lineageContext
             )
             return true
         } catch {
+            await sessionStore.finishTrackedRequest(
+                requestID: requestID,
+                succeeded: false,
+                tokenUsage: nil,
+                responseID: nil
+            )
+            let lineageContext = await sessionStore.lineageContext(for: requestID)
             await sessionStore.markRequestDone(id: requestID, errored: true, tokenUsage: nil, estimatedCost: nil)
             await metrics.recordFailed()
             let response = proxyErrorResponse(
@@ -389,7 +408,8 @@ final class ProxyForwarder: Sendable {
                 request: requestLog,
                 response: response.loggedResponse,
                 durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
-                error: error.localizedDescription
+                error: error.localizedDescription,
+                lineage: lineageContext
             )
             writeErrorToClient(writer: writer, response: response)
             return true
@@ -407,7 +427,7 @@ final class ProxyForwarder: Sendable {
         sessionID: String,
         model: String?,
         fingerprint: LineageFingerprint?,
-        normalizedMessages: [LineageTree.NormalizedMessage],
+        normalizedMessages: [ContentTree.NormalizedMessage],
         previousResponseID: String?,
         requestLog: ProxyEventLogger.LoggedRequest,
         requestStartedAt: Date,
@@ -442,16 +462,6 @@ final class ProxyForwarder: Sendable {
                 let httpResponse = try await taskContext.awaitResponse()
                 await sessionStore.markRequestReceiving(id: requestID)
 
-                if (200..<300).contains(httpResponse.statusCode), let fingerprint {
-                    await sessionStore.attachToTree(
-                        requestID: requestID,
-                        sessionID: sessionID,
-                        fingerprint: fingerprint,
-                        messages: normalizedMessages,
-                        previousResponseID: previousResponseID
-                    )
-                }
-
                 var responseData = Data()
                 for try await chunk in taskContext.chunkStream {
                     await sessionStore.markFirstDataReceived(id: requestID)
@@ -483,13 +493,12 @@ final class ProxyForwarder: Sendable {
                 let isIncomplete = !isUpstreamError && !apiHandler.isResponseComplete(tokenUsage)
                 let requestErrored = isUpstreamError || isIncomplete
                 errored = requestErrored
-                if !requestErrored {
-                    await sessionStore.markNodeDone(
-                        requestID: requestID,
-                        tokenUsage: tokenUsage,
-                        responseID: responseID
-                    )
-                }
+                await sessionStore.finishTrackedRequest(
+                    requestID: requestID,
+                    succeeded: !requestErrored,
+                    tokenUsage: tokenUsage,
+                    responseID: responseID
+                )
                 let lineageContext = await sessionStore.lineageContext(for: requestID)
                 await sessionStore.markRequestDone(id: requestID, errored: requestErrored, tokenUsage: tokenUsage, estimatedCost: requestCost)
                 let responseLog = ProxyEventLogger.LoggedResponse(
@@ -507,7 +516,8 @@ final class ProxyForwarder: Sendable {
                         response: responseLog,
                         durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
                         error: "incomplete response (no terminal signal)",
-                        lineage: lineageContext
+                        lineage: lineageContext,
+                        responseID: responseID
                     )
                 } else {
                     await eventLogger?.logRequestCompleted(
@@ -529,6 +539,13 @@ final class ProxyForwarder: Sendable {
             }
 
         } catch is CancellationError {
+            await sessionStore.finishTrackedRequest(
+                requestID: requestID,
+                succeeded: false,
+                tokenUsage: nil,
+                responseID: nil
+            )
+            let lineageContext = await sessionStore.lineageContext(for: requestID)
             await sessionStore.markRequestDone(id: requestID, errored: true, tokenUsage: nil, estimatedCost: nil)
             ProxyLogger.log("Non-streaming request cancelled (client disconnect)")
             await eventLogger?.logRequestFailed(
@@ -538,9 +555,17 @@ final class ProxyForwarder: Sendable {
                 request: requestLog,
                 response: nil,
                 durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
-                error: "client disconnected"
+                error: "client disconnected",
+                lineage: lineageContext
             )
         } catch {
+            await sessionStore.finishTrackedRequest(
+                requestID: requestID,
+                succeeded: false,
+                tokenUsage: nil,
+                responseID: nil
+            )
+            let lineageContext = await sessionStore.lineageContext(for: requestID)
             await sessionStore.markRequestDone(id: requestID, errored: true, tokenUsage: nil, estimatedCost: nil)
             await metrics.recordFailed()
             let response = proxyErrorResponse(
@@ -554,7 +579,8 @@ final class ProxyForwarder: Sendable {
                 request: requestLog,
                 response: response.loggedResponse,
                 durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
-                error: error.localizedDescription
+                error: error.localizedDescription,
+                lineage: lineageContext
             )
             writeErrorToClient(writer: writer, response: response)
         }

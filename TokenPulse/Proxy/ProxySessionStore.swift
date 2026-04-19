@@ -1,14 +1,14 @@
 import Foundation
 
-/// Tracks proxy traffic and maintains the in-memory lineage tree across
-/// all proxied requests. Replaces the pre-refactor Claude-Code-specific
-/// lineage + manual keep-alive bookkeeping.
+/// Tracks proxy traffic and maintains the in-memory content tree across all
+/// proxied requests.
 ///
 /// - Sessions are a thin UI grouping layer keyed by the agent's session
 ///   header (e.g. `X-Claude-Code-Session-Id`, OpenAI `session_id`); they do
-///   not drive lineage tracking directly.
-/// - The `LineageTree` lives here and grows whenever upstream returns 2xx.
-///   Every request's done-leaf status is derived from the tree.
+///   not drive content-tree tracking directly.
+/// - The `ContentTree` lives here. Requests attach to it the moment their
+///   body has been parsed — before upstream is contacted. Every displayable
+///   done row is derived from the tree's content nodes.
 actor ProxySessionStore {
 
     struct CostSnapshot: Sendable {
@@ -51,14 +51,16 @@ actor ProxySessionStore {
     /// keep their completed requests here on a short timer). For flavored sessions the done
     /// list is derived from the lineage tree leaves and this map is unused.
     private var doneRequestsBySession: [String: [ProxyRequestActivity]] = [:]
-    /// Final `ProxyRequestActivity` snapshot for every completed request that landed in the
-    /// lineage tree. Keyed by request UUID, this preserves model name, byte counts, timing,
-    /// cost, etc. so the UI can render a full row for any tree-leaf node. Entries are
-    /// removed when the corresponding node is pruned from the tree.
+    /// Final `ProxyRequestActivity` snapshot for every completed request that
+    /// landed in the content tree. Keyed by request UUID, this preserves
+    /// model name, byte counts, timing, cost, etc. so the UI can render a
+    /// full row for any tree node's requests. Entries are removed when the
+    /// corresponding request is pruned from the tree.
     private var treeDoneActivities: [UUID: ProxyRequestActivity] = [:]
 
-    /// The in-memory lineage tree. Grown on 2xx responses; consulted for UI leaf queries.
-    private var lineageTree: LineageTree = LineageTree()
+    /// The in-memory content tree. Requests attach the moment their body is
+    /// parsed; leaf requests are consulted for UI display.
+    private var contentTree: ContentTree = ContentTree()
 
     // Byte counters for throughput and one-shot upload display.
     private var totalBytesReceived: Int = 0
@@ -175,19 +177,20 @@ actor ProxySessionStore {
         sessions[sessionID]
     }
 
-    // MARK: - Lineage tree integration
+    // MARK: - Content tree integration
 
-    /// Attach a request to the lineage tree. Called the moment upstream returns 2xx.
-    /// Stores the full fingerprint on the conversation so downstream callers never
-    /// need to re-derive model / system / tools from the original request body.
+    /// Attach a request to the content tree. Called once the request body
+    /// has been fully parsed (before upstream is contacted). Stores the full
+    /// fingerprint on the conversation so downstream callers never need to
+    /// re-derive model / system / tools from the original request body.
     func attachToTree(
         requestID: UUID,
         sessionID: String,
         fingerprint: LineageFingerprint,
-        messages: [LineageTree.NormalizedMessage],
+        messages: [ContentTree.NormalizedMessage],
         previousResponseID: String?
     ) {
-        let result = lineageTree.attach(
+        let result = contentTree.attach(
             requestID: requestID,
             sessionID: sessionID,
             fingerprint: fingerprint,
@@ -196,31 +199,34 @@ actor ProxySessionStore {
         )
         if var entry = activeRequests[requestID] {
             entry.activity.conversationID = result.conversationID
-            entry.activity.segmentID = result.segmentID
-            entry.activity.tailIndex = result.tailIndex
+            entry.activity.nodeID = result.nodeID
             activeRequests[requestID] = entry
         }
         onTraffic?(nil)
     }
 
-    /// Mark a lineage-tree node as done after the response has been fully received.
-    /// No-op when the request was never attached.
-    func markNodeDone(
+    /// Finalize a tree request. `succeeded` is true only for streams that
+    /// completed cleanly — upstream errors, client disconnects, and
+    /// incomplete streams all pass `succeeded: false`. No-op when the
+    /// request was never attached.
+    func finishTrackedRequest(
         requestID: UUID,
+        succeeded: Bool,
         tokenUsage: TokenUsage?,
         responseID: String?
     ) {
-        lineageTree.markDone(
+        contentTree.finishRequest(
             requestID: requestID,
+            succeeded: succeeded,
             tokenUsage: tokenUsage,
             responseID: responseID
         )
     }
 
-    /// Prune inactive lineage-tree leaves and return the IDs removed so callers
-    /// can mirror deletions to SQLite.
-    func pruneLineageTree(retention: TimeInterval) -> LineageTree.PruneResult {
-        let result = lineageTree.prune(retention: retention)
+    /// Prune terminal requests and empty nodes from the content tree and
+    /// return the IDs removed so callers can mirror deletions to SQLite.
+    func pruneContentTree(retention: TimeInterval) -> ContentTree.PruneResult {
+        let result = contentTree.prune(retention: retention)
         for removed in result.removedRequestIDs {
             treeDoneActivities.removeValue(forKey: removed)
         }
@@ -228,51 +234,40 @@ actor ProxySessionStore {
     }
 
     /// Test hook: snapshot of the current tree state, used for diagnostics and UI.
-    func lineageTreeSnapshot() -> LineageTree { lineageTree }
+    func contentTreeSnapshot() -> ContentTree { contentTree }
 
-    /// Build the `LineageContext` needed to mirror a request's tree coordinates
-    /// into SQLite. Returns nil when the request is not currently tracked by the tree.
+    /// Build the `LineageContext` needed to mirror a request's tree
+    /// coordinates into SQLite. Returns nil when the request is not
+    /// currently tracked by the tree.
     func lineageContext(for requestID: UUID) -> ProxyEventLogger.LineageContext? {
-        guard let (segmentID, nodeIndex) = lineageTree.nodeLocations[requestID],
-              let segment = lineageTree.segments[segmentID],
-              let conversation = lineageTree.conversation(withID: segment.conversationID) else {
+        guard let request = contentTree.requests[requestID],
+              let targetNode = contentTree.nodes[request.nodeID],
+              let conversation = contentTree.conversation(withID: targetNode.conversationID),
+              let rootNode = contentTree.nodes[conversation.rootNodeID] else {
             return nil
         }
-        let node = segment.nodes[nodeIndex]
         let fingerprint = conversation.fingerprint
-        let targetSegmentID = segment.id
-
-        // Walk parent chain from root → target. Each row's `messages_json` uses
-        // the segment's cached serialization (populated once per mutation), so
-        // ancestors don't re-encode on every request. `isTarget` tells the
-        // logger which row is allowed to rewrite `messages_json` on conflict.
-        var chain: [ProxyEventLogger.LineageContext.SegmentRow] = []
-        var visitedID: UUID? = targetSegmentID
-        while let currentID = visitedID {
-            guard let current = lineageTree.segments[currentID] else { break }
-            let json = lineageTree.cachedMessagesJSON(for: currentID)
-            chain.insert(
-                ProxyEventLogger.LineageContext.SegmentRow(
-                    id: current.id,
-                    parentSegmentID: current.parentSegmentID,
-                    parentSplitIndex: current.parentSplitIndex,
-                    messagesJSON: json,
-                    isTarget: current.id == targetSegmentID
-                ),
-                at: 0
-            )
-            visitedID = current.parentSegmentID
-        }
+        let targetDeltaJSON = contentTree.cachedDeltaMessagesJSON(for: targetNode.id)
+        let rootDeltaJSON = contentTree.cachedDeltaMessagesJSON(for: rootNode.id)
 
         return ProxyEventLogger.LineageContext(
-            conversationID: segment.conversationID,
-            segmentID: targetSegmentID,
-            tailIndex: node.tailIndex,
-            previousResponseID: node.previousResponseID,
+            conversationID: conversation.id,
+            nodeID: targetNode.id,
+            rootNodeID: rootNode.id,
+            previousResponseID: request.previousResponseID,
             fingerprintHash: fingerprint.conversationKey.fingerprintHash,
             fingerprint: fingerprint,
             flavor: fingerprint.flavor,
-            segmentChain: chain
+            rootNodeRow: ProxyEventLogger.LineageContext.NodeRow(
+                id: rootNode.id,
+                parentNodeID: nil,
+                deltaMessagesJSON: rootDeltaJSON
+            ),
+            targetNodeRow: ProxyEventLogger.LineageContext.NodeRow(
+                id: targetNode.id,
+                parentNodeID: targetNode.parentNodeID,
+                deltaMessagesJSON: targetDeltaJSON
+            )
         )
     }
 
@@ -327,8 +322,7 @@ actor ProxySessionStore {
             state: .uploading,
             modelID: model,
             conversationID: nil,
-            segmentID: nil,
-            tailIndex: nil,
+            nodeID: nil,
             bytesSent: 0,
             bytesReceived: 0,
             lastDataAt: nil,
@@ -449,52 +443,46 @@ actor ProxySessionStore {
             activeRequestsBySession[entry.sessionID, default: []].append(entry.activity)
         }
 
-        // Lineage-tree leaves are collected per conversation, then bucketed
-        // back into whichever session contributed each leaf. A conversation
-        // can span multiple sessions (rare but legal) so we rely on the
-        // sessionID recorded on each node. Prefer the cached `ProxyRequestActivity`
-        // captured at completion so rows show model / bytes / cost; fall back to
-        // a tree-only synthesis if the cache has already expired.
-        //
-        // `displayableDoneLeaves` returns both true leaves (no descendants) and
-        // pending-replacement leaves (descendants exist but are still done=false).
-        // The `isPendingReplacement` flag drives the per-row dimming in the popup.
+        // Displayable requests come from the content tree — every successful
+        // request at a leaf-ish node, bucketed into the session that sent it.
+        // `isPendingReplacement` flags rows whose node has a descendant with
+        // an in-flight request so the UI can dim them pending completion.
+        // A conversation can span multiple sessions (rare but legal) so we
+        // rely on the sessionID stored on each request. Prefer the cached
+        // `ProxyRequestActivity` captured at completion so rows show
+        // model / bytes / cost; fall back to a tree-only synthesis if the
+        // cache has already expired.
         var leafActivityBySession: [String: [ProxyRequestActivity]] = [:]
-        for leaf in lineageTree.displayableDoneLeaves() {
-            guard let (segmentID, nodeIndex) = lineageTree.nodeLocations[leaf.requestID],
-                  let segment = lineageTree.segments[segmentID] else {
-                continue
-            }
-            let node = segment.nodes[nodeIndex]
+        for displayable in contentTree.displayableRequests() {
+            guard let request = contentTree.requests[displayable.requestID] else { continue }
             var activity: ProxyRequestActivity
-            if let cached = treeDoneActivities[leaf.requestID] {
+            if let cached = treeDoneActivities[displayable.requestID] {
                 activity = cached
             } else {
-                let conversationModel = lineageTree
-                    .conversation(withID: segment.conversationID)?
+                let conversationModel = contentTree
+                    .conversation(withID: displayable.conversationID)?
                     .fingerprint
                     .model
                 activity = ProxyRequestActivity(
-                    id: node.requestID,
+                    id: request.id,
                     kind: .request,
                     state: .done,
                     modelID: conversationModel,
-                    conversationID: segment.conversationID,
-                    segmentID: segment.id,
-                    tailIndex: node.tailIndex,
+                    conversationID: displayable.conversationID,
+                    nodeID: displayable.nodeID,
                     bytesSent: 0,
                     bytesReceived: 0,
                     lastDataAt: nil,
-                    startedAt: node.createdAt,
+                    startedAt: request.createdAt,
                     receivingStartedAt: nil,
                     firstDataAt: nil,
-                    completedAt: node.doneAt,
-                    tokenUsage: node.tokenUsage,
+                    completedAt: request.finishedAt,
+                    tokenUsage: request.tokenUsage,
                     estimatedCost: nil
                 )
             }
-            activity.isPendingReplacement = leaf.isPendingReplacement
-            leafActivityBySession[node.sessionID, default: []].append(activity)
+            activity.isPendingReplacement = displayable.isPendingReplacement
+            leafActivityBySession[request.sessionID, default: []].append(activity)
         }
 
         // For untracked sessions ("other" or missing flavor) merge in the
@@ -543,15 +531,12 @@ actor ProxySessionStore {
             sessions.removeValue(forKey: id)
             doneRequestsBySession.removeValue(forKey: id)
         }
-        // Drop cached done-leaf activities whose tree-side node belonged to an
-        // expired session. Rare (the lineage tree usually holds nodes longer
-        // than sessions) but keeps memory from leaking across evictions.
+        // Drop cached done-leaf activities whose tree-side request belonged
+        // to an expired session. Rare (the content tree usually outlives
+        // sessions) but keeps memory from leaking across evictions.
         treeDoneActivities = treeDoneActivities.filter { requestID, _ in
-            guard let (segmentID, nodeIndex) = lineageTree.nodeLocations[requestID],
-                  let segment = lineageTree.segments[segmentID] else {
-                return false
-            }
-            return !expiredSet.contains(segment.nodes[nodeIndex].sessionID)
+            guard let request = contentTree.requests[requestID] else { return false }
+            return !expiredSet.contains(request.sessionID)
         }
         return expired
     }

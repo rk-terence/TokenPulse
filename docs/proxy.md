@@ -1,6 +1,6 @@
 ---
 title: Proxy Subsystem
-description: Architecture, request flow, universal lineage tree, retention, and event logging details for the local Anthropic/OpenAI proxy.
+description: Architecture, request flow, universal content tree, retention, and event logging details for the local Anthropic/OpenAI proxy.
 ---
 
 The proxy is an optional local HTTP proxy that sits between AI tools and upstream APIs. It currently serves two route families on the same local port:
@@ -13,13 +13,13 @@ Both handlers also accept query-string variants of those paths, such as `/v1/mes
 It forwards requests transparently while adding two capabilities:
 
 - request observability with per-request token tracking and cost estimation
-- a universal lineage tree over proxied requests, used for popup UI display and payload deduplication in the event log
+- a universal content tree over proxied requests, used for popup UI display and payload deduplication in the event log
 
 # Why it exists
 
-The proxy provides visibility that upstream APIs do not surface directly in local tools: per-request token usage, per-session aggregation, model selection, byte counts, request timing, and estimated cost. It also assembles proxied requests into a **lineage tree** — a conversation-level structure that lets the popup show only the current leaf of each conversation and lets the event logger store message content once per conversation instead of once per request.
+The proxy provides visibility that upstream APIs do not surface directly in local tools: per-request token usage, per-session aggregation, model selection, byte counts, request timing, and estimated cost. It also assembles proxied requests into a **content tree** — a conversation-level structure where each tree node is a content checkpoint (a point in the conversation's message-prefix space) and each attached request is an attempt at that checkpoint. Nodes dedupe shared conversation prefixes across requests, so the event logger stores message content once per node instead of once per request.
 
-Keep-alive (cache-warming replay requests) is **not currently implemented**; the previous Claude-Code-specific manual keep-alive button and its supporting state were removed in favor of the universal lineage tree. Keep-alive may return in a future iteration built on top of the tree.
+Keep-alive (cache-warming replay requests) is **not currently implemented**; the previous Claude-Code-specific manual keep-alive button and its supporting state were removed in favor of the universal tree. Keep-alive may return in a future iteration built on top of the tree.
 
 # Architecture
 
@@ -55,44 +55,63 @@ flowchart TD
 | Component | Isolation | Rationale |
 |-----------|-----------|-----------|
 | `LocalProxyController` | `@MainActor` | Owns `@Observable` state for SwiftUI binding. Reads snapshots and publishes UI state; does not sit on the request hot path. |
-| `ProxySessionStore` | `actor` | Owns mutable per-session state: in-flight counts, the in-memory `LineageTree`, token accumulation, and done requests. |
+| `ProxySessionStore` | `actor` | Owns mutable per-session state: in-flight counts, the in-memory `ContentTree`, token accumulation, and done requests. |
 | `ProxyMetricsStore` | `actor` | Tracks aggregate counters without contending with the richer session store. |
 | `ProxyEventLogger` | `actor` | Owns all SQLite and snapshot file I/O so persistence never blocks forwarding. |
 | `ProxyHTTPServer` | `Sendable` (lock-based) | Uses `NSLock`-protected containers for active connections and cancellable tasks. Network.framework callbacks require synchronous state access. |
 | `ProxyForwarder` | `Sendable` (immutable) | Holds immutable route config plus `URLSession` instances. All mutable state is passed in as actor references. |
 | `AnthropicProxyAPIHandler` / `OpenAIResponsesProxyAPIHandler` | `Sendable` value types | Own route-specific request parsing, session identity, lineage fingerprint / message normalization / response-ID extraction, token parsing, and proxy error body shape. |
 
-# Lineage tree
+# Content tree
 
-Every request whose body carries a messages-style stack (Anthropic Messages `messages`, OpenAI Responses `input`) — or an OpenAI `previous_response_id` pointer to a previously-seen response — is attached to an in-memory `LineageTree` the moment upstream returns `2xx`.
+Every proxied request whose body carries a messages-style stack (Anthropic Messages `messages`, OpenAI Responses `input`) — or an OpenAI `previous_response_id` pointer to a previously-seen response — is attached to an in-memory `ContentTree` the moment its body has been fully parsed, before upstream is contacted.
+
+## Model
+
+Tree granularity is **content**, not requests:
+
+- A **conversation** is a single tree rooted at a synthetic empty-messages node and keyed by `(flavor, fingerprint_hash)`. The fingerprint is a stable hash of the cache-identity fields: `model`, `system`/`instructions`, `tools`, `tool_choice`, `thinking`/`reasoning`.
+- A **node** is a content checkpoint — a point in the conversation's message-prefix space. Each non-root node stores only its **delta messages** (the messages it appends to its parent's cumulative prefix) and its `cumulative_hash` (the fold-hash of the full prefix at that node). Deltas are immutable after creation.
+- A **request** is one attempt attached to a node. It carries `session_id`, `previous_response_id`, `response_id`, `created_at`, `finished_at`, `succeeded`, and `token_usage`. States match the existing request pipeline: `uploading` → `waiting` → `receiving` → terminal (`succeeded` / errored / cancelled). A node may own **multiple** requests; we do not restrict to one.
 
 ## Invariants
 
-- A conversation is keyed by `(flavor, fingerprint_hash)`, where the fingerprint is a stable hash of the cache-identity fields: `model`, `system`/`instructions`, `tools`, `tool_choice`, `thinking`/`reasoning`.
-- A request enters the tree with `done == false`. `done == false` nodes are always leaves; only `done == true` nodes can acquire children.
-- The tree only grows. Existing nodes are never re-parented. If a new request is a strict prefix of an existing node, it becomes a sibling of that node under their common ancestor, not an intermediate ancestor.
-- Closest ancestor = the deepest `done == true` node whose messages form a proper prefix of the incoming request's messages.
-- Segments hold a non-branching run of normalized messages. A 50-turn conversation lives as a single segment that grows in place. A retry or edited reply creates a new child segment whose parent is the existing segment at the branch point.
-- Errored or cancelled mid-stream requests stay `done == false` forever and eventually prune.
+- Root nodes always have an empty `deltaMessages` list and exist for every conversation.
+- Nodes are never re-parented. Deltas are write-once. New requests either attach to an existing node (the prefix already exists) or create a new child node carrying the trimmed-off suffix.
+- `done`/`active` are attributes of **requests**, not nodes. A request is *displayable* when it has `succeeded == true` and its node has no descendant node with any succeeded request.
+- When an incoming request's prefix lands *inside* an existing node's multi-message delta (rather than on a node boundary), the matcher treats it as a fresh conversation-prefix and creates a new branch. This is a rare case we accept rather than splitting existing deltas.
+- Errored / cancelled / mid-stream-terminated requests stay in the tree with `succeeded == false` and age out via request pruning.
+
+## Matching
+
+Attach is O(N) in the request's message count:
+
+1. Compute prefix hashes `H_0..H_N` in one pass, folding each message's per-message `contentHash` into a running SHA-256 (`H_k = SHA256(H_{k-1} + ":" + contentHash_k)`). Each message is hashed exactly once.
+2. For `k` from `N` down to `0`, look up the conversation's `nodesByHash[H_k]`. The root's `H_0` is always registered, so the loop terminates.
+3. If `k == N`, attach the request to the matched node (no new content).
+4. Otherwise, create a new child node whose `parentNodeID` is the match and whose `deltaMessages` is the suffix `messages[k..<N]`, and record the request on it.
+
+For OpenAI `previous_response_id` bodies with no messages, the tree force-links to the node whose request produced that response (via the `responseID → nodeID` index). Unknown `previous_response_id` falls through to the root node.
 
 ## Pruning
 
-- Inactive leaves prune after **24 hours** since their most recent activity (`doneAt` or `createdAt`).
-- Pruning cascades upward through now-empty segments and then empty conversations; it stops at any ancestor that still has live children.
+- **Requests** prune 24 hours after `finishedAt`. In-flight requests (`finishedAt == nil`) never age out on their own — they finalize via the pipeline.
+- **Nodes** prune once they have no requests *and* no descendant nodes. Root nodes drop only when the conversation is being evicted.
+- **Conversations** evict once their root has no requests, no descendants, and no activity within the retention window.
 - Pruning is destructive in both memory and SQLite. A descendant that later reappears after its ancestor was pruned becomes a new root.
 
 ## Session retention and UI visibility
 
-Sessions are a thin UI grouping layer; they do not drive lineage matching.
+Sessions are a thin UI grouping layer; they do not drive tree matching.
 
 - Sessions with a recognized flavor (Anthropic / OpenAI) keep their session summary for up to 24 hours; `other` traffic expires after 60 seconds of inactivity when no requests are in flight.
 - Active (in-flight) requests are always shown.
-- Done requests in flavored sessions are derived from the lineage tree's **done leaves** — a done request stops showing the moment a descendant attaches to it. In untracked (`other`) sessions, done requests follow the 60-second cutoff.
-- Errored and cancelled requests disappear from the "active" section on termination and do not become tree leaves.
+- Done requests in flavored sessions come from `ContentTree.displayableRequests()` — a successful request is displayable until its node has any descendant carrying a succeeded request. If a descendant has only in-flight requests, the parent's row is still displayed but **dimmed** pending completion. In untracked (`other`) sessions, done requests follow the 60-second cutoff.
+- Errored / cancelled requests disappear from the "active" section on termination and do not become displayable; they remain in the tree as auditable records until they age out.
 
 ## Message normalization
 
-Normalization intentionally ignores differences that should not break same-lineage matching, including:
+Normalization intentionally ignores differences that should not break same-conversation matching, including:
 
 - Claude Code billing-header noise in `system`
 - presence or absence of `cache_control`
@@ -147,18 +166,18 @@ sequenceDiagram
 7. NWResponseWriter is created and the request is dispatched
 8. ProxyForwarder.forward() runs for the matched route
 9. Session is touched, request state is registered, metrics/logging begin
-10. Upstream request is forwarded via streaming or buffered path
-11. Token usage and estimated cost are recorded
-12. On upstream 2xx, the request is attached to the lineage tree (conversation + segment + tail index) and the node becomes a leaf until the response completes
-13. On successful completion, the node is marked `done == true` and the tree's mirror rows are written to SQLite alongside the request row
+10. The request body is parsed and the request is attached to the content tree (conversation + node); the request enters its in-flight state
+11. Upstream request is forwarded via streaming or buffered path
+12. Token usage and estimated cost are recorded
+13. On terminal state the tree request is finalized with `succeeded: true/false` and the tree mirror rows are written to SQLite alongside the request row
 ```
 
 ## Session identity
 
-Session identity is a **UI grouping key**, not a lineage key. A conversation in the lineage tree can span multiple session IDs (e.g. Codex subagents) and vice versa; the tree treats them as one conversation whenever their fingerprints and messages align.
+Session identity is a **UI grouping key**, not a tree key. A conversation in the content tree can span multiple session IDs (e.g. Codex subagents) and vice versa; the tree treats them as one conversation whenever their fingerprints and messages align.
 
 - **Anthropic Messages**: session ID comes from `X-Claude-Code-Session-Id`, normalized and stored as `anthropic:<id>`.
-- **OpenAI Responses**: treated as Codex session traffic when `session_id` is present and matches the `x-codex-window-id` prefix (`<session_id>:<window_generation>`). Otherwise it falls into `other`. Thread reconciliation across parent/child Codex threads is no longer required — the lineage tree collapses child-thread traffic into the right conversation via `previous_response_id` linkage.
+- **OpenAI Responses**: treated as Codex session traffic when `session_id` is present and matches the `x-codex-window-id` prefix (`<session_id>:<window_generation>`). Otherwise it falls into `other`. Thread reconciliation across parent/child Codex threads is no longer required — the content tree collapses child-thread traffic into the right conversation via `previous_response_id` linkage.
 - **Everything else**: falls back to `other`.
 
 Tracked sessions store normal request activity and token/cost aggregation.
@@ -228,7 +247,7 @@ A cumulative cost counter in `ProxySessionStore` survives session expiration unt
 
 # Keep-alive
 
-Keep-alive (cache-warming replay requests) is **not currently implemented**. The universal lineage tree replaces the previous Claude-Code-specific manual keep-alive surface. A future iteration may use the tree's accepted-request nodes to synthesize replay requests across supported providers.
+Keep-alive (cache-warming replay requests) is **not currently implemented**. The universal content tree replaces the previous Claude-Code-specific manual keep-alive surface. A future iteration may use the tree's accepted-request nodes to synthesize replay requests across supported providers.
 
 # Error handling
 
@@ -282,24 +301,25 @@ One row per conversation (cache-identity bucket).
 | `id` | TEXT PK | Conversation UUID |
 | `flavor` | TEXT NOT NULL | `anthropicMessages` \| `openAIResponses` |
 | `fingerprint_hash` | TEXT NOT NULL | SHA-256 of normalized identity (model + system + tools + tool_choice + thinking) |
+| `fingerprint_json` | TEXT NOT NULL | Serialized `LineageFingerprint` for replay / diagnostics |
+| `root_node_id` | TEXT NOT NULL | UUID of the conversation's synthetic empty-messages root node |
 | `first_seen` / `last_seen` | TEXT | ISO 8601 timestamps |
 
-### `proxy_lineage_segments`
+### `proxy_nodes`
 
-Non-branching runs of normalized messages. Grows in place when a descendant extends the current tail; branches create a new child segment.
+Content checkpoints. Each non-root row stores only the **delta messages** its creating request appended to its parent's cumulative prefix — writes are O(delta) per request regardless of conversation depth. Rows are immutable after creation; only `last_activity` is ever updated.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `id` | TEXT PK | Segment UUID |
+| `id` | TEXT PK | Node UUID |
 | `conversation_id` | TEXT NOT NULL | FK → `proxy_conversations(id)` `ON DELETE CASCADE` |
-| `parent_segment_id` | TEXT | FK → `proxy_lineage_segments(id)` `ON DELETE CASCADE`; nil for root |
-| `parent_split_index` | INTEGER NOT NULL | Index in parent at which this segment branches (-1 for root) |
-| `messages_json` | TEXT NOT NULL | JSON array of normalized messages for this segment |
-| `last_activity` | TEXT NOT NULL | ISO 8601 timestamp |
+| `parent_node_id` | TEXT | FK → `proxy_nodes(id)` `ON DELETE CASCADE`; nil for the conversation root |
+| `delta_messages_json` | TEXT NOT NULL | JSON array of normalized messages this node adds to its parent's prefix (`[]` for the root) |
+| `last_activity` | TEXT NOT NULL | ISO 8601 timestamp, refreshed on every request that lands on this node |
 
 ### `proxy_requests`
 
-One row per forwarded API request. Rows carry both the request metadata and the lineage-tree coordinates of the node they produced.
+One row per forwarded API request. Rows carry both the request metadata and the content-tree coordinates of the node they attached to.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -318,13 +338,12 @@ One row per forwarded API request. Rows carry both the request metadata and the 
 | `error` | TEXT | Proxy-side or upstream error text |
 | `errored` | INTEGER | `1` if the request errored |
 | `conversation_id` | TEXT | FK → `proxy_conversations(id)` `ON DELETE SET NULL` |
-| `segment_id` | TEXT | FK → `proxy_lineage_segments(id)` `ON DELETE SET NULL` |
-| `tail_index` | INTEGER | Inclusive index into the segment's messages |
+| `node_id` | TEXT | FK → `proxy_nodes(id)` `ON DELETE SET NULL` |
 | `response_id` | TEXT | Upstream `msg_*` / `resp_*` identifier when known |
 | `previous_response_id` | TEXT | OpenAI `previous_response_id` when used |
-| `done` | INTEGER NOT NULL | `1` when the node is `done == true` |
+| `done` | INTEGER NOT NULL | `1` when the request completed successfully |
 
-Indexes: `started_at`, `(session, started_at)`, `(model, started_at)`, `(status_code, started_at)`, `upstream_request_id`, `conversation_id`, `segment_id`, `response_id`.
+Indexes: `started_at`, `(session, started_at)`, `(model, started_at)`, `(status_code, started_at)`, `upstream_request_id`, `conversation_id`, `node_id`, `response_id`.
 
 ### `proxy_lifecycle`
 
@@ -342,19 +361,19 @@ Stores lifecycle events: `proxy_started`, `proxy_stopped`, `session_expired`.
 
 ### `proxy_request_content`
 
-Stores request/response captures. When the request has lineage coordinates, the cache-identity fields (`model`, `system`/`instructions`, `tools`, `tool_choice`, `thinking`/`reasoning`), the messages stack (`messages` for Anthropic, `input` for OpenAI Responses), and `previous_response_id` are stripped from the stored body and replaced with refs back to the conversation and segment:
+Stores request/response captures. When the request has content-tree coordinates, the cache-identity fields (`model`, `system`/`instructions`, `tools`, `tool_choice`, `thinking`/`reasoning`), the messages stack (`messages` for Anthropic, `input` for OpenAI Responses), and `previous_response_id` are stripped from the stored body and replaced with refs back to the conversation and node:
 
 ```json
 {
   "body_extras": { "max_tokens": 1024, "stream": true, "temperature": 0.2, "...": "..." },
   "body_refs":   {
     "fingerprint": "<conversation-uuid>",
-    "lineage":     { "segment_id": "<segment-uuid>", "tail_index": 42 }
+    "content":     { "node_id": "<node-uuid>" }
   }
 }
 ```
 
-The fingerprint fields live on `proxy_conversations.fingerprint_json`; the messages array lives on `proxy_lineage_segments.messages_json` and is reconstructed by walking the parent chain. Request bodies without lineage coordinates are stored in full otherwise; streaming response bodies are truncated to 4 MB.
+The fingerprint fields live on `proxy_conversations.fingerprint_json`; the messages array is reconstructed by walking `proxy_nodes.parent_node_id` from the node up to the root and concatenating each node's `delta_messages_json`. Request bodies without content-tree coordinates are stored in full otherwise; streaming response bodies are truncated to 4 MB.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -371,7 +390,7 @@ Bodies are serialized as UTF-8 when possible, otherwise base64. Bodies whose fin
 - prune check interval: at most once every 5 minutes, opportunistically on writes
 - SQLite prune targets: `proxy_requests`, `proxy_lifecycle`
 - `proxy_request_content` is cascade-deleted with its parent `proxy_requests` row
-- `proxy_lineage_segments` and `proxy_conversations` rows are removed via `ProxyEventLogger.pruneLineageMirror(...)` after the in-memory `LineageTree.prune(...)` drops them, so both sides stay in sync
+- `proxy_nodes` and `proxy_conversations` rows are removed via `ProxyEventLogger.pruneLineageMirror(...)` after the in-memory `ContentTree.prune(...)` drops them, so both sides stay in sync
 - `PRAGMA wal_checkpoint(PASSIVE)` runs after each prune pass
 
 ## Insert strategy
@@ -442,7 +461,7 @@ Legacy `proxyUpstreamURL` is still read during config migration and mapped to `a
 | Tracked session retention (Anthropic / OpenAI) | 24 hours since last activity | `LocalProxyController.sessionRetentionSeconds` + `ProxySessionID.usesShortRetentionWindow(...)` |
 | `other` session retention | 60 seconds since last activity | `LocalProxyController.otherTrafficRetentionSeconds` |
 | Tracked session UI visibility | 10 minutes since last activity, or any in-flight request | `LocalProxyController.visibleSessionActivities(...)` |
-| Lineage-tree leaf retention | 24 hours since last activity | `LocalProxyController.lineageTreePruneRetention` + `LineageTree.prune(...)` |
+| Content-tree request retention | 24 hours since terminal finish time | `LocalProxyController.contentTreePruneRetention` + `ContentTree.prune(...)` |
 | Untracked / `other` done request retention | 60 seconds | `LocalProxyController.otherTrafficRetentionSeconds` + `ProxySessionStore.pruneStaleDoneRequests(...)` |
 | Event retention | 24 hours | `ProxyEventLogger.maxEventAge` |
 | Event prune pass | Opportunistic on write after 5 minutes have elapsed since the last prune | `ProxyEventLogger.pruneInterval` |
@@ -454,13 +473,13 @@ Legacy `proxyUpstreamURL` is still read during config migration and mapped to `a
 
 | File | Role |
 |------|------|
-| `Proxy/LocalProxyController.swift` | `@MainActor` lifecycle owner; starts/stops server; publishes UI state; drives refresh + lineage-tree pruning |
+| `Proxy/LocalProxyController.swift` | `@MainActor` lifecycle owner; starts/stops server; publishes UI state; drives refresh + content-tree pruning |
 | `Proxy/ProxyHTTPServer.swift` | Network.framework HTTP/1.1 listener; parser; validator; `NWResponseWriter` implementation |
-| `Proxy/ProxyForwarder.swift` | Route-specific forwarding, streaming/non-streaming handling, token parsing, tree attach/markDone wiring |
+| `Proxy/ProxyForwarder.swift` | Route-specific forwarding, streaming/non-streaming handling, token parsing, tree attach/finish wiring |
 | `Proxy/AnthropicProxyAPIHandler.swift` | Anthropic Messages route semantics, session identity, fingerprint/messages normalization, Anthropic error bodies |
 | `Proxy/OpenAIResponsesProxyAPIHandler.swift` | OpenAI Responses route semantics, strict Codex session detection, `previous_response_id` extraction, token parsing, OpenAI error bodies |
-| `Proxy/LineageTree.swift` | In-memory lineage tree: conversations, segments, nodes, attach/markDone/leaf queries/prune/reconstruction |
-| `Proxy/ProxySessionStore.swift` | Actor; session lifecycle, request state machine, token accumulation, lineage-tree ownership and mirror context construction |
-| `Proxy/ProxyEventLogger.swift` | Actor; SQLite event persistence, lineage mirror tables, deduplicated payload storage, status snapshots with throttling |
+| `Proxy/LineageTree.swift` | In-memory content tree: conversations, content nodes, per-request attach/finish, prefix-fold matching, prune/reconstruction |
+| `Proxy/ProxySessionStore.swift` | Actor; session lifecycle, request state machine, token accumulation, content-tree ownership and mirror context construction |
+| `Proxy/ProxyEventLogger.swift` | Actor; SQLite event persistence, content-tree mirror tables, deduplicated payload storage, status snapshots with throttling |
 | `Proxy/ProxyMetricsStore.swift` | Actor; aggregate counters and savings formula |
 | `Proxy/ProxyModels.swift` | Shared value types and helpers: `ProxyAPIFlavor`, `ProxySessionID`, `LineageFingerprint`, `TokenUsage`, `ModelPricingTable`, `ProxyHTTPUtils` |

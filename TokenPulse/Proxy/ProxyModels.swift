@@ -227,7 +227,7 @@ enum ProxyRequestBody {
     static func normalizedLineageMessages(
         from body: Data,
         flavor: ProxyAPIFlavor
-    ) -> [LineageTree.NormalizedMessage] {
+    ) -> [ContentTree.NormalizedMessage] {
         guard let json = jsonObject(from: body) else { return [] }
         let field = (flavor == .openAIResponses) ? "input" : "messages"
         // OpenAI's `input` may be a string OR an array; Anthropic's `messages` is always an array.
@@ -248,8 +248,8 @@ enum ProxyRequestBody {
         return json["previous_response_id"] as? String
     }
 
-    private static func normalizedLineageMessages(from rawArray: [Any]) -> [LineageTree.NormalizedMessage] {
-        var result: [LineageTree.NormalizedMessage] = []
+    private static func normalizedLineageMessages(from rawArray: [Any]) -> [ContentTree.NormalizedMessage] {
+        var result: [ContentTree.NormalizedMessage] = []
         result.reserveCapacity(rawArray.count)
         for element in rawArray {
             guard let normalized = normalizedValue(element) as? [String: Any],
@@ -257,7 +257,7 @@ enum ProxyRequestBody {
             let canonical = canonicalString(for: normalized) ?? ""
             let contentHash = LineageHash.sha256Hex(canonical)
             let rawJSON = (try? JSONSerialization.data(withJSONObject: normalized, options: [.sortedKeys])) ?? Data()
-            result.append(LineageTree.NormalizedMessage(
+            result.append(ContentTree.NormalizedMessage(
                 role: role,
                 contentHash: contentHash,
                 rawJSON: rawJSON
@@ -431,7 +431,7 @@ struct LineageFingerprint: Sendable, Equatable, Codable {
     let thinkingCanonical: String?
 
     /// Derive the tree `ConversationKey` for this fingerprint.
-    var conversationKey: LineageTree.ConversationKey {
+    var conversationKey: ContentTree.ConversationKey {
         let canonical = [
             "model:\(model)",
             "system:\(systemCanonical ?? "")",
@@ -439,7 +439,7 @@ struct LineageFingerprint: Sendable, Equatable, Codable {
             "tool_choice:\(toolChoiceCanonical ?? "")",
             "thinking:\(thinkingCanonical ?? "")",
         ].joined(separator: "\n")
-        return LineageTree.ConversationKey(
+        return ContentTree.ConversationKey(
             flavor: flavor,
             fingerprintHash: LineageHash.sha256Hex(canonical)
         )
@@ -489,12 +489,10 @@ struct ProxyRequestActivity: Sendable, Identifiable {
     var state: ProxyRequestState
     /// Model ID from the request body, used for done-request replacement matching.
     let modelID: String?
-    /// Lineage tree node location: conversation this request belongs to (nil when unclassified).
+    /// Content tree conversation this request belongs to (nil when unclassified).
     var conversationID: UUID?
-    /// Lineage tree segment the request's tail lands in.
-    var segmentID: UUID?
-    /// Inclusive index into the segment's messages array.
-    var tailIndex: Int?
+    /// Content tree node this request is attached to (nil when unclassified).
+    var nodeID: UUID?
     /// Cumulative bytes sent to upstream so far.
     var bytesSent: Int
     /// Cumulative bytes received from upstream so far.
@@ -513,9 +511,10 @@ struct ProxyRequestActivity: Sendable, Identifiable {
     var tokenUsage: TokenUsage?
     /// Estimated cost (USD) for this single request, populated when state transitions to `.done`.
     var estimatedCost: Double?
-    /// True when this activity is rendered as a done-tree leaf, but a newer
-    /// descendant (still `done=false`) exists. The UI dims such rows because
-    /// they are about to be replaced once the descendant completes.
+    /// True when this activity represents a displayable done request whose
+    /// node has a descendant with an in-flight request. The UI dims such
+    /// rows because they are about to be replaced once the descendant
+    /// completes successfully.
     var isPendingReplacement: Bool = false
 
     /// Total prompt tokens for display. Some providers report cache-read tokens as a
