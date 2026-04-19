@@ -8,8 +8,8 @@ final class LocalProxyController {
     private static let sessionExpirationSweepInterval: TimeInterval = 10
     private static let sessionRetentionSeconds: TimeInterval = 24 * 60 * 60
     private static let sessionVisibilitySeconds: TimeInterval = 10 * 60
-    private static let sideTrafficDoneRetentionSeconds: TimeInterval = 5 * 60
     private static let otherTrafficRetentionSeconds: TimeInterval = 60
+    private static let lineageTreePruneRetention: TimeInterval = 24 * 60 * 60
     private static let restartAttempts = 3
     private static let restartStopDelay: Duration = .milliseconds(150)
     private static let restartStartupTimeout: Duration = .milliseconds(900)
@@ -21,7 +21,6 @@ final class LocalProxyController {
         let sessionID: String
         let completedRequests: Int
         let erroredRequests: Int
-        let keepaliveCount: Int
         let activeRequests: [ProxyRequestActivity]
         let doneRequests: [ProxyRequestActivity]
         let totalInputTokens: Int
@@ -29,49 +28,23 @@ final class LocalProxyController {
         let totalCacheReadInputTokens: Int
         let totalCacheCreationInputTokens: Int
         let estimatedCostUSD: Double
-        let isKeepaliveDisabled: Bool
-        let keepaliveDisabledReason: String?
-        let keepaliveMode: KeepaliveMode
-        /// Whether lineage is established and a keepalive body is available for manual send.
-        let lineageReady: Bool
-        let lastKeepaliveAt: Date?
-        /// Cache read percentage from the last keepalive response (0–100), nil if no keepalive yet.
-        let lastKeepaliveCacheReadPercent: Double?
-        /// Cache-read tokens from the last keepalive response, for diagnostics.
-        let lastKeepaliveCacheReadTokens: Int?
-        /// Cache-creation tokens from the last keepalive response, for diagnostics.
-        let lastKeepaliveCacheCreationTokens: Int?
-        /// Output tokens from the last keepalive response, for verification.
-        let lastKeepaliveOutputTokens: Int?
 
         var id: String { sessionID }
         var apiFlavor: ProxyAPIFlavor? { ProxySessionID.flavor(for: sessionID) }
         var displayID: String { ProxySessionID.displayID(for: sessionID) }
-        /// First 8 characters of the display session ID — enough to distinguish sessions in the UI.
         var shortID: String { ProxySessionID.shortDisplayID(for: sessionID) }
         var agentName: String? { apiFlavor?.sessionAgentName }
         var rowTitle: String {
             ProxySessionID.isOther(sessionID) ? displayID : shortID
         }
         var isOtherTraffic: Bool { ProxySessionID.isOther(sessionID) }
-        var supportsKeepalive: Bool { apiFlavor?.supportsKeepalive ?? false }
-        /// Whether a manual keepalive can be sent right now.
-        var canSendKeepalive: Bool {
-            keepaliveMode == .manual && !isKeepaliveDisabled && lineageReady
-        }
     }
 
     // MARK: - Aggregate metrics snapshot for UI
 
     struct ProxyStatus: Sendable {
         let activeSessions: Int
-        let activeKeepalives: Int
         let totalRequestsForwarded: Int
-        let totalKeepalivesSent: Int
-        let totalKeepalivesFailed: Int
-        let cacheReads: Int
-        let cacheWrites: Int
-        let estimatedSavings: Double
         let totalInputTokens: Int
         let totalOutputTokens: Int
         let totalCacheReadInputTokens: Int
@@ -80,10 +53,8 @@ final class LocalProxyController {
         let estimatedCostUSDByAPI: [ProxyAPIFlavor: Double]
 
         static let empty = ProxyStatus(
-            activeSessions: 0, activeKeepalives: 0,
-            totalRequestsForwarded: 0, totalKeepalivesSent: 0,
-            totalKeepalivesFailed: 0, cacheReads: 0, cacheWrites: 0,
-            estimatedSavings: 0,
+            activeSessions: 0,
+            totalRequestsForwarded: 0,
             totalInputTokens: 0, totalOutputTokens: 0,
             totalCacheReadInputTokens: 0, totalCacheCreationInputTokens: 0,
             totalEstimatedCostUSD: 0,
@@ -107,19 +78,8 @@ final class LocalProxyController {
     /// Download throughput in bytes per second, computed from cumulative deltas every refresh tick.
     private(set) var downloadBytesPerSec: Double = 0
 
-    /// Called on the main actor when the proxy detects data traffic.
-    /// `direction` is non-nil when bytes actually flowed (used to animate the
-    /// menu bar arrows); it is nil for bookkeeping updates that refresh the
-    /// popover but should not trigger a byte-level animation.
     var onTrafficEvent: ((TrafficDirection?) -> Void)?
-    /// Called on the main actor once per successfully finalized request.
-    /// `ProxySessionStore.markRequestDone` gates this on `!errored`, so
-    /// failed requests do not fire — they don't accrue provider cost and
-    /// shouldn't spawn a cost-transformation particle on the menu bar icon.
     var onRequestDone: (() -> Void)?
-    /// Called on the main actor whenever `isRunning` transitions between
-    /// true and false. Used so the menu bar icon can redraw the proxy-off
-    /// dim immediately, even when no traffic or poll event is pending.
     var onRunningChanged: ((Bool) -> Void)?
 
     private var server: ProxyHTTPServer?
@@ -136,23 +96,14 @@ final class LocalProxyController {
     private var trafficRefreshPending = false
     private var currentAnthropicUpstreamURL: String?
 
-    /// Session IDs currently sending a manual keepalive request.
-    private(set) var manualKeepaliveInFlight: Set<String> = []
-    /// Last manual keepalive result per session (true = success, false = failure).
-    private(set) var manualKeepaliveLastResult: [String: Bool] = [:]
-
     /// Start the proxy server on the given port, serving both supported API routes.
     func start(port: Int, anthropicUpstreamURL: String, openAIUpstreamURL: String) {
         guard server == nil else { return }
 
-        // Read config from ConfigService (both are @MainActor, safe here).
         let config = ConfigService.shared
         currentAnthropicUpstreamURL = anthropicUpstreamURL
 
-        let logger = ProxyEventLogger(
-            enabled: config.saveProxyEventLog || config.saveProxyPayloads,
-            capturesContent: config.saveProxyPayloads
-        )
+        let logger = ProxyEventLogger(enabled: config.saveProxyEventLog)
         self.eventLogger = logger
 
         let anthropicForwarder = ProxyForwarder(
@@ -172,7 +123,6 @@ final class LocalProxyController {
         self.anthropicForwarder = anthropicForwarder
         self.openAIForwarder = openAIForwarder
 
-        // Wire traffic events from session store to MainActor callback.
         Task { [weak self] in
             guard let self else { return }
             let store = self.sessionStore
@@ -189,7 +139,6 @@ final class LocalProxyController {
             }
         }
 
-        // Capture actor-isolated stores for the handler closure.
         let sessStore = sessionStore
         let metStore = metricsStore
         let anthropicHandler = anthropicAPIHandler
@@ -204,8 +153,6 @@ final class LocalProxyController {
                         || openAIHandler.acceptsRequest(method: method, path: path) {
                         return .accepted
                     }
-
-                    // Path matches a known route but method is wrong (e.g. GET /v1/messages).
                     if anthropicHandler.acceptsRequest(method: "POST", path: path)
                         || openAIHandler.acceptsRequest(method: "POST", path: path) {
                         return .rejected(
@@ -306,12 +253,10 @@ final class LocalProxyController {
         }
     }
 
-    /// Stop the proxy server.
     func stop() {
         stopInternal(cancelRestartTask: true)
     }
 
-    /// Stop then start the proxy using the latest settings, with retry to avoid restart races.
     func restart(port: Int, anthropicUpstreamURL: String, openAIUpstreamURL: String) {
         restartTask?.cancel()
         restartTask = Task { @MainActor [weak self] in
@@ -353,7 +298,6 @@ final class LocalProxyController {
                 enabled: false,
                 port: 0,
                 activeSessions: 0,
-                activeKeepalives: 0,
                 metrics: snapshot,
                 force: true
             )
@@ -368,8 +312,6 @@ final class LocalProxyController {
         lastUploadBytes = 0
         downloadBytesPerSec = 0
         currentAnthropicUpstreamURL = nil
-        manualKeepaliveInFlight.removeAll()
-        manualKeepaliveLastResult.removeAll()
         ProxyLogger.log("Proxy controller stopped")
     }
 
@@ -422,16 +364,10 @@ final class LocalProxyController {
     /// Reset the cumulative proxy cost estimate to zero.
     func resetCost() async {
         await sessionStore.resetCost()
-        var s = proxyStatus
-        s = ProxyStatus(
+        let s = proxyStatus
+        proxyStatus = ProxyStatus(
             activeSessions: s.activeSessions,
-            activeKeepalives: s.activeKeepalives,
             totalRequestsForwarded: s.totalRequestsForwarded,
-            totalKeepalivesSent: s.totalKeepalivesSent,
-            totalKeepalivesFailed: s.totalKeepalivesFailed,
-            cacheReads: s.cacheReads,
-            cacheWrites: s.cacheWrites,
-            estimatedSavings: s.estimatedSavings,
             totalInputTokens: s.totalInputTokens,
             totalOutputTokens: s.totalOutputTokens,
             totalCacheReadInputTokens: s.totalCacheReadInputTokens,
@@ -439,187 +375,9 @@ final class LocalProxyController {
             totalEstimatedCostUSD: 0,
             estimatedCostUSDByAPI: [:]
         )
-        proxyStatus = s
     }
 
-    /// Set the keepalive mode for a specific session (user-initiated).
-    func setSessionKeepaliveMode(_ mode: KeepaliveMode, for sessionID: String) {
-        guard ProxySessionID.flavor(for: sessionID)?.supportsKeepalive == true else { return }
-        let sessStore = sessionStore
-        Task {
-            await sessStore.setKeepaliveMode(mode, for: sessionID)
-        }
-    }
-
-    /// Send a single manual keepalive request for a session.
-    func sendManualKeepalive(for sessionID: String) {
-        guard !manualKeepaliveInFlight.contains(sessionID) else { return }
-        guard let upstreamURL = currentAnthropicUpstreamURL else { return }
-
-        manualKeepaliveInFlight.insert(sessionID)
-        manualKeepaliveLastResult.removeValue(forKey: sessionID)
-
-        let sessStore = sessionStore
-        let metStore = metricsStore
-        let handler = anthropicAPIHandler
-        let logger = eventLogger
-
-        Task { [weak self] in
-            let result = await Self.performManualKeepalive(
-                sessionID: sessionID,
-                upstreamBaseURL: upstreamURL,
-                sessionStore: sessStore,
-                metricsStore: metStore,
-                apiHandler: handler,
-                eventLogger: logger
-            )
-
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                self.manualKeepaliveInFlight.remove(sessionID)
-                self.manualKeepaliveLastResult[sessionID] = result
-            }
-
-            // Clear the result indicator after a brief delay.
-            try? await Task.sleep(for: .seconds(2))
-            await MainActor.run { [weak self] in
-                _ = self?.manualKeepaliveLastResult.removeValue(forKey: sessionID)
-            }
-        }
-    }
-
-    /// Perform a single keepalive request. Returns true on success, false on failure.
-    private nonisolated static func performManualKeepalive(
-        sessionID: String,
-        upstreamBaseURL: String,
-        sessionStore: ProxySessionStore,
-        metricsStore: ProxyMetricsStore,
-        apiHandler: any ProxyAPIHandler,
-        eventLogger: ProxyEventLogger?
-    ) async -> Bool {
-        guard await sessionStore.canSendManualKeepalive(for: sessionID) else { return false }
-
-        guard let keepaliveSource = await sessionStore.keepaliveRequestContext(for: sessionID) else {
-            return false
-        }
-        let lineageBody = keepaliveSource.body
-        guard let keepaliveBody = apiHandler.buildKeepaliveBody(from: lineageBody) else {
-            return false
-        }
-
-        let lineageHeaders = keepaliveSource.headers
-        let urlString = upstreamBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            + keepaliveSource.path
-        guard let url = URL(string: urlString) else { return false }
-
-        let model = apiHandler.extractModel(from: lineageBody)
-        let requestID = UUID()
-        await sessionStore.startRequest(
-            id: requestID,
-            sessionID: sessionID,
-            model: model,
-            promptDescriptor: nil,
-            isMainAgentShaped: false,
-            kind: .keepalive
-        )
-        await sessionStore.updateRequestBytesSent(id: requestID, totalBytesSent: keepaliveBody.count)
-        await sessionStore.markRequestWaiting(id: requestID)
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.httpBody = keepaliveBody
-        for header in lineageHeaders {
-            let lowered = header.name.lowercased()
-            if lowered == "host" || lowered == "content-length" || lowered == "transfer-encoding" {
-                continue
-            }
-            request.addValue(header.value, forHTTPHeaderField: header.name)
-        }
-
-        let startedAt = Date()
-        let keepaliveID = await eventLogger?.logKeepaliveSent(session: sessionID)
-
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            let httpResponse = response as? HTTPURLResponse
-            let statusCode = httpResponse?.statusCode ?? 0
-            await sessionStore.markRequestReceiving(id: requestID)
-            if !data.isEmpty {
-                await sessionStore.markFirstDataReceived(id: requestID)
-                await sessionStore.updateRequestBytes(id: requestID, additionalBytes: data.count)
-            }
-
-            await metricsStore.recordKeepaliveSent()
-
-            if statusCode >= 200 && statusCode < 300 {
-                let tokenUsage = apiHandler.parseTokenUsage(from: data, streaming: false)
-                let requestCost = ModelPricingTable.pricing(for: model).map { tokenUsage.cost(for: $0) }
-                await sessionStore.recordKeepaliveResult(
-                    for: sessionID,
-                    success: true,
-                    tokenUsage: tokenUsage,
-                    apiFlavor: .anthropicMessages
-                )
-                await sessionStore.markRequestDone(
-                    id: requestID,
-                    errored: false,
-                    tokenUsage: tokenUsage,
-                    estimatedCost: requestCost
-                )
-                await eventLogger?.logKeepaliveCompleted(
-                    keepaliveID: keepaliveID,
-                    session: sessionID,
-                    success: true,
-                    statusCode: statusCode,
-                    durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: startedAt),
-                    upstreamRequestID: nil,
-                    tokenUsage: tokenUsage,
-                    error: nil
-                )
-                return true
-            } else {
-                await metricsStore.recordKeepaliveFailed()
-                await sessionStore.recordKeepaliveResult(
-                    for: sessionID,
-                    success: false,
-                    tokenUsage: .empty,
-                    apiFlavor: .anthropicMessages
-                )
-                await sessionStore.markRequestDone(id: requestID, errored: true, tokenUsage: nil, estimatedCost: nil)
-                await eventLogger?.logKeepaliveCompleted(
-                    keepaliveID: keepaliveID,
-                    session: sessionID,
-                    success: false,
-                    statusCode: statusCode,
-                    durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: startedAt),
-                    upstreamRequestID: nil,
-                    tokenUsage: .empty,
-                    error: "HTTP \(statusCode)"
-                )
-                return false
-            }
-        } catch {
-            await metricsStore.recordKeepaliveFailed()
-            await sessionStore.recordKeepaliveResult(
-                for: sessionID,
-                success: false,
-                tokenUsage: .empty,
-                apiFlavor: .anthropicMessages
-            )
-            await sessionStore.markRequestDone(id: requestID, errored: true, tokenUsage: nil, estimatedCost: nil)
-            await eventLogger?.logKeepaliveCompleted(
-                keepaliveID: keepaliveID,
-                session: sessionID,
-                success: false,
-                statusCode: nil,
-                durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: startedAt),
-                upstreamRequestID: nil,
-                tokenUsage: .empty,
-                error: error.localizedDescription
-            )
-            return false
-        }
-    }
+    // MARK: - Route helpers
 
     nonisolated private static func route(
         for path: String,
@@ -666,9 +424,8 @@ final class LocalProxyController {
 
     nonisolated private static var jsonContentType: String { "application/json" }
 
-    /// Refresh session activities immediately in response to a traffic event.
-    /// Coalesces rapid calls: the first call schedules a refresh after a short delay;
-    /// subsequent calls within that window are absorbed.
+    // MARK: - Refresh
+
     private func scheduleTrafficRefresh() {
         guard !trafficRefreshPending else { return }
         trafficRefreshPending = true
@@ -687,13 +444,7 @@ final class LocalProxyController {
             self.lastUploadBytes = uploadSize
             self.proxyStatus = ProxyStatus(
                 activeSessions: activities.count,
-                activeKeepalives: self.proxyStatus.activeKeepalives,
                 totalRequestsForwarded: self.proxyStatus.totalRequestsForwarded,
-                totalKeepalivesSent: self.proxyStatus.totalKeepalivesSent,
-                totalKeepalivesFailed: self.proxyStatus.totalKeepalivesFailed,
-                cacheReads: self.proxyStatus.cacheReads,
-                cacheWrites: self.proxyStatus.cacheWrites,
-                estimatedSavings: self.proxyStatus.estimatedSavings,
                 totalInputTokens: self.proxyStatus.totalInputTokens,
                 totalOutputTokens: self.proxyStatus.totalOutputTokens,
                 totalCacheReadInputTokens: self.proxyStatus.totalCacheReadInputTokens,
@@ -712,7 +463,6 @@ final class LocalProxyController {
 
         refreshTask = Task { [weak self] in
             var lastSessionExpirationSweep = Date.distantPast
-            // Throughput tracking — local to this task to avoid actor hops.
             var prevTransfer = (sent: 0, received: 0)
             var prevTransferDate = Date()
 
@@ -734,9 +484,18 @@ final class LocalProxyController {
                         }
                     }
                     await sessStore.pruneStaleDoneRequests(
-                        olderThan: now.addingTimeInterval(-Self.sideTrafficDoneRetentionSeconds),
                         otherOlderThan: now.addingTimeInterval(-Self.otherTrafficRetentionSeconds)
                     )
+                    let pruneResult = await sessStore.pruneLineageTree(
+                        retention: Self.lineageTreePruneRetention
+                    )
+                    if !pruneResult.removedConversationIDs.isEmpty || !pruneResult.removedSegmentIDs.isEmpty {
+                        let logger = await MainActor.run { self?.eventLogger }
+                        await logger?.pruneLineageMirror(
+                            conversationIDs: pruneResult.removedConversationIDs,
+                            segmentIDs: pruneResult.removedSegmentIDs
+                        )
+                    }
                 }
 
                 let snapshot = await metStore.snapshot()
@@ -745,7 +504,6 @@ final class LocalProxyController {
                 let bytesRx     = await sessStore.cumulativeBytesReceived()
                 let costSnapshot = await sessStore.costSnapshot()
 
-                // Delta-based KB/s from cumulative receive counter.
                 let elapsed = now.timeIntervalSince(prevTransferDate)
                 let downloadSpeed: Double
                 if elapsed > 0 {
@@ -765,13 +523,7 @@ final class LocalProxyController {
                     self?.downloadBytesPerSec = downloadSpeed
                     self?.proxyStatus = ProxyStatus(
                         activeSessions: activities.count,
-                        activeKeepalives: 0,
                         totalRequestsForwarded: snapshot.totalRequestsForwarded,
-                        totalKeepalivesSent: snapshot.totalKeepalivesSent,
-                        totalKeepalivesFailed: snapshot.totalKeepalivesFailed,
-                        cacheReads: snapshot.totalCacheReads,
-                        cacheWrites: snapshot.totalCacheWrites,
-                        estimatedSavings: snapshot.estimatedSavingsMultiple,
                         totalInputTokens: snapshot.totalInputTokens,
                         totalOutputTokens: snapshot.totalOutputTokens,
                         totalCacheReadInputTokens: snapshot.totalCacheReadInputTokens,
@@ -793,84 +545,24 @@ final class LocalProxyController {
 
         return snapshots
             .filter {
-                let cutoff = usesShortRetentionWindow(for: $0) ? otherCutoff : sessionCutoff
-                return max($0.lastSeenAt, $0.lastKeepaliveAt ?? .distantPast) >= cutoff
-                    || !$0.activeRequests.isEmpty
+                let cutoff = ProxySessionID.usesShortRetentionWindow(for: $0.sessionID) ? otherCutoff : sessionCutoff
+                return $0.lastSeenAt >= cutoff || !$0.activeRequests.isEmpty || !$0.doneRequests.isEmpty
             }
             .map { snap in
-                let doneRequests = Self.visibleDoneRequests(from: snap, now: now)
-                return SessionActivity(
+                SessionActivity(
                     sessionID: snap.sessionID,
                     completedRequests: snap.completedRequestCount,
                     erroredRequests: snap.erroredRequestCount,
-                    keepaliveCount: snap.keepaliveTotalCount,
                     activeRequests: snap.activeRequests.sorted { $0.startedAt > $1.startedAt },
-                    doneRequests: doneRequests,
+                    doneRequests: snap.doneRequests.sorted {
+                        ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt)
+                    },
                     totalInputTokens: snap.totalInputTokens,
                     totalOutputTokens: snap.totalOutputTokens,
                     totalCacheReadInputTokens: snap.totalCacheReadInputTokens,
                     totalCacheCreationInputTokens: snap.totalCacheCreationInputTokens,
-                    estimatedCostUSD: snap.estimatedCostUSD,
-                    isKeepaliveDisabled: snap.isKeepaliveDisabled,
-                    keepaliveDisabledReason: snap.keepaliveDisabledReason,
-                    keepaliveMode: snap.keepaliveMode,
-                    lineageReady: snap.lineageEstablished,
-                    lastKeepaliveAt: snap.lastKeepaliveAt,
-                    lastKeepaliveCacheReadPercent: Self.cacheReadPercent(from: snap.lastKeepaliveTokenUsage),
-                    lastKeepaliveCacheReadTokens: snap.lastKeepaliveTokenUsage?.cacheReadInputTokens,
-                    lastKeepaliveCacheCreationTokens: snap.lastKeepaliveTokenUsage?.cacheCreationInputTokens,
-                    lastKeepaliveOutputTokens: snap.lastKeepaliveTokenUsage?.outputTokens
+                    estimatedCostUSD: snap.estimatedCostUSD
                 )
             }
-    }
-
-    private static func visibleDoneRequests(
-        from snapshot: ProxySessionStore.SessionSnapshot,
-        now: Date
-    ) -> [ProxyRequestActivity] {
-        var doneRequests = snapshot.doneRequests
-        if let lastKeepaliveRequest = snapshot.lastKeepaliveRequest {
-            doneRequests.append(lastKeepaliveRequest)
-        }
-
-        if usesShortDoneRequestRetentionWindow(for: snapshot) {
-            let cutoff = now.addingTimeInterval(-otherTrafficRetentionSeconds)
-            doneRequests = doneRequests.filter {
-                ($0.completedAt ?? $0.startedAt) >= cutoff
-            }
-        }
-
-        return doneRequests.sorted {
-            ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt)
-        }
-    }
-
-    private static func usesShortRetentionWindow(
-        for snapshot: ProxySessionStore.SessionSnapshot
-    ) -> Bool {
-        ProxySessionID.usesShortRetentionWindow(
-            for: snapshot.sessionID,
-            lineageEstablished: snapshot.lineageEstablished
-        )
-    }
-
-    private static func usesShortDoneRequestRetentionWindow(
-        for snapshot: ProxySessionStore.SessionSnapshot
-    ) -> Bool {
-        ProxySessionID.usesShortDoneRequestRetentionWindow(
-            for: snapshot.sessionID,
-            lineageEstablished: snapshot.lineageEstablished
-        )
-    }
-
-    /// Compute cache read percentage from a keepalive token usage response.
-    private static func cacheReadPercent(from usage: TokenUsage?) -> Double? {
-        guard let usage else { return nil }
-        let cacheRead = Double(usage.cacheReadInputTokens ?? 0)
-        let cacheWrite = Double(usage.cacheCreationInputTokens ?? 0)
-        let input = Double(usage.inputTokens ?? 0)
-        let total = cacheRead + cacheWrite + input
-        guard total > 0 else { return nil }
-        return (cacheRead / total) * 100
     }
 }

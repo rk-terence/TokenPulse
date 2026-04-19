@@ -1,12 +1,15 @@
 import Foundation
 
 /// Forwards incoming proxy requests to the configured upstream API and streams
-/// responses back to the local client.
-///
-/// Protocol-specific request parsing, lineage, and keepalive semantics are
-/// delegated to the injected `ProxyAPIHandler`.
+/// responses back to the local client. Feeds the lineage tree on every 2xx.
 final class ProxyForwarder: Sendable {
     private static let maxLoggedStreamingResponseBytes = 4 * 1024 * 1024
+    /// Size of the tail ring-buffer used for terminal-signal parsing.
+    /// Anthropic's final `message_delta` + `message_stop` events and OpenAI's
+    /// `response.completed` event are all well under this limit, so keeping
+    /// the last 64 KB reliably preserves the terminal signal regardless of
+    /// how big the response body grew.
+    private static let maxParseTailBytes = 64 * 1024
 
     let upstreamBaseURL: String
     private let apiFlavor: ProxyAPIFlavor
@@ -48,14 +51,10 @@ final class ProxyForwarder: Sendable {
     ) async {
         let sessionIdentity = apiHandler.sessionIdentity(for: request)
         let model = apiHandler.extractModel(from: request.body)
-        let supportsTrackedSession = sessionIdentity.flavor != nil
-        let promptDescriptor = supportsTrackedSession ? apiHandler.promptDescriptor(from: request.body) : nil
-
         await forwardRequest(
             request: request,
             sessionIdentity: sessionIdentity,
             model: model,
-            promptDescriptor: promptDescriptor,
             sessionStore: sessionStore,
             metrics: metrics
         )
@@ -67,12 +66,9 @@ final class ProxyForwarder: Sendable {
         request: ProxyHTTPRequest,
         sessionIdentity: ProxySessionIdentity,
         model: String?,
-        promptDescriptor: String?,
         sessionStore: ProxySessionStore,
         metrics: ProxyMetricsStore
     ) async {
-        // requestID is created below, after URL validation, so we only track
-        // real upstream attempts (not proxy-side config errors).
         let upstreamPath = apiHandler.upstreamPath(for: request.path)
         let urlString = upstreamBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             + upstreamPath
@@ -121,18 +117,14 @@ final class ProxyForwarder: Sendable {
 
         // Register the in-flight request in the session store for real-time UI display.
         let requestID = UUID()
-        let isMainAgentShaped = sessionIdentity.flavor != nil && apiHandler.isMainAgentRequest(body: request.body)
         let sessionID = await sessionStore.beginRequest(
             identity: sessionIdentity,
             id: requestID,
-            body: request.body,
-            headers: request.headers,
-            model: model,
-            promptDescriptor: promptDescriptor,
-            isMainAgentShaped: isMainAgentShaped
+            model: model
         )
-        let supportsTrackedSession = ProxySessionID.supportsTrackedSession(sessionID)
-        let supportsKeepalive = apiFlavor.supportsKeepalive && supportsTrackedSession
+        let fingerprint = apiHandler.lineageFingerprint(from: request.body)
+        let normalizedMessages = apiHandler.normalizedLineageMessages(from: request.body)
+        let previousResponseID = apiHandler.previousResponseID(from: request.body)
         let loggedRequestID = await eventLogger?.logRequestStarted(
             session: sessionID,
             model: model,
@@ -143,37 +135,34 @@ final class ProxyForwarder: Sendable {
         )
         await sessionStore.recordBytesSent(request.body.count)
 
-        let errored: Bool
         if wantsStreaming {
-            errored = await forwardStreaming(
+            _ = await forwardStreaming(
                 urlRequest: urlRequest,
-                requestPath: request.path,
-                requestBody: request.body,
-                requestHeaders: request.headers,
                 writer: request.writer,
                 requestID: requestID,
                 sessionStore: sessionStore,
                 metrics: metrics,
                 sessionID: sessionID,
                 model: model,
-                supportsTrackedSession: supportsTrackedSession,
+                fingerprint: fingerprint,
+                normalizedMessages: normalizedMessages,
+                previousResponseID: previousResponseID,
                 requestLog: requestLog,
                 requestStartedAt: requestStartedAt,
                 loggedRequestID: loggedRequestID
             )
         } else {
-            errored = await forwardNonStreaming(
+            _ = await forwardNonStreaming(
                 urlRequest: urlRequest,
-                requestPath: request.path,
-                requestBody: request.body,
-                requestHeaders: request.headers,
                 writer: request.writer,
                 requestID: requestID,
                 sessionStore: sessionStore,
                 metrics: metrics,
                 sessionID: sessionID,
                 model: model,
-                supportsTrackedSession: supportsTrackedSession,
+                fingerprint: fingerprint,
+                normalizedMessages: normalizedMessages,
+                previousResponseID: previousResponseID,
                 requestLog: requestLog,
                 requestStartedAt: requestStartedAt,
                 loggedRequestID: loggedRequestID
@@ -185,64 +174,25 @@ final class ProxyForwarder: Sendable {
             metrics: metrics
         )
 
-        // Only Anthropic tracked sessions participate in lineage/keepalive.
-        if !errored && supportsKeepalive {
-            let lineageResult = await sessionStore.evaluateAndTrackLineage(
-                path: request.path,
-                body: request.body,
-                headers: request.headers,
-                model: model,
-                for: sessionID,
-                using: apiHandler
-            )
-
-            switch lineageResult {
-            case .tracked:
-                break
-            case .diverged(let reason):
-                await sessionStore.clearMainAgentFlag(requestID: requestID, sessionID: sessionID)
-                let shortSessionID = ProxySessionID.shortDisplayID(for: sessionID)
-                await eventLogger?.logKeepaliveDisabled(
-                    session: sessionID,
-                    reason: "lineage_diverged: \(reason)",
-                    failureCount: 0
-                )
-                await MainActor.run {
-                    NotificationService.shared.sendProxyKeepaliveDisabled(
-                        sessionID: shortSessionID,
-                        reason: reason
-                    )
-                }
-            case .ignored, .pendingIdentification, .alreadyDisabled:
-                if isMainAgentShaped {
-                    await sessionStore.clearMainAgentFlag(requestID: requestID, sessionID: sessionID)
-                }
-            }
-        }
-
-        let currentSessionID = await sessionStore.currentSessionID(for: sessionID)
-        await sessionStore.decrementInFlight(currentSessionID)
+        await sessionStore.decrementInFlight(sessionID)
     }
 
     private func forwardStreaming(
         urlRequest: URLRequest,
-        requestPath: String,
-        requestBody: Data,
-        requestHeaders: [(name: String, value: String)],
         writer: ResponseWriter,
         requestID: UUID,
         sessionStore: ProxySessionStore,
         metrics: ProxyMetricsStore,
         sessionID: String,
         model: String?,
-        supportsTrackedSession: Bool,
+        fingerprint: LineageFingerprint?,
+        normalizedMessages: [LineageTree.NormalizedMessage],
+        previousResponseID: String?,
         requestLog: ProxyEventLogger.LoggedRequest,
         requestStartedAt: Date,
         loggedRequestID: Int64?
     ) async -> Bool {
         do {
-            // Create a per-request streaming delegate and session so we receive
-            // natural TCP-segment-sized chunks instead of byte-by-byte iteration.
             let streamingDelegate = StreamingDelegate()
             streamingDelegate.onUploadProgress = { totalBytesSent in
                 Task {
@@ -265,7 +215,6 @@ final class ProxyForwarder: Sendable {
                                               delegateQueue: nil)
             defer { delegateSession.invalidateAndCancel() }
 
-            // Use uploadTask for reliable didSendBodyData progress callbacks.
             let bodyData = urlRequest.httpBody ?? Data()
             var uploadRequest = urlRequest
             uploadRequest.httpBody = nil
@@ -274,49 +223,44 @@ final class ProxyForwarder: Sendable {
 
             dataTask.resume()
 
-            // Track the upstream status code for event logging.
             var upstreamStatusCode = 0
             var capturedResponseHeaders: [(name: String, value: String)] = []
             let shouldCaptureResponseBody = eventLogger != nil
             var capturedResponseBody = Data()
             var capturedResponseBytes = 0
+            // Tail ring-buffer for terminal-signal parsing. Accumulates every
+            // chunk and trims back to `maxParseTailBytes` after each append so
+            // we always have the end of the stream even when the body exceeds
+            // `maxLoggedStreamingResponseBytes`.
+            var parseTailBuffer = Data()
 
-            // Wrap the entire streaming operation — including header wait — in a
-            // cancellation handler so the upstream task is cancelled if the client
-            // disconnects at any point (during header wait OR chunk streaming).
             try await withTaskCancellationHandler {
-                // Await the HTTP response headers.
                 let httpResponse = try await streamingDelegate.awaitResponse()
                 upstreamStatusCode = httpResponse.statusCode
                 capturedResponseHeaders = ProxyHTTPUtils.allHeaders(from: httpResponse)
 
-                // Write the head with upstream status and headers.
                 var responseHeaders = buildResponseHeaders(from: httpResponse, streaming: true)
-
-                // For streaming, use chunked transfer encoding to the client.
-                // Remove any content-length since we are chunking.
                 responseHeaders.removeAll(where: { $0.name.lowercased() == "content-length" })
-
-                // Ensure Transfer-Encoding: chunked is present.
                 if !responseHeaders.contains(where: { $0.name.lowercased() == "transfer-encoding" }) {
                     responseHeaders.append((name: "Transfer-Encoding", value: "chunked"))
                 }
 
                 writer.writeHead(status: httpResponse.statusCode, headers: responseHeaders)
-                // Headers received — transition to receiving state.
                 await sessionStore.markRequestReceiving(id: requestID)
-                if supportsTrackedSession, (200..<300).contains(httpResponse.statusCode) {
-                    await sessionStore.markAcceptedLineageRequestActive(
-                        id: requestID,
-                        path: requestPath,
-                        body: requestBody,
-                        headers: requestHeaders,
-                        for: sessionID,
-                        using: apiHandler
+
+                // On 2xx, attach this request to the lineage tree. We do it here
+                // (as headers arrive) per the design: the tree state reflects the
+                // fact that upstream accepted the request, independent of stream completion.
+                if (200..<300).contains(httpResponse.statusCode), let fingerprint {
+                    await sessionStore.attachToTree(
+                        requestID: requestID,
+                        sessionID: sessionID,
+                        fingerprint: fingerprint,
+                        messages: normalizedMessages,
+                        previousResponseID: previousResponseID
                     )
                 }
 
-                // Stream chunks through to the client.
                 for try await chunk in chunks {
                     try Task.checkCancellation()
                     await sessionStore.markFirstDataReceived(id: requestID)
@@ -329,6 +273,14 @@ final class ProxyForwarder: Sendable {
                             maxBytes: Self.maxLoggedStreamingResponseBytes
                         )
                     }
+                    // Tail ring buffer for terminal-signal parsing. Appended
+                    // unconditionally and trimmed so the tail never exceeds
+                    // ~2x `maxParseTailBytes` between appends.
+                    Self.appendToTail(
+                        chunk,
+                        to: &parseTailBuffer,
+                        capBytes: Self.maxParseTailBytes
+                    )
                     writer.writeChunk(chunk)
                 }
             } onCancel: {
@@ -345,40 +297,77 @@ final class ProxyForwarder: Sendable {
                 bodyBytes: capturedResponseBytes,
                 bodyTruncated: capturedResponseBytes > capturedResponseBody.count
             )
-            let tokenUsage = apiHandler.parseTokenUsage(from: capturedResponseBody, streaming: true)
-            let currentSessionID = await sessionStore.currentSessionID(forRequest: requestID, fallback: sessionID)
+            // Parse head + tail separately and merge.
+            //  - Head (`capturedResponseBody`, up to 4 MB from the start) carries
+            //    Anthropic's `message_start` — source of input/cache tokens.
+            //  - Tail (`parseTailBuffer`, last 64 KB) carries Anthropic's
+            //    `message_delta` / OpenAI's `response.completed` — source of the
+            //    terminal signal + output tokens.
+            let headUsage = apiHandler.parseTokenUsage(from: capturedResponseBody, streaming: true)
+            let tailUsage = apiHandler.parseTokenUsage(from: parseTailBuffer, streaming: true)
+            let tokenUsage = Self.mergeUsage(head: headUsage, tail: tailUsage)
+            let responseID = apiHandler.extractResponseID(from: capturedResponseBody, streaming: true)
+                ?? apiHandler.extractResponseID(from: parseTailBuffer, streaming: true)
             await metrics.recordTokenUsage(tokenUsage)
             await sessionStore.recordTokenUsage(
                 tokenUsage,
                 model: model,
-                for: currentSessionID,
+                for: sessionID,
                 apiFlavor: apiFlavor
             )
             let requestCost = ModelPricingTable.pricing(for: model).map { tokenUsage.cost(for: $0) }
             let isUpstreamError = upstreamStatusCode >= 400
-            await sessionStore.markRequestDone(id: requestID, errored: isUpstreamError, tokenUsage: tokenUsage, estimatedCost: requestCost)
-            let eventLogSessionID = await sessionStore.currentSessionID(for: sessionID)
-            await eventLogger?.logRequestCompleted(
-                requestID: loggedRequestID,
-                session: eventLogSessionID,
-                model: model,
-                request: requestLog,
-                response: responseLog,
-                durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
-                statusCode: upstreamStatusCode,
-                tokenUsage: tokenUsage,
-                errored: isUpstreamError
-            )
-            return isUpstreamError
+            let isIncomplete = !isUpstreamError && !apiHandler.isResponseComplete(tokenUsage)
+            let errored = isUpstreamError || isIncomplete
+            if !errored {
+                await sessionStore.markNodeDone(
+                    requestID: requestID,
+                    tokenUsage: tokenUsage,
+                    responseID: responseID
+                )
+            }
+            let lineageContext = await sessionStore.lineageContext(for: requestID)
+            await sessionStore.markRequestDone(id: requestID, errored: errored, tokenUsage: tokenUsage, estimatedCost: requestCost)
+            let errorString: String?
+            if isIncomplete {
+                errorString = "incomplete response (no terminal signal)"
+            } else {
+                errorString = nil
+            }
+            if let errorString {
+                await eventLogger?.logRequestFailed(
+                    requestID: loggedRequestID,
+                    session: sessionID,
+                    model: model,
+                    request: requestLog,
+                    response: responseLog,
+                    durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
+                    error: errorString,
+                    lineage: lineageContext
+                )
+            } else {
+                await eventLogger?.logRequestCompleted(
+                    requestID: loggedRequestID,
+                    session: sessionID,
+                    model: model,
+                    request: requestLog,
+                    response: responseLog,
+                    durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
+                    statusCode: upstreamStatusCode,
+                    tokenUsage: tokenUsage,
+                    errored: isUpstreamError,
+                    lineage: lineageContext,
+                    responseID: responseID
+                )
+            }
+            return errored
 
         } catch is CancellationError {
-            // Client disconnected — no error response needed.
             await sessionStore.markRequestDone(id: requestID, errored: true, tokenUsage: nil, estimatedCost: nil)
             ProxyLogger.log("Streaming request cancelled (client disconnect)")
-            let currentSessionID = await sessionStore.currentSessionID(for: sessionID)
             await eventLogger?.logRequestFailed(
                 requestID: loggedRequestID,
-                session: currentSessionID,
+                session: sessionID,
                 model: model,
                 request: requestLog,
                 response: nil,
@@ -393,10 +382,9 @@ final class ProxyForwarder: Sendable {
                 status: 502,
                 message: String(localized: "Bad Gateway: upstream error: \(error.localizedDescription)")
             )
-            let currentSessionID = await sessionStore.currentSessionID(for: sessionID)
             await eventLogger?.logRequestFailed(
                 requestID: loggedRequestID,
-                session: currentSessionID,
+                session: sessionID,
                 model: model,
                 request: requestLog,
                 response: response.loggedResponse,
@@ -412,22 +400,19 @@ final class ProxyForwarder: Sendable {
 
     private func forwardNonStreaming(
         urlRequest: URLRequest,
-        requestPath: String,
-        requestBody: Data,
-        requestHeaders: [(name: String, value: String)],
         writer: ResponseWriter,
         requestID: UUID,
         sessionStore: ProxySessionStore,
         metrics: ProxyMetricsStore,
         sessionID: String,
         model: String?,
-        supportsTrackedSession: Bool,
+        fingerprint: LineageFingerprint?,
+        normalizedMessages: [LineageTree.NormalizedMessage],
+        previousResponseID: String?,
         requestLog: ProxyEventLogger.LoggedRequest,
         requestStartedAt: Date,
         loggedRequestID: Int64?
     ) async -> Bool {
-        // Use the shared non-streaming session for TCP/TLS connection reuse.
-        // Per-task callbacks are routed through the multiplexing pool delegate.
         var errored = true
         let taskContext = NonStreamingPoolDelegate.TaskContext()
         taskContext.onUploadProgress = { totalBytesSent in
@@ -454,21 +439,19 @@ final class ProxyForwarder: Sendable {
             dataTask.resume()
 
             try await withTaskCancellationHandler {
-                // Await response headers — phase: .waiting -> .receiving
                 let httpResponse = try await taskContext.awaitResponse()
                 await sessionStore.markRequestReceiving(id: requestID)
-                if supportsTrackedSession, (200..<300).contains(httpResponse.statusCode) {
-                    await sessionStore.markAcceptedLineageRequestActive(
-                        id: requestID,
-                        path: requestPath,
-                        body: requestBody,
-                        headers: requestHeaders,
-                        for: sessionID,
-                        using: apiHandler
+
+                if (200..<300).contains(httpResponse.statusCode), let fingerprint {
+                    await sessionStore.attachToTree(
+                        requestID: requestID,
+                        sessionID: sessionID,
+                        fingerprint: fingerprint,
+                        messages: normalizedMessages,
+                        previousResponseID: previousResponseID
                     )
                 }
 
-                // Accumulate all response body chunks.
                 var responseData = Data()
                 for try await chunk in taskContext.chunkStream {
                     await sessionStore.markFirstDataReceived(id: requestID)
@@ -476,7 +459,6 @@ final class ProxyForwarder: Sendable {
                     await sessionStore.updateRequestBytes(id: requestID, additionalBytes: chunk.count)
                 }
 
-                // Write complete response to client.
                 var responseHeaders = buildResponseHeaders(from: httpResponse, streaming: false)
                 responseHeaders.append((name: "Content-Length", value: "\(responseData.count)"))
 
@@ -488,36 +470,60 @@ final class ProxyForwarder: Sendable {
                 await metrics.recordForwarded()
 
                 let tokenUsage = apiHandler.parseTokenUsage(from: responseData, streaming: false)
-                let currentSessionID = await sessionStore.currentSessionID(forRequest: requestID, fallback: sessionID)
+                let responseID = apiHandler.extractResponseID(from: responseData, streaming: false)
                 await metrics.recordTokenUsage(tokenUsage)
                 await sessionStore.recordTokenUsage(
                     tokenUsage,
                     model: model,
-                    for: currentSessionID,
+                    for: sessionID,
                     apiFlavor: apiFlavor
                 )
                 let requestCost = ModelPricingTable.pricing(for: model).map { tokenUsage.cost(for: $0) }
                 let isUpstreamError = httpResponse.statusCode >= 400
-                errored = isUpstreamError
-                await sessionStore.markRequestDone(id: requestID, errored: isUpstreamError, tokenUsage: tokenUsage, estimatedCost: requestCost)
-                let eventLogSessionID = await sessionStore.currentSessionID(for: sessionID)
+                let isIncomplete = !isUpstreamError && !apiHandler.isResponseComplete(tokenUsage)
+                let requestErrored = isUpstreamError || isIncomplete
+                errored = requestErrored
+                if !requestErrored {
+                    await sessionStore.markNodeDone(
+                        requestID: requestID,
+                        tokenUsage: tokenUsage,
+                        responseID: responseID
+                    )
+                }
+                let lineageContext = await sessionStore.lineageContext(for: requestID)
+                await sessionStore.markRequestDone(id: requestID, errored: requestErrored, tokenUsage: tokenUsage, estimatedCost: requestCost)
                 let responseLog = ProxyEventLogger.LoggedResponse(
                     statusCode: httpResponse.statusCode,
                     headers: ProxyHTTPUtils.allHeaders(from: httpResponse),
                     body: responseData,
                     source: "upstream"
                 )
-                await eventLogger?.logRequestCompleted(
-                    requestID: loggedRequestID,
-                    session: eventLogSessionID,
-                    model: model,
-                    request: requestLog,
-                    response: responseLog,
-                    durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
-                    statusCode: httpResponse.statusCode,
-                    tokenUsage: tokenUsage,
-                    errored: isUpstreamError
-                )
+                if isIncomplete {
+                    await eventLogger?.logRequestFailed(
+                        requestID: loggedRequestID,
+                        session: sessionID,
+                        model: model,
+                        request: requestLog,
+                        response: responseLog,
+                        durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
+                        error: "incomplete response (no terminal signal)",
+                        lineage: lineageContext
+                    )
+                } else {
+                    await eventLogger?.logRequestCompleted(
+                        requestID: loggedRequestID,
+                        session: sessionID,
+                        model: model,
+                        request: requestLog,
+                        response: responseLog,
+                        durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
+                        statusCode: httpResponse.statusCode,
+                        tokenUsage: tokenUsage,
+                        errored: isUpstreamError,
+                        lineage: lineageContext,
+                        responseID: responseID
+                    )
+                }
             } onCancel: {
                 dataTask.cancel()
             }
@@ -525,10 +531,9 @@ final class ProxyForwarder: Sendable {
         } catch is CancellationError {
             await sessionStore.markRequestDone(id: requestID, errored: true, tokenUsage: nil, estimatedCost: nil)
             ProxyLogger.log("Non-streaming request cancelled (client disconnect)")
-            let currentSessionID = await sessionStore.currentSessionID(for: sessionID)
             await eventLogger?.logRequestFailed(
                 requestID: loggedRequestID,
-                session: currentSessionID,
+                session: sessionID,
                 model: model,
                 request: requestLog,
                 response: nil,
@@ -542,10 +547,9 @@ final class ProxyForwarder: Sendable {
                 status: 502,
                 message: String(localized: "Bad Gateway: upstream error: \(error.localizedDescription)")
             )
-            let currentSessionID = await sessionStore.currentSessionID(for: sessionID)
             await eventLogger?.logRequestFailed(
                 requestID: loggedRequestID,
-                session: currentSessionID,
+                session: sessionID,
                 model: model,
                 request: requestLog,
                 response: response.loggedResponse,
@@ -561,7 +565,6 @@ final class ProxyForwarder: Sendable {
 
     // MARK: - Helpers
 
-    /// Build response headers from the upstream HTTPURLResponse, filtering hop-by-hop headers.
     private func buildResponseHeaders(
         from response: HTTPURLResponse,
         streaming: Bool
@@ -582,7 +585,6 @@ final class ProxyForwarder: Sendable {
         return headers
     }
 
-    /// Send a proxy-generated error response to the client.
     private func writeErrorToClient(
         writer: ResponseWriter,
         response: (headers: [(name: String, value: String)], body: Data, loggedResponse: ProxyEventLogger.LoggedResponse)
@@ -621,7 +623,31 @@ final class ProxyForwarder: Sendable {
         }
     }
 
-    /// Write an atomic status snapshot via the event logger.
+    /// Append `chunk` to a tail ring buffer, trimming back to `capBytes` when
+    /// the buffer would exceed 2× the cap. The 2× slack avoids reallocating on
+    /// every chunk for a long stream.
+    private static func appendToTail(_ chunk: Data, to tail: inout Data, capBytes: Int) {
+        tail.append(chunk)
+        if tail.count > capBytes * 2 {
+            tail = tail.suffix(capBytes)
+        }
+    }
+
+    /// Merge usage parsed from the head (start-of-stream `message_start`) and
+    /// the tail (end-of-stream `message_delta` / `response.completed`) so both
+    /// input- and output-side counts survive even when the body exceeds the
+    /// logging capture cap.
+    private static func mergeUsage(head: TokenUsage, tail: TokenUsage) -> TokenUsage {
+        TokenUsage(
+            inputTokens: head.inputTokens ?? tail.inputTokens,
+            outputTokens: tail.outputTokens ?? head.outputTokens,
+            cacheReadInputTokens: head.cacheReadInputTokens ?? tail.cacheReadInputTokens,
+            cacheCreationInputTokens: head.cacheCreationInputTokens ?? tail.cacheCreationInputTokens,
+            inputTokensIncludeCacheReads: head.inputTokensIncludeCacheReads || tail.inputTokensIncludeCacheReads,
+            stopReason: tail.stopReason ?? head.stopReason
+        )
+    }
+
     private func writeStatusSnapshot(
         sessionStore: ProxySessionStore,
         metrics: ProxyMetricsStore
@@ -633,7 +659,6 @@ final class ProxyForwarder: Sendable {
             enabled: true,
             port: proxyPort,
             activeSessions: activeSessions,
-            activeKeepalives: 0,
             metrics: snapshot
         )
     }
@@ -641,19 +666,9 @@ final class ProxyForwarder: Sendable {
 
 // MARK: - StreamingDelegate
 
-/// A `URLSessionDataDelegate` that receives upstream chunks in natural TCP segment
-/// sizes and pipes them through an `AsyncStream<Data>`. This avoids the byte-by-byte
-/// overhead of `URLSession.AsyncBytes` for SSE passthrough.
-///
-/// The delegate uses a lock to safely bridge between the URLSession delegate queue
-/// callbacks and the async consumer. The response is delivered via a one-element
-/// `AsyncStream<Result<HTTPURLResponse, Error>>`.
 private final class StreamingDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
 
-    /// Called on each upload progress report with cumulative bytes sent.
     var onUploadProgress: (@Sendable (_ totalBytesSent: Int64) -> Void)?
-
-    /// Called once when the upload finishes (totalBytesSent == totalBytesExpectedToSend).
     var onUploadComplete: (@Sendable () -> Void)?
 
     private let chunkContinuation: AsyncThrowingStream<Data, Error>.Continuation
@@ -674,8 +689,6 @@ private final class StreamingDelegate: NSObject, URLSessionDataDelegate, @unchec
         super.init()
     }
 
-    /// Await the HTTP response from the delegate. Returns `nil` if the stream
-    /// ends without delivering a response (e.g. task was cancelled before headers).
     func awaitResponse() async throws -> HTTPURLResponse {
         for await result in responseStream {
             switch result {
@@ -687,8 +700,6 @@ private final class StreamingDelegate: NSObject, URLSessionDataDelegate, @unchec
         }
         throw ProxyStreamingError.noResponse
     }
-
-    // MARK: - URLSessionDataDelegate
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
                     didReceive response: URLResponse,
@@ -718,11 +729,8 @@ private final class StreamingDelegate: NSObject, URLSessionDataDelegate, @unchec
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         if let error {
-            // If response was never delivered (connection failed before headers),
-            // send the error through the response stream.
             responseContinuation.yield(.failure(error))
             responseContinuation.finish()
-            // Also propagate through chunk stream so mid-body failures are caught.
             chunkContinuation.finish(throwing: error)
         } else {
             chunkContinuation.finish()
@@ -732,13 +740,8 @@ private final class StreamingDelegate: NSObject, URLSessionDataDelegate, @unchec
 
 // MARK: - NonStreamingPoolDelegate
 
-/// Multiplexing delegate for non-streaming requests. Routes URLSession callbacks
-/// by task identifier so a single long-lived session can serve all non-streaming
-/// requests, preserving TCP/TLS and HTTP/2 connection reuse.
 private final class NonStreamingPoolDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
 
-    /// Per-task async streams and callbacks, mirroring `StreamingDelegate` but
-    /// keyed by `taskIdentifier` for multiplexed use on a shared session.
     final class TaskContext: @unchecked Sendable {
         var onUploadProgress: (@Sendable (_ totalBytesSent: Int64) -> Void)?
         var onUploadComplete: (@Sendable () -> Void)?
@@ -807,8 +810,6 @@ private final class NonStreamingPoolDelegate: NSObject, URLSessionDataDelegate, 
         lock.withLock { contexts[task.taskIdentifier] }
     }
 
-    // MARK: - URLSessionDataDelegate
-
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
                     didReceive response: URLResponse,
                     completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void) {
@@ -844,7 +845,6 @@ private final class NonStreamingPoolDelegate: NSObject, URLSessionDataDelegate, 
     }
 }
 
-/// Errors specific to the streaming delegate flow.
 private enum ProxyStreamingError: Error, LocalizedError {
     case nonHTTPResponse
     case noResponse

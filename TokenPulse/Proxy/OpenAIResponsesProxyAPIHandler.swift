@@ -1,7 +1,7 @@
 import Foundation
 
 struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
-    let keepaliveRequestPath = "/v1/responses"
+    let flavor: ProxyAPIFlavor = .openAIResponses
 
     func acceptsRequest(method: String, path: String) -> Bool {
         method.uppercased() == "POST"
@@ -12,8 +12,16 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
         requestPath
     }
 
+    /// Codex traffic carries `session_id` + matching `x-codex-window-id`.
+    /// Sub-agents add `x-codex-parent-thread-id`, but with the lineage tree in
+    /// place we no longer collapse threads server-side — the tree groups by
+    /// fingerprint. We retain the session ID only for UI grouping.
     func sessionIdentity(for request: ProxyHTTPRequest) -> ProxySessionIdentity {
-        codexSessionIdentity(for: request) ?? .other
+        guard let sessionID = normalizedHeaderValue("session_id", in: request),
+              windowHeaderMatchesSessionID(request, sessionID: sessionID) else {
+            return .other
+        }
+        return .tracked(rawSessionID: sessionID, flavor: .openAIResponses)
     }
 
     func extractModel(from body: Data) -> String? {
@@ -24,24 +32,23 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
         (jsonObject(from: body)?["stream"] as? Bool) ?? false
     }
 
-    func promptDescriptor(from body: Data) -> String? {
-        nil
-    }
-
-    func isMainAgentRequest(body: Data) -> Bool {
-        false
-    }
-
     func lineageFingerprint(from body: Data) -> LineageFingerprint? {
-        nil
+        ProxyRequestBody.lineageFingerprint(from: body, flavor: flavor)
     }
 
-    func messagesDescriptor(from body: Data) -> String? {
-        nil
+    func normalizedLineageMessages(from body: Data) -> [LineageTree.NormalizedMessage] {
+        ProxyRequestBody.normalizedLineageMessages(from: body, flavor: flavor)
     }
 
-    func buildKeepaliveBody(from body: Data) -> Data? {
-        nil
+    func previousResponseID(from body: Data) -> String? {
+        ProxyRequestBody.previousResponseID(from: body)
+    }
+
+    func extractResponseID(from data: Data, streaming: Bool) -> String? {
+        if streaming {
+            return extractResponseIDFromStreaming(data)
+        }
+        return (jsonObject(from: data)?["id"] as? String)
     }
 
     func parseTokenUsage(from data: Data, streaming: Bool) -> TokenUsage {
@@ -49,6 +56,13 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
             return parseTokenUsageFromStreaming(data)
         }
         return parseTokenUsageFromJSON(data)
+    }
+
+    func isResponseComplete(_ usage: TokenUsage) -> Bool {
+        // `response.completed` carries `status == "completed"`. `status == "incomplete"`
+        // means upstream stopped early (e.g. hit max_output_tokens) and the turn is
+        // partial — treat as incomplete. Missing status = malformed response.
+        usage.stopReason == "completed"
     }
 
     func proxyErrorBody(message: String) -> Data {
@@ -64,23 +78,6 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
 
     private func jsonObject(from body: Data) -> [String: Any]? {
         try? JSONSerialization.jsonObject(with: body) as? [String: Any]
-    }
-
-    /// Local Codex traffic consistently carries `session_id` (thread ID) plus
-    /// `x-codex-window-id`, and subagents add `x-codex-parent-thread-id`.
-    /// We use that header trio to identify Codex sessions and let the session
-    /// store collapse child threads into the root Codex session.
-    private func codexSessionIdentity(for request: ProxyHTTPRequest) -> ProxySessionIdentity? {
-        guard let sessionID = normalizedHeaderValue("session_id", in: request),
-              windowHeaderMatchesSessionID(request, sessionID: sessionID) else {
-            return nil
-        }
-
-        return .tracked(
-            rawSessionID: sessionID,
-            flavor: .openAIResponses,
-            parentRawSessionID: normalizedHeaderValue("x-codex-parent-thread-id", in: request)
-        )
     }
 
     private func normalizedHeaderValue(_ name: String, in request: ProxyHTTPRequest) -> String? {
@@ -105,6 +102,7 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
         let generation = String(windowID[windowID.index(after: separator)...])
         return rawSessionID == sessionID && UInt64(generation) != nil
     }
+
     private func parseTokenUsageFromJSON(_ data: Data) -> TokenUsage {
         guard let json = jsonObject(from: data) else { return .empty }
         return parseUsage(from: json["usage"] as? [String: Any], stopReason: json["status"] as? String)
@@ -137,6 +135,27 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
         }
 
         return finalUsage
+    }
+
+    private func extractResponseIDFromStreaming(_ data: Data) -> String? {
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        var result: String?
+        text.enumerateLines { line, stop in
+            guard line.hasPrefix("data: ") else { return }
+            let payload = line.dropFirst(6)
+            guard payload != "[DONE]",
+                  let lineData = payload.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                  let type = json["type"] as? String,
+                  type == "response.completed" || type == "response.incomplete",
+                  let response = json["response"] as? [String: Any],
+                  let id = response["id"] as? String else {
+                return
+            }
+            result = id
+            stop = true
+        }
+        return result
     }
 
     private func parseUsage(from usage: [String: Any]?, stopReason: String?) -> TokenUsage {

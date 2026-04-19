@@ -47,6 +47,7 @@ ditto "$(xcodebuild -scheme TokenPulse -configuration Release -showBuildSettings
 - Notifications fire when 5-hour utilization crosses 50% or 80%, and when quota windows reset, with jitter filtering.
 - File I/O for config and usage export must use `.atomic` writes.
 - Proxy must listen on `127.0.0.1` only, never all interfaces.
-- Keepalive send is manual-only in the current implementation. No background keepalive loops.
-- Event logging uses SQLite with WAL mode and 24-hour retention.
-- Proxy status snapshots are written whenever proxy logging infrastructure is enabled (currently if either `saveProxyEventLog` or `saveProxyPayloads` is enabled) and should stay throttled.
+- Keep-alive is not currently implemented; the UI and wire protocol reserve no space for it. Deferred as future work.
+- Proxy lineage tracking is universal across supported providers (Anthropic Messages, OpenAI Responses). Every 2xx response attaches its request to an in-memory `LineageTree`; nodes are never re-parented, `done == false` nodes are always leaves, and inactive leaves prune after 24 hours.
+- Event logging uses SQLite with WAL mode and 24-hour retention. A single `saveProxyEventLog` toggle controls all logging (metadata + deduplicated payloads); there is no separate payload-capture opt-in.
+- Proxy status snapshots are written whenever `saveProxyEventLog` is true and should stay throttled.

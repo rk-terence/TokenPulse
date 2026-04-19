@@ -8,7 +8,7 @@ enum TrafficDirection: Sendable {
     case download
 }
 
-enum ProxyAPIFlavor: String, CaseIterable, Identifiable, Sendable {
+enum ProxyAPIFlavor: String, CaseIterable, Identifiable, Sendable, Codable {
     case anthropicMessages
     case openAIResponses
 
@@ -38,15 +38,6 @@ enum ProxyAPIFlavor: String, CaseIterable, Identifiable, Sendable {
             return String(localized: "Claude Code")
         case .openAIResponses:
             return String(localized: "Codex")
-        }
-    }
-
-    var supportsKeepalive: Bool {
-        switch self {
-        case .anthropicMessages:
-            return true
-        case .openAIResponses:
-            return false
         }
     }
 
@@ -94,35 +85,13 @@ enum ProxySessionID {
         flavor(for: sessionID) != nil
     }
 
-    static func usesShortRetentionWindow(for sessionID: String, lineageEstablished: Bool) -> Bool {
-        guard !isOther(sessionID) else {
+    /// Sessions that the lineage tree tracks get the longer retention window.
+    /// Untracked ("other") traffic uses the short window.
+    static func usesShortRetentionWindow(for sessionID: String) -> Bool {
+        if isOther(sessionID) {
             return true
         }
-        guard let flavor = flavor(for: sessionID) else {
-            return true
-        }
-        if !flavor.supportsKeepalive {
-            return false
-        }
-        return !lineageEstablished
-    }
-
-    static func usesShortDoneRequestRetentionWindow(
-        for sessionID: String,
-        lineageEstablished: Bool
-    ) -> Bool {
-        guard !isOther(sessionID) else {
-            return true
-        }
-        guard let flavor = flavor(for: sessionID) else {
-            return true
-        }
-        switch flavor {
-        case .openAIResponses:
-            return true
-        case .anthropicMessages:
-            return !lineageEstablished
-        }
+        return flavor(for: sessionID) == nil
     }
 
     static func displayID(for sessionID: String) -> String {
@@ -187,14 +156,6 @@ struct ProxySessionIdentity: Sendable {
     }
 }
 
-// MARK: - Keepalive mode
-
-enum KeepaliveMode: String, Sendable, CaseIterable {
-    case off
-    case manual
-    // case auto  // future — not implemented
-}
-
 // MARK: - Lightweight model for the proxy passthrough
 
 /// For Phase 1 passthrough, we store the raw body as Data and only extract
@@ -216,113 +177,28 @@ enum ProxyRequestBody {
         jsonObject(from: body)?["model"] as? String
     }
 
-    /// Build a stable prompt descriptor used for completed-request replacement.
-    /// We include the Anthropic prompt-shaping fields and preserve message order
-    /// so a later superset prompt contains the earlier prompt as a substring.
-    static func promptDescriptor(from body: Data) -> String? {
-        guard let json = jsonObject(from: body) else {
-            return nil
-        }
-
-        var lines: [String] = []
-        appendCanonicalLine(label: "system", value: normalizedValue(normalizedSystemPrompt(json["system"])), to: &lines)
-        appendCanonicalLine(label: "tools", value: normalizedValue(json["tools"]), to: &lines)
-        appendCanonicalLine(label: "tool_choice", value: normalizedValue(json["tool_choice"]), to: &lines)
-        appendCanonicalLine(label: "thinking", value: normalizedValue(json["thinking"]), to: &lines)
-
-        if let messages = json["messages"] as? [Any] {
-            for message in messages {
-                appendCanonicalLine(label: "message", value: normalizedValue(message), to: &lines)
-            }
-        }
-
-        guard !lines.isEmpty else {
-            return nil
-        }
-        return lines.joined(separator: "\n")
-    }
-
     // MARK: - Lineage extraction
 
-    /// Whether the request body has a non-empty `tools` array.
-    static func hasTools(from body: Data) -> Bool {
+    /// Build a `LineageFingerprint` from a request body. Returns nil only when
+    /// the body lacks a `model` field — all other cache-key fields are optional.
+    static func lineageFingerprint(from body: Data, flavor: ProxyAPIFlavor) -> LineageFingerprint? {
         guard let json = jsonObject(from: body),
-              let tools = json["tools"] as? [Any] else {
-            return false
-        }
-        return !tools.isEmpty
-    }
-
-    /// Whether the request body has `output_config.format.type == "json_schema"`.
-    static func hasJSONSchemaOutputConfig(from body: Data) -> Bool {
-        guard let json = jsonObject(from: body),
-              let outputConfig = json["output_config"] as? [String: Any],
-              let format = outputConfig["format"] as? [String: Any],
-              let type = format["type"] as? String else {
-            return false
-        }
-        return type == "json_schema"
-    }
-
-    /// Extract the `thinking.type` string ("enabled", "disabled", or "adaptive").
-    static func thinkingType(from body: Data) -> String? {
-        guard let json = jsonObject(from: body),
-              let thinking = json["thinking"] as? [String: Any] else {
+              let model = json["model"] as? String else {
             return nil
         }
-        return thinking["type"] as? String
-    }
-
-    /// Canonical string of the `tools` array for fingerprint comparison.
-    static func toolsCanonical(from body: Data) -> String? {
-        guard let json = jsonObject(from: body),
-              let tools = json["tools"] as? [Any],
-              !tools.isEmpty else {
-            return nil
-        }
-        return canonicalString(for: tools)
-    }
-
-    /// Canonical string of the `tool_choice` field for fingerprint comparison.
-    static func toolChoiceCanonical(from body: Data) -> String? {
-        guard let json = jsonObject(from: body),
-              let toolChoice = json["tool_choice"] else {
-            return nil
-        }
-        return canonicalString(for: toolChoice)
-    }
-
-    /// Build a canonical descriptor of just the messages array for append-only checks.
-    /// Each message becomes a `message:<canonical>` line, joined by newlines.
-    static func messagesDescriptor(from body: Data) -> String? {
-        guard let json = jsonObject(from: body),
-              let messages = json["messages"] as? [Any],
-              !messages.isEmpty else {
-            return nil
-        }
-        var lines: [String] = []
-        for message in messages {
-            appendCanonicalLine(label: "message", value: normalizedValue(message), to: &lines)
-        }
-        return lines.isEmpty ? nil : lines.joined(separator: "\n")
-    }
-
-    /// Build a `LineageFingerprint` from a request body. Returns nil if model or tools
-    /// are missing (the request is not main-agent-shaped).
-    /// Includes all cache-key-relevant fields: model, system, tools, tool_choice, thinking.
-    static func lineageFingerprint(from body: Data) -> LineageFingerprint? {
-        guard let json = jsonObject(from: body),
-              let model = json["model"] as? String,
-              let tools = json["tools"] as? [Any],
-              !tools.isEmpty,
-              let toolsStr = canonicalString(for: tools) else {
-            return nil
-        }
+        let systemKey = (flavor == .openAIResponses) ? "instructions" : "system"
+        let thinkingKey = (flavor == .openAIResponses) ? "reasoning" : "thinking"
         let systemStr: String?
-        if let sys = normalizedSystemPrompt(json["system"]) {
+        if let sys = normalizedSystemPrompt(json[systemKey]) {
             systemStr = canonicalString(for: sys)
         } else {
             systemStr = nil
+        }
+        let toolsStr: String?
+        if let tools = json["tools"] as? [Any], !tools.isEmpty {
+            toolsStr = canonicalString(for: tools)
+        } else {
+            toolsStr = nil
         }
         let toolChoiceStr: String?
         if let tc = json["tool_choice"] {
@@ -331,18 +207,63 @@ enum ProxyRequestBody {
             toolChoiceStr = nil
         }
         let thinkingStr: String?
-        if let thinking = json["thinking"] {
+        if let thinking = json[thinkingKey] {
             thinkingStr = canonicalString(for: thinking)
         } else {
             thinkingStr = nil
         }
         return LineageFingerprint(
+            flavor: flavor,
             model: model,
             systemCanonical: systemStr,
             toolsCanonical: toolsStr,
             toolChoiceCanonical: toolChoiceStr,
             thinkingCanonical: thinkingStr
         )
+    }
+
+    /// Extract the normalized messages list (for Anthropic) or input list (for OpenAI Responses).
+    /// Returns an empty array when neither field is present (e.g. OpenAI using `previous_response_id` alone).
+    static func normalizedLineageMessages(
+        from body: Data,
+        flavor: ProxyAPIFlavor
+    ) -> [LineageTree.NormalizedMessage] {
+        guard let json = jsonObject(from: body) else { return [] }
+        let field = (flavor == .openAIResponses) ? "input" : "messages"
+        // OpenAI's `input` may be a string OR an array; Anthropic's `messages` is always an array.
+        if let rawArray = json[field] as? [Any] {
+            return normalizedLineageMessages(from: rawArray)
+        }
+        if flavor == .openAIResponses, let rawString = json[field] as? String {
+            // Promote a bare string to a synthetic single-user-message array.
+            let promoted: [[String: Any]] = [["role": "user", "content": rawString]]
+            return normalizedLineageMessages(from: promoted)
+        }
+        return []
+    }
+
+    /// Extract `previous_response_id` from an OpenAI Responses request body.
+    static func previousResponseID(from body: Data) -> String? {
+        guard let json = jsonObject(from: body) else { return nil }
+        return json["previous_response_id"] as? String
+    }
+
+    private static func normalizedLineageMessages(from rawArray: [Any]) -> [LineageTree.NormalizedMessage] {
+        var result: [LineageTree.NormalizedMessage] = []
+        result.reserveCapacity(rawArray.count)
+        for element in rawArray {
+            guard let normalized = normalizedValue(element) as? [String: Any],
+                  let role = normalized["role"] as? String else { continue }
+            let canonical = canonicalString(for: normalized) ?? ""
+            let contentHash = LineageHash.sha256Hex(canonical)
+            let rawJSON = (try? JSONSerialization.data(withJSONObject: normalized, options: [.sortedKeys])) ?? Data()
+            result.append(LineageTree.NormalizedMessage(
+                role: role,
+                contentHash: contentHash,
+                rawJSON: rawJSON
+            ))
+        }
+        return result
     }
 
     private static func jsonObject(from body: Data) -> [String: Any]? {
@@ -494,19 +415,35 @@ enum ProxyRequestBody {
 
 // MARK: - Lineage fingerprint
 
-/// Captures the cache-identity-relevant "shape" of a main-agent request.
-/// Two requests with different fingerprints cannot share an upstream prompt cache.
-/// Includes all fields that contribute to the Anthropic cache key.
-struct LineageFingerprint: Sendable, Equatable {
+/// Captures the cache-identity-relevant "shape" of a proxied request.
+/// Two requests with different fingerprints cannot share an upstream prompt cache
+/// and therefore live in different conversations of the lineage tree.
+struct LineageFingerprint: Sendable, Equatable, Codable {
+    let flavor: ProxyAPIFlavor
     let model: String
-    /// Canonical string of the normalized system prompt (nil when absent).
+    /// Canonical string of the normalized system prompt / instructions (nil when absent).
     let systemCanonical: String?
-    /// Canonical string representation of the `tools` array.
-    let toolsCanonical: String
+    /// Canonical string representation of the `tools` array (nil when absent).
+    let toolsCanonical: String?
     /// Canonical string representation of `tool_choice` (nil when absent).
     let toolChoiceCanonical: String?
-    /// Canonical string of the full `thinking` object (nil when absent).
+    /// Canonical string of the full `thinking` / `reasoning` object (nil when absent).
     let thinkingCanonical: String?
+
+    /// Derive the tree `ConversationKey` for this fingerprint.
+    var conversationKey: LineageTree.ConversationKey {
+        let canonical = [
+            "model:\(model)",
+            "system:\(systemCanonical ?? "")",
+            "tools:\(toolsCanonical ?? "")",
+            "tool_choice:\(toolChoiceCanonical ?? "")",
+            "thinking:\(thinkingCanonical ?? "")",
+        ].joined(separator: "\n")
+        return LineageTree.ConversationKey(
+            flavor: flavor,
+            fingerprintHash: LineageHash.sha256Hex(canonical)
+        )
+    }
 }
 
 // MARK: - HTTP primitives used by the proxy server
@@ -526,41 +463,11 @@ struct ProxyHTTPRequest: Sendable {
     }
 }
 
-// MARK: - Keepalive request builder
-
-/// Transforms a stored request body into a keepalive variant, preserving all
-/// cache-identity-relevant fields (system, messages, tools, tool_choice,
-/// cache_control, thinking config). Only `max_tokens` and `stream` are changed.
-enum KeepaliveRequestBuilder {
-
-    /// Build a keepalive request body from a stored real request body.
-    /// Preserves all cache-key-relevant fields including `thinking`.
-    /// When thinking is enabled, `max_tokens` must exceed `budget_tokens`,
-    /// so we set it to `budget_tokens + 1`. Otherwise `max_tokens` is 1.
-    /// Returns nil if the body cannot be parsed as JSON.
-    static func build(from originalBody: Data) -> Data? {
-        guard var json = try? JSONSerialization.jsonObject(with: originalBody) as? [String: Any] else {
-            return nil
-        }
-        json["stream"] = false
-
-        if let thinking = json["thinking"] as? [String: Any],
-           let budgetTokens = thinking["budget_tokens"] as? Int {
-            json["max_tokens"] = budgetTokens + 1
-        } else {
-            json["max_tokens"] = 1
-        }
-
-        return try? JSONSerialization.data(withJSONObject: json)
-    }
-}
-
 // MARK: - Real-time request activity
 
 /// The source of a request shown in the proxy activity UI.
 enum ProxyRequestKind: Sendable {
     case request
-    case keepalive
 }
 
 /// The state of an in-flight proxy request as seen by the UI.
@@ -582,12 +489,12 @@ struct ProxyRequestActivity: Sendable, Identifiable {
     var state: ProxyRequestState
     /// Model ID from the request body, used for done-request replacement matching.
     let modelID: String?
-    /// Stable prompt descriptor built from prompt-shaping fields in the request body.
-    let promptDescriptor: String?
-    /// Whether this request matches the tracked Anthropic main-agent shape.
-    /// Tracked-session main-agent done requests persist for the session lifetime;
-    /// non-session traffic expires on the short retention timer.
-    var isMainAgentShaped: Bool
+    /// Lineage tree node location: conversation this request belongs to (nil when unclassified).
+    var conversationID: UUID?
+    /// Lineage tree segment the request's tail lands in.
+    var segmentID: UUID?
+    /// Inclusive index into the segment's messages array.
+    var tailIndex: Int?
     /// Cumulative bytes sent to upstream so far.
     var bytesSent: Int
     /// Cumulative bytes received from upstream so far.
@@ -606,6 +513,10 @@ struct ProxyRequestActivity: Sendable, Identifiable {
     var tokenUsage: TokenUsage?
     /// Estimated cost (USD) for this single request, populated when state transitions to `.done`.
     var estimatedCost: Double?
+    /// True when this activity is rendered as a done-tree leaf, but a newer
+    /// descendant (still `done=false`) exists. The UI dims such rows because
+    /// they are about to be replaced once the descendant completes.
+    var isPendingReplacement: Bool = false
 
     /// Total prompt tokens for display. Some providers report cache-read tokens as a
     /// subset of input tokens, while others report them separately.
@@ -618,7 +529,6 @@ struct ProxyRequestActivity: Sendable, Identifiable {
         return total > 0 ? total : nil
     }
 
-    var isKeepalive: Bool { kind == .keepalive }
 }
 
 // MARK: - Token usage
@@ -753,12 +663,6 @@ enum ProxyHTTPUtils {
         }
     }
 
-    /// Legacy wrapper for callers that only need cache metrics (e.g. KeepaliveManager).
-    static func parseCacheMetrics(from data: Data) -> (cacheReadTokens: Int?, cacheCreationTokens: Int?) {
-        let usage = parseTokenUsage(from: data, streaming: false)
-        return (usage.cacheReadInputTokens, usage.cacheCreationInputTokens)
-    }
-
     // MARK: - Non-streaming JSON parsing
 
     private static func parseTokenUsageFromJSON(_ data: Data) -> TokenUsage {
@@ -834,6 +738,35 @@ enum ProxyHTTPUtils {
             inputTokensIncludeCacheReads: false,
             stopReason: stopReason
         )
+    }
+
+    /// Extract the Anthropic `message.id` from a captured response body.
+    /// Returns nil when the body doesn't contain a recognized id field.
+    static func extractAnthropicMessageID(from data: Data, streaming: Bool) -> String? {
+        if !streaming {
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return nil
+            }
+            return json["id"] as? String
+        }
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        var result: String?
+        text.enumerateLines { line, stop in
+            guard line.hasPrefix("data: ") else { return }
+            let payload = line.dropFirst(6)
+            guard payload != "[DONE]",
+                  let lineData = payload.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                  let type = json["type"] as? String,
+                  type == "message_start",
+                  let message = json["message"] as? [String: Any],
+                  let id = message["id"] as? String else {
+                return
+            }
+            result = id
+            stop = true
+        }
+        return result
     }
 
     /// Extract all headers from an HTTPURLResponse as name/value tuples.

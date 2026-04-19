@@ -10,6 +10,12 @@ actor ProxyEventLogger {
     private static let maxEventAge: TimeInterval = 24 * 60 * 60
     private static let pruneInterval: TimeInterval = 5 * 60
     private static let statusSnapshotThrottleInterval: TimeInterval = 1
+    /// Bump when adding columns/tables that require an incompatible rewrite.
+    /// On mismatch the whole database is dropped (24h retention means no meaningful loss).
+    /// v4: proxy_request_content.request_json renamed to request_extras_json; body
+    /// now stores only per-request extras + refs to conversation/segment, so
+    /// system/tools/tool_choice/thinking/messages are deduplicated across requests.
+    private static let currentSchemaVersion: Int = 4
 
     struct LoggedRequest: Sendable {
         let method: String
@@ -18,6 +24,37 @@ actor ProxyEventLogger {
         let headers: [(name: String, value: String)]
         let body: Data
         let streaming: Bool
+    }
+
+    /// Lineage-tree context associated with a request. Supplied by callers so we can
+    /// write the conversation/segment/node pointer into `proxy_requests` and substitute
+    /// the heavy `messages` field in the body with a compact reference.
+    struct LineageContext: Sendable {
+        let conversationID: UUID
+        let segmentID: UUID
+        let tailIndex: Int
+        let previousResponseID: String?
+        let fingerprintHash: String
+        /// Full fingerprint serialized so the conversations table can rematerialize
+        /// model / system / tools / thinking without re-parsing every request body.
+        let fingerprint: LineageFingerprint
+        let flavor: ProxyAPIFlavor
+        /// Ordered list of segments (root → target) used to rematerialize the messages
+        /// array on demand; each entry carries its local messages array (post-split-point).
+        let segmentChain: [SegmentRow]
+
+        struct SegmentRow: Sendable {
+            let id: UUID
+            let parentSegmentID: UUID?
+            let parentSplitIndex: Int
+            let messagesJSON: String
+            /// True only for the single segment the request's tail lands in.
+            /// Non-target rows only touch `last_activity` on upsert; the target
+            /// rewrites `messages_json`. Segments never re-parent and only the
+            /// target could have grown since the last mirror pass, so this
+            /// avoids rewriting identical blobs for ancestors on every request.
+            let isTarget: Bool
+        }
     }
 
     struct LoggedResponse: Sendable {
@@ -49,7 +86,6 @@ actor ProxyEventLogger {
         let proxyEnabled: Bool
         let port: Int
         let activeSessions: Int
-        let activeKeepalives: Int
         let metrics: ProxyMetricsStore.Snapshot
     }
 
@@ -62,7 +98,6 @@ actor ProxyEventLogger {
     // MARK: - Properties
 
     let enabled: Bool
-    let capturesContent: Bool
 
     private let databaseFileURL: URL
     private let statusFileURL: URL
@@ -80,9 +115,8 @@ actor ProxyEventLogger {
 
     private static let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-    init(enabled: Bool, capturesContent: Bool = false) {
+    init(enabled: Bool) {
         self.enabled = enabled
-        self.capturesContent = capturesContent
         self.databaseFileURL = Self.directory.appendingPathComponent("proxy_events.sqlite")
         self.statusFileURL = Self.directory.appendingPathComponent("proxy_status.json")
         let formatter = ISO8601DateFormatter()
@@ -139,11 +173,16 @@ actor ProxyEventLogger {
         durationMs: Int,
         statusCode: Int,
         tokenUsage: TokenUsage,
-        errored: Bool
+        errored: Bool,
+        lineage: LineageContext? = nil,
+        responseID: String? = nil
     ) {
         guard enabled else { return }
         do {
             let database = try openDatabaseIfNeeded()
+            if let lineage {
+                try mirrorLineage(lineage, in: database)
+            }
             if let requestID {
                 let sql = """
                     UPDATE proxy_requests SET
@@ -151,7 +190,9 @@ actor ProxyEventLogger {
                         upstream_request_id = ?,
                         input_tokens = ?, output_tokens = ?,
                         cache_read_tokens = ?, cache_creation_tokens = ?,
-                        errored = ?
+                        errored = ?,
+                        conversation_id = ?, segment_id = ?, tail_index = ?,
+                        response_id = ?, previous_response_id = ?, done = ?
                     WHERE id = ?
                     """
                 var statement: OpaquePointer?
@@ -169,12 +210,18 @@ actor ProxyEventLogger {
                 bind(tokenUsage.cacheReadInputTokens, to: 8, in: statement)
                 bind(tokenUsage.cacheCreationInputTokens, to: 9, in: statement)
                 bind(errored, to: 10, in: statement)
-                bind(requestID, to: 11, in: statement)
+                bind(lineage?.conversationID.uuidString, to: 11, in: statement)
+                bind(lineage?.segmentID.uuidString, to: 12, in: statement)
+                bind(lineage?.tailIndex, to: 13, in: statement)
+                bind(responseID, to: 14, in: statement)
+                bind(lineage?.previousResponseID, to: 15, in: statement)
+                bind(!errored, to: 16, in: statement)
+                bind(requestID, to: 17, in: statement)
                 guard sqlite3_step(statement) == SQLITE_DONE else {
                     throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
                 }
                 try insertContentIfNeeded(
-                    serializeContent(request: request, response: response),
+                    serializeContent(request: request, response: response, lineage: lineage),
                     requestID: requestID,
                     in: database
                 )
@@ -188,8 +235,10 @@ actor ProxyEventLogger {
                         upstream_request_id,
                         input_tokens, output_tokens,
                         cache_read_tokens, cache_creation_tokens,
-                        errored
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        errored,
+                        conversation_id, segment_id, tail_index,
+                        response_id, previous_response_id, done
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """
                 var statement: OpaquePointer?
                 guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -213,18 +262,149 @@ actor ProxyEventLogger {
                 bind(tokenUsage.cacheReadInputTokens, to: 14, in: statement)
                 bind(tokenUsage.cacheCreationInputTokens, to: 15, in: statement)
                 bind(errored, to: 16, in: statement)
+                bind(lineage?.conversationID.uuidString, to: 17, in: statement)
+                bind(lineage?.segmentID.uuidString, to: 18, in: statement)
+                bind(lineage?.tailIndex, to: 19, in: statement)
+                bind(responseID, to: 20, in: statement)
+                bind(lineage?.previousResponseID, to: 21, in: statement)
+                bind(!errored, to: 22, in: statement)
                 guard sqlite3_step(statement) == SQLITE_DONE else {
                     throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
                 }
                 let insertedID = sqlite3_last_insert_rowid(database)
                 try insertContentIfNeeded(
-                    serializeContent(request: request, response: response),
+                    serializeContent(request: request, response: response, lineage: lineage),
                     requestID: insertedID,
                     in: database
                 )
             }
         } catch {
             ProxyLogger.log("ProxyEventLogger: failed to log request completed: \(error)")
+        }
+    }
+
+    // MARK: - Lineage mirror
+
+    private func mirrorLineage(_ context: LineageContext, in database: OpaquePointer) throws {
+        let now = isoFormatter.string(from: Date())
+        // Serialize the full fingerprint so every row in this table captures the
+        // cache-identity payload (model + system + tools + tool_choice + thinking).
+        // That way keep-alive or diagnostics can reconstruct a valid replay body
+        // without needing the original request.
+        let fingerprintJSON: String
+        if let data = try? JSONEncoder().encode(context.fingerprint),
+           let text = String(data: data, encoding: .utf8) {
+            fingerprintJSON = text
+        } else {
+            fingerprintJSON = "{}"
+        }
+        // Upsert conversation.
+        do {
+            let sql = """
+                INSERT INTO proxy_conversations (id, flavor, fingerprint_hash, fingerprint_json, first_seen, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    fingerprint_json = excluded.fingerprint_json,
+                    last_seen = excluded.last_seen
+                """
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw LoggerStorageError.prepareFailed(message: errorMessage(from: database))
+            }
+            defer { sqlite3_finalize(statement) }
+            bind(context.conversationID.uuidString, to: 1, in: statement)
+            bind(context.flavor.rawValue, to: 2, in: statement)
+            bind(context.fingerprintHash, to: 3, in: statement)
+            bind(fingerprintJSON, to: 4, in: statement)
+            bind(now, to: 5, in: statement)
+            bind(now, to: 6, in: statement)
+            guard sqlite3_step(statement) == SQLITE_DONE else {
+                throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
+            }
+        }
+        // Upsert each segment along the chain. The target segment (the one the
+        // request's tail lands in) is the only segment whose messages could have
+        // grown since the last mirror pass — invariants guarantee ancestors are
+        // frozen once a descendant branches off them. So we rewrite
+        // `messages_json` only for the target and refresh `last_activity` on
+        // ancestors. Ancestor rows that don't yet exist (first-ever write for
+        // this chain) still INSERT with their current cached messages_json.
+        for segment in context.segmentChain {
+            let sql: String
+            if segment.isTarget {
+                sql = """
+                    INSERT INTO proxy_lineage_segments
+                        (id, conversation_id, parent_segment_id, parent_split_index, messages_json, last_activity)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        messages_json = excluded.messages_json,
+                        last_activity = excluded.last_activity
+                    """
+            } else {
+                sql = """
+                    INSERT INTO proxy_lineage_segments
+                        (id, conversation_id, parent_segment_id, parent_split_index, messages_json, last_activity)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        last_activity = excluded.last_activity
+                    """
+            }
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw LoggerStorageError.prepareFailed(message: errorMessage(from: database))
+            }
+            defer { sqlite3_finalize(statement) }
+            bind(segment.id.uuidString, to: 1, in: statement)
+            bind(context.conversationID.uuidString, to: 2, in: statement)
+            bind(segment.parentSegmentID?.uuidString, to: 3, in: statement)
+            bind(segment.parentSplitIndex, to: 4, in: statement)
+            bind(segment.messagesJSON, to: 5, in: statement)
+            bind(now, to: 6, in: statement)
+            guard sqlite3_step(statement) == SQLITE_DONE else {
+                throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
+            }
+        }
+    }
+
+    /// Remove lineage rows whose tree-side nodes were just pruned. Segments and
+    /// conversations cascade via ON DELETE CASCADE; request rows retain their
+    /// IDs but have `segment_id`/`conversation_id` NULLed by ON DELETE SET NULL.
+    func pruneLineageMirror(
+        conversationIDs: Set<UUID>,
+        segmentIDs: Set<UUID>
+    ) {
+        guard enabled else { return }
+        guard !conversationIDs.isEmpty || !segmentIDs.isEmpty else { return }
+        do {
+            let database = try openDatabaseIfNeeded()
+            for id in segmentIDs {
+                try executeDelete(
+                    "DELETE FROM proxy_lineage_segments WHERE id = ?;",
+                    value: id.uuidString,
+                    in: database
+                )
+            }
+            for id in conversationIDs {
+                try executeDelete(
+                    "DELETE FROM proxy_conversations WHERE id = ?;",
+                    value: id.uuidString,
+                    in: database
+                )
+            }
+        } catch {
+            ProxyLogger.log("ProxyEventLogger: failed to prune lineage mirror: \(error)")
+        }
+    }
+
+    private func executeDelete(_ sql: String, value: String, in database: OpaquePointer) throws {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw LoggerStorageError.prepareFailed(message: errorMessage(from: database))
+        }
+        defer { sqlite3_finalize(statement) }
+        bind(value, to: 1, in: statement)
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
         }
     }
 
@@ -235,7 +415,8 @@ actor ProxyEventLogger {
         request: LoggedRequest,
         response: LoggedResponse?,
         durationMs: Int,
-        error: String
+        error: String,
+        lineage: LineageContext? = nil
     ) {
         guard enabled else { return }
         do {
@@ -267,7 +448,7 @@ actor ProxyEventLogger {
                     throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
                 }
                 try insertContentIfNeeded(
-                    serializeContent(request: request, response: response),
+                    serializeContent(request: request, response: response, lineage: lineage),
                     requestID: requestID,
                     in: database
                 )
@@ -304,119 +485,13 @@ actor ProxyEventLogger {
                 }
                 let insertedID = sqlite3_last_insert_rowid(database)
                 try insertContentIfNeeded(
-                    serializeContent(request: request, response: response),
+                    serializeContent(request: request, response: response, lineage: lineage),
                     requestID: insertedID,
                     in: database
                 )
             }
         } catch let dbError {
             ProxyLogger.log("ProxyEventLogger: failed to log request failed: \(dbError)")
-        }
-    }
-
-    // MARK: - Keepalive logging
-
-    func logKeepaliveSent(session: String) -> Int64? {
-        guard enabled else { return nil }
-        do {
-            let database = try openDatabaseIfNeeded()
-            try pruneExpiredIfNeeded(in: database)
-            let sql = "INSERT INTO proxy_keepalives (session, started_at) VALUES (?, ?)"
-            var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
-                throw LoggerStorageError.prepareFailed(message: errorMessage(from: database))
-            }
-            defer { sqlite3_finalize(statement) }
-            bind(session, to: 1, in: statement)
-            bind(isoFormatter.string(from: Date()), to: 2, in: statement)
-            guard sqlite3_step(statement) == SQLITE_DONE else {
-                throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
-            }
-            return sqlite3_last_insert_rowid(database)
-        } catch {
-            ProxyLogger.log("ProxyEventLogger: failed to log keepalive sent: \(error)")
-            return nil
-        }
-    }
-
-    func logKeepaliveCompleted(
-        keepaliveID: Int64?,
-        session: String,
-        success: Bool,
-        statusCode: Int?,
-        durationMs: Int,
-        upstreamRequestID: String?,
-        tokenUsage: TokenUsage,
-        error: String?
-    ) {
-        guard enabled else { return }
-        do {
-            let database = try openDatabaseIfNeeded()
-            if let keepaliveID {
-                let sql = """
-                    UPDATE proxy_keepalives SET
-                        completed_at = ?, success = ?, status_code = ?, duration_ms = ?,
-                        upstream_request_id = ?,
-                        input_tokens = ?, output_tokens = ?,
-                        cache_read_tokens = ?, cache_creation_tokens = ?,
-                        error = ?
-                    WHERE id = ?
-                    """
-                var statement: OpaquePointer?
-                guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
-                    throw LoggerStorageError.prepareFailed(message: errorMessage(from: database))
-                }
-                defer { sqlite3_finalize(statement) }
-                bind(isoFormatter.string(from: Date()), to: 1, in: statement)
-                bind(success, to: 2, in: statement)
-                bind(statusCode, to: 3, in: statement)
-                bind(durationMs, to: 4, in: statement)
-                bind(upstreamRequestID, to: 5, in: statement)
-                bind(tokenUsage.inputTokens, to: 6, in: statement)
-                bind(tokenUsage.outputTokens, to: 7, in: statement)
-                bind(tokenUsage.cacheReadInputTokens, to: 8, in: statement)
-                bind(tokenUsage.cacheCreationInputTokens, to: 9, in: statement)
-                bind(error, to: 10, in: statement)
-                bind(keepaliveID, to: 11, in: statement)
-                guard sqlite3_step(statement) == SQLITE_DONE else {
-                    throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
-                }
-            } else {
-                // Standalone INSERT for cases where logKeepaliveSent failed
-                try pruneExpiredIfNeeded(in: database)
-                let now = isoFormatter.string(from: Date())
-                let sql = """
-                    INSERT INTO proxy_keepalives (
-                        session, started_at, completed_at, success, status_code, duration_ms,
-                        upstream_request_id,
-                        input_tokens, output_tokens,
-                        cache_read_tokens, cache_creation_tokens,
-                        error
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """
-                var statement: OpaquePointer?
-                guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
-                    throw LoggerStorageError.prepareFailed(message: errorMessage(from: database))
-                }
-                defer { sqlite3_finalize(statement) }
-                bind(session, to: 1, in: statement)
-                bind(now, to: 2, in: statement)
-                bind(now, to: 3, in: statement)
-                bind(success, to: 4, in: statement)
-                bind(statusCode, to: 5, in: statement)
-                bind(durationMs, to: 6, in: statement)
-                bind(upstreamRequestID, to: 7, in: statement)
-                bind(tokenUsage.inputTokens, to: 8, in: statement)
-                bind(tokenUsage.outputTokens, to: 9, in: statement)
-                bind(tokenUsage.cacheReadInputTokens, to: 10, in: statement)
-                bind(tokenUsage.cacheCreationInputTokens, to: 11, in: statement)
-                bind(error, to: 12, in: statement)
-                guard sqlite3_step(statement) == SQLITE_DONE else {
-                    throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
-                }
-            }
-        } catch {
-            ProxyLogger.log("ProxyEventLogger: failed to log keepalive completed: \(error)")
         }
     }
 
@@ -434,17 +509,12 @@ actor ProxyEventLogger {
         insertLifecycleEvent(type: "session_expired", session: session)
     }
 
-    func logKeepaliveDisabled(session: String, reason: String, failureCount: Int) {
-        insertLifecycleEvent(type: "keepalive_disabled", session: session, reason: reason, failureCount: failureCount)
-    }
-
     // MARK: - Status snapshot
 
     func writeStatusSnapshot(
         enabled proxyEnabled: Bool,
         port: Int,
         activeSessions: Int,
-        activeKeepalives: Int,
         metrics: ProxyMetricsStore.Snapshot,
         force: Bool = false
     ) {
@@ -454,7 +524,6 @@ actor ProxyEventLogger {
             proxyEnabled: proxyEnabled,
             port: port,
             activeSessions: activeSessions,
-            activeKeepalives: activeKeepalives,
             metrics: metrics
         )
         let now = Date()
@@ -513,9 +582,56 @@ actor ProxyEventLogger {
             try execute("PRAGMA journal_mode = WAL;", in: database)
             try execute("PRAGMA synchronous = NORMAL;", in: database)
 
-            // Migration: drop legacy tables
-            try execute("DROP TABLE IF EXISTS proxy_event_content;", in: database)
-            try execute("DROP TABLE IF EXISTS proxy_events;", in: database)
+            // Check schema version; on mismatch drop all known tables and rebuild.
+            try execute(
+                "CREATE TABLE IF NOT EXISTS proxy_schema (version INTEGER PRIMARY KEY);",
+                in: database
+            )
+            let persistedVersion = readSchemaVersion(in: database)
+            if persistedVersion != Self.currentSchemaVersion {
+                let dropTables = [
+                    "proxy_event_content", "proxy_events", "proxy_keepalives",
+                    "proxy_request_content", "proxy_requests",
+                    "proxy_lineage_segments", "proxy_conversations",
+                    "proxy_lifecycle"
+                ]
+                for table in dropTables {
+                    try execute("DROP TABLE IF EXISTS \(table);", in: database)
+                }
+                try execute("DELETE FROM proxy_schema;", in: database)
+                try execute(
+                    "INSERT INTO proxy_schema (version) VALUES (\(Self.currentSchemaVersion));",
+                    in: database
+                )
+            }
+
+            try execute(
+                """
+                CREATE TABLE IF NOT EXISTS proxy_conversations (
+                    id TEXT PRIMARY KEY,
+                    flavor TEXT NOT NULL,
+                    fingerprint_hash TEXT NOT NULL,
+                    fingerprint_json TEXT NOT NULL,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL
+                );
+                """,
+                in: database
+            )
+
+            try execute(
+                """
+                CREATE TABLE IF NOT EXISTS proxy_lineage_segments (
+                    id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL REFERENCES proxy_conversations(id) ON DELETE CASCADE,
+                    parent_segment_id TEXT REFERENCES proxy_lineage_segments(id) ON DELETE CASCADE,
+                    parent_split_index INTEGER NOT NULL,
+                    messages_json TEXT NOT NULL,
+                    last_activity TEXT NOT NULL
+                );
+                """,
+                in: database
+            )
 
             try execute(
                 """
@@ -537,28 +653,13 @@ actor ProxyEventLogger {
                     cache_read_tokens INTEGER,
                     cache_creation_tokens INTEGER,
                     error TEXT,
-                    errored INTEGER
-                );
-                """,
-                in: database
-            )
-
-            try execute(
-                """
-                CREATE TABLE IF NOT EXISTS proxy_keepalives (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session TEXT NOT NULL,
-                    started_at TEXT NOT NULL,
-                    completed_at TEXT,
-                    success INTEGER,
-                    status_code INTEGER,
-                    duration_ms INTEGER,
-                    upstream_request_id TEXT,
-                    input_tokens INTEGER,
-                    output_tokens INTEGER,
-                    cache_read_tokens INTEGER,
-                    cache_creation_tokens INTEGER,
-                    error TEXT
+                    errored INTEGER,
+                    conversation_id TEXT REFERENCES proxy_conversations(id) ON DELETE SET NULL,
+                    segment_id TEXT REFERENCES proxy_lineage_segments(id) ON DELETE SET NULL,
+                    tail_index INTEGER,
+                    response_id TEXT,
+                    previous_response_id TEXT,
+                    done INTEGER NOT NULL DEFAULT 0
                 );
                 """,
                 in: database
@@ -584,7 +685,7 @@ actor ProxyEventLogger {
                 CREATE TABLE IF NOT EXISTS proxy_request_content (
                     request_id INTEGER PRIMARY KEY,
                     upstream_request_id TEXT,
-                    request_json TEXT,
+                    request_extras_json TEXT,
                     response_json TEXT,
                     FOREIGN KEY(request_id) REFERENCES proxy_requests(id) ON DELETE CASCADE
                 );
@@ -598,10 +699,14 @@ actor ProxyEventLogger {
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_requests_model ON proxy_requests(model, started_at);", in: database)
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_requests_status ON proxy_requests(status_code, started_at);", in: database)
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_requests_upstream_rid ON proxy_requests(upstream_request_id);", in: database)
-            try execute("CREATE INDEX IF NOT EXISTS idx_proxy_keepalives_started_at ON proxy_keepalives(started_at);", in: database)
-            try execute("CREATE INDEX IF NOT EXISTS idx_proxy_keepalives_session ON proxy_keepalives(session, started_at);", in: database)
+            try execute("CREATE INDEX IF NOT EXISTS idx_proxy_requests_conversation ON proxy_requests(conversation_id);", in: database)
+            try execute("CREATE INDEX IF NOT EXISTS idx_proxy_requests_segment ON proxy_requests(segment_id);", in: database)
+            try execute("CREATE INDEX IF NOT EXISTS idx_proxy_requests_response ON proxy_requests(response_id);", in: database)
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_lifecycle_ts ON proxy_lifecycle(ts);", in: database)
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_request_content_upstream_rid ON proxy_request_content(upstream_request_id);", in: database)
+            try execute("CREATE INDEX IF NOT EXISTS idx_proxy_conversations_fingerprint ON proxy_conversations(fingerprint_hash);", in: database)
+            try execute("CREATE INDEX IF NOT EXISTS idx_proxy_segments_conversation ON proxy_lineage_segments(conversation_id);", in: database)
+            try execute("CREATE INDEX IF NOT EXISTS idx_proxy_segments_parent ON proxy_lineage_segments(parent_segment_id);", in: database)
         } catch {
             sqlite3_close(database)
             throw error
@@ -609,6 +714,18 @@ actor ProxyEventLogger {
 
         self.database = database
         return database
+    }
+
+    private func readSchemaVersion(in database: OpaquePointer) -> Int {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, "SELECT version FROM proxy_schema LIMIT 1;", -1, &statement, nil) == SQLITE_OK else {
+            return 0
+        }
+        defer { sqlite3_finalize(statement) }
+        if sqlite3_step(statement) == SQLITE_ROW {
+            return Int(sqlite3_column_int64(statement, 0))
+        }
+        return 0
     }
 
     // MARK: - Private: Pruning
@@ -619,10 +736,18 @@ actor ProxyEventLogger {
             return
         }
         let cutoff = isoFormatter.string(from: now.addingTimeInterval(-Self.maxEventAge))
-        // proxy_request_content is CASCADE-deleted via proxy_requests FK
+        // proxy_request_content is CASCADE-deleted via proxy_requests FK.
         try executePrune("DELETE FROM proxy_requests WHERE started_at < ?;", cutoff: cutoff, in: database)
-        try executePrune("DELETE FROM proxy_keepalives WHERE started_at < ?;", cutoff: cutoff, in: database)
         try executePrune("DELETE FROM proxy_lifecycle WHERE ts < ?;", cutoff: cutoff, in: database)
+        // Lineage mirror: in-memory `LineageTree.prune(...)` drives `pruneLineageMirror`
+        // while the app is running, but after a restart the tree starts empty and
+        // can no longer emit pruning IDs for rows left over from prior runs. Sweep
+        // by `last_seen`/`last_activity` here so the mirror tables bound their disk
+        // use across restarts. `proxy_requests.conversation_id`/`segment_id` use
+        // ON DELETE SET NULL so historical request rows survive; segments CASCADE
+        // through `conversations` → `parent_segment_id` so a single delete on the
+        // conversations table is enough to evict the whole subtree.
+        try executePrune("DELETE FROM proxy_conversations WHERE last_seen < ?;", cutoff: cutoff, in: database)
         try execute("PRAGMA wal_checkpoint(PASSIVE);", in: database)
         lastPruneAt = now
     }
@@ -676,10 +801,12 @@ actor ProxyEventLogger {
 
     // MARK: - Private: Content serialization
 
-    private func serializeContent(request: LoggedRequest?, response: LoggedResponse?) -> EventContent? {
-        guard capturesContent else { return nil }
-
-        let requestJSON = request.flatMap { jsonString(for: serializeContent(request: $0)) }
+    private func serializeContent(
+        request: LoggedRequest?,
+        response: LoggedResponse?,
+        lineage: LineageContext?
+    ) -> EventContent? {
+        let requestJSON = request.flatMap { jsonString(for: serializeContent(request: $0, lineage: lineage)) }
         let responseJSON = response.flatMap { jsonString(for: serializeContent(response: $0)) }
         let capturedUpstreamRequestID = response.flatMap { extractUpstreamRequestID(from: $0.headers) }
 
@@ -694,14 +821,14 @@ actor ProxyEventLogger {
         )
     }
 
-    private func serializeContent(request: LoggedRequest) -> [String: Any] {
+    private func serializeContent(request: LoggedRequest, lineage: LineageContext?) -> [String: Any] {
         [
             "method": request.method,
             "path": request.path,
             "upstreamURL": request.upstreamURL,
             "streaming": request.streaming,
             "headers": serialize(headers: request.headers),
-            "body": serializeBodyContent(body: request.body),
+            "body": serializeBodyContent(body: request.body, lineage: lineage),
         ]
     }
 
@@ -723,9 +850,70 @@ actor ProxyEventLogger {
     }
 
     private func serializeBodyContent(body: Data, byteCount: Int? = nil, truncated: Bool = false) -> [String: Any] {
+        serializeBodyContent(body: body, byteCount: byteCount, truncated: truncated, lineage: nil)
+    }
+
+    /// When `lineage` is non-nil and the body is JSON, strip the cache-identity
+    /// fields (already stored once on `proxy_conversations.fingerprint_json`) and
+    /// the messages/input array (already stored on `proxy_lineage_segments.messages_json`),
+    /// keeping only per-request extras plus refs back to the conversation and segment.
+    ///
+    /// Resulting shape (JSON-encoded into `body.text`):
+    ///   {
+    ///     "body_extras": { max_tokens, stream, temperature, stop_sequences, metadata, ... },
+    ///     "body_refs":   {
+    ///       "fingerprint": "<conversation uuid>",
+    ///       "lineage":     { "segment_id": "<segment uuid>", "tail_index": N }
+    ///     }
+    ///   }
+    /// A reader rebuilds the original request body by expanding `fingerprint` to the
+    /// conversation's `fingerprint_json` fields and `lineage` to a walked messages array.
+    private func serializeBodyContent(
+        body: Data,
+        byteCount: Int? = nil,
+        truncated: Bool = false,
+        lineage: LineageContext?
+    ) -> [String: Any] {
         var serialized: [String: Any] = ["bytes": byteCount ?? body.count]
         if truncated {
             serialized["truncated"] = true
+        }
+        if let lineage,
+           var json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] {
+            let fingerprintKeys: [String]
+            let messagesKey: String
+            switch lineage.flavor {
+            case .anthropicMessages:
+                fingerprintKeys = ["model", "system", "tools", "tool_choice", "thinking"]
+                messagesKey = "messages"
+            case .openAIResponses:
+                fingerprintKeys = ["model", "instructions", "tools", "tool_choice", "reasoning"]
+                messagesKey = "input"
+            }
+            for key in fingerprintKeys {
+                json.removeValue(forKey: key)
+            }
+            json.removeValue(forKey: messagesKey)
+            // `previous_response_id` is captured on `proxy_requests.previous_response_id`.
+            json.removeValue(forKey: "previous_response_id")
+
+            let refs: [String: Any] = [
+                "fingerprint": lineage.conversationID.uuidString,
+                "lineage": [
+                    "segment_id": lineage.segmentID.uuidString,
+                    "tail_index": lineage.tailIndex,
+                ],
+            ]
+            let compact: [String: Any] = [
+                "body_extras": json,
+                "body_refs": refs,
+            ]
+            if let collapsed = try? JSONSerialization.data(withJSONObject: compact, options: [.sortedKeys]),
+               let text = String(data: collapsed, encoding: .utf8) {
+                serialized["encoding"] = "utf8-refs"
+                serialized["text"] = text
+                return serialized
+            }
         }
         if let text = String(data: body, encoding: .utf8) {
             serialized["encoding"] = "utf8"
@@ -740,11 +928,11 @@ actor ProxyEventLogger {
     // MARK: - Private: Content insertion
 
     private func insertContentIfNeeded(_ content: EventContent?, requestID: Int64, in database: OpaquePointer) throws {
-        guard capturesContent, let content else { return }
+        guard let content else { return }
 
         let sql = """
             INSERT OR REPLACE INTO proxy_request_content (
-                request_id, upstream_request_id, request_json, response_json
+                request_id, upstream_request_id, request_extras_json, response_json
             ) VALUES (?, ?, ?, ?)
             """
 
@@ -803,12 +991,7 @@ actor ProxyEventLogger {
             "enabled": snapshot.proxyEnabled,
             "port": snapshot.port,
             "activeSessions": snapshot.activeSessions,
-            "activeKeepalives": snapshot.activeKeepalives,
             "totalRequestsForwarded": snapshot.metrics.totalRequestsForwarded,
-            "totalKeepalivesSent": snapshot.metrics.totalKeepalivesSent,
-            "totalKeepalivesFailed": snapshot.metrics.totalKeepalivesFailed,
-            "cacheReads": snapshot.metrics.totalCacheReads,
-            "cacheWrites": snapshot.metrics.totalCacheWrites,
             "totalInputTokens": snapshot.metrics.totalInputTokens,
             "totalOutputTokens": snapshot.metrics.totalOutputTokens,
             "totalCacheReadInputTokens": snapshot.metrics.totalCacheReadInputTokens,

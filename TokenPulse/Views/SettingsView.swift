@@ -479,37 +479,15 @@ private struct ProxyTab: View {
             }
 
             SettingsCard(
-                title: String(localized: "Session controls"),
-                description: String(localized: "Expose manual keepalive controls in the activity popover for Anthropic Messages traffic.")
-            ) {
-                Toggle(String(localized: "Enable keepalive controls"), isOn: $config.keepaliveEnabled)
-
-                Text(String(localized: "Keepalive remains manual-only in the current implementation."))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            SettingsCard(
                 title: String(localized: "Logging"),
-                description: String(localized: "Store lightweight proxy metadata locally, and optionally capture full payloads when you really need them.")
+                description: String(localized: "Store proxy metadata and deduplicated request/response payloads locally.")
             ) {
                 Toggle(String(localized: "Save event log"), isOn: $config.saveProxyEventLog)
 
                 if config.saveProxyEventLog {
-                    Text(String(localized: "Saves proxy metadata to ~/.tokenpulse/proxy_events.sqlite (proxy_requests, proxy_keepalives, proxy_lifecycle tables), including request timing, status, cache metrics, and upstream request IDs. Prompt and response content are excluded unless Capture all content is enabled. Restart the proxy to apply."))
+                    Text(String(localized: "Saves proxy metadata and deduplicated payloads to ~/.tokenpulse/proxy_events.sqlite. These records contain your prompts, conversation content, and model outputs. Restart the proxy to apply."))
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                Divider()
-
-                Toggle(String(localized: "Capture all content"), isOn: $config.saveProxyPayloads)
-
-                if config.saveProxyPayloads {
-                    Text(String(localized: "Saves full proxy request and response headers and bodies to the proxy_request_content table in ~/.tokenpulse/proxy_events.sqlite, linked to per-request rows. These records contain your prompts, conversation content, and model outputs. Restart the proxy to apply."))
-                        .font(.caption)
-                        .foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }

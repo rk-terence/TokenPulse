@@ -17,12 +17,12 @@ A macOS menu bar app that monitors AI platform token usage and optimizes API cos
 
 ### Local proxy
 
-- **Manual cache-warming keepalives** — Lets you send lightweight Anthropic keepalive requests from the popover when a tracked session's cache would otherwise go cold
+- **Universal lineage tree** — Groups proxied requests by cache-identity fingerprint (model + system + tools + `thinking`) across both Anthropic Messages and OpenAI Responses, so the popup shows one leaf per conversation and the event log deduplicates payloads per conversation
 - **Per-session cost tracking** — Tracks token usage, bytes transferred, and estimated cost per tracked proxy session
 - **Streaming support** — Full HTTP/1.1 proxy with SSE streaming passthrough; parses token usage from both JSON and SSE responses
 - **Traffic indicator** — Menu bar arrows and bar animate when the proxy forwards requests and completions
-- **Event logging** — Structured SQLite event log with 24-hour retention; optional request/response capture in SQLite for debugging
-- **Status snapshots** — Atomic JSON snapshots at `~/.tokenpulse/proxy_status.json` for external tooling whenever proxy logging infrastructure is enabled (`saveProxyEventLog` or `saveProxyPayloads`)
+- **Event logging** — Structured SQLite event log with 24-hour retention; deduplicated request/response capture via the lineage tree
+- **Status snapshots** — Atomic JSON snapshots at `~/.tokenpulse/proxy_status.json` for external tooling whenever `saveProxyEventLog` is enabled
 
 ### General
 
@@ -140,11 +140,11 @@ When TokenPulse establishes Anthropic lineage for a session, the popover can exp
 
 ### Observability
 
-When proxy logging infrastructure is enabled, the proxy writes structured event logs to `~/.tokenpulse/proxy_events.sqlite` (SQLite, WAL mode) and atomic status snapshots to `~/.tokenpulse/proxy_status.json` (throttled to 1-second intervals). This infrastructure is enabled whenever either `saveProxyEventLog` or `saveProxyPayloads` is on. Events are pruned after 24 hours with 5-minute sweep cycles.
+When `saveProxyEventLog` is enabled, the proxy writes structured event logs to `~/.tokenpulse/proxy_events.sqlite` (SQLite, WAL mode) and atomic status snapshots to `~/.tokenpulse/proxy_status.json` (throttled to 1-second intervals). Events are pruned after 24 hours with 5-minute sweep cycles.
 
-Optional payload capture stores full request bodies plus response bodies in the `proxy_request_content` table inside `~/.tokenpulse/proxy_events.sqlite` (disabled by default). Streaming response capture is truncated to 4 MB per request.
+Payload capture is now part of the same `saveProxyEventLog` toggle. Per-request extras and lineage refs live in `proxy_request_content`; the actual prompt content (system, tools, messages) is stored once per conversation in `proxy_conversations` + `proxy_lineage_segments` and referenced from each request. Streaming response capture is truncated to 4 MB per request.
 
-For the full proxy architecture, request flow, SQLite schema, and keepalive economics, see [docs/proxy.md](docs/proxy.md).
+For the full proxy architecture, request flow, lineage-tree semantics, and SQLite schema, see [docs/proxy.md](docs/proxy.md).
 
 ### Configuration
 
@@ -156,11 +156,7 @@ All fields are in `~/.tokenpulse/config.json`:
 | `proxyPort` | `8080` | Listening port on 127.0.0.1 |
 | `anthropicUpstreamURL` | `https://zenmux.ai/api/anthropic` | Anthropic Messages upstream base URL |
 | `openAIUpstreamURL` | `https://api.openai.com` | OpenAI Responses upstream base URL |
-| `keepaliveEnabled` | `false` | Show per-session manual keepalive controls in the popover |
-| `keepaliveIntervalSeconds` | `240` | Persisted compatibility field; currently unused by manual keepalive |
-| `proxyInactivityTimeoutSeconds` | `900` | Persisted compatibility field; currently unused by manual keepalive |
-| `saveProxyEventLog` | `true` | Enable proxy logging infrastructure, including SQLite event metadata and status snapshot writes |
-| `saveProxyPayloads` | `false` | Capture request/response bodies for debugging; also enables proxy logging infrastructure if it was otherwise off. Streaming responses are truncated to 4 MB |
+| `saveProxyEventLog` | `true` | Master on/off for the proxy event log. When enabled, SQLite metadata + deduplicated request/response payloads + status snapshots are all written; when disabled, no database is opened |
 
 ## Data export
 

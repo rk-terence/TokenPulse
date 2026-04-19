@@ -599,33 +599,14 @@ private struct SessionActivityRow: View {
     let activity: LocalProxyController.SessionActivity
     let proxyController: LocalProxyController?
 
-    private var keepaliveModeBinding: Binding<KeepaliveMode> {
-        Binding(
-            get: { activity.keepaliveMode },
-            set: { mode in
-                proxyController?.setSessionKeepaliveMode(mode, for: activity.sessionID)
-            }
-        )
-    }
-
-    private var isInFlight: Bool {
-        proxyController?.manualKeepaliveInFlight.contains(activity.sessionID) ?? false
-    }
-
-    private var lastResult: Bool? {
-        proxyController?.manualKeepaliveLastResult[activity.sessionID]
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            // Coding agent + abbreviated session ID + completed / keepalive / errored counts
             HStack(spacing: 0) {
                 sessionTitle
                 Spacer()
                 sessionStats
             }
 
-            // In-flight requests
             if !activity.activeRequests.isEmpty {
                 Text(String(localized: "Active"))
                     .font(.caption)
@@ -635,14 +616,6 @@ private struct SessionActivityRow: View {
                 ForEach(activity.activeRequests) { request in
                     RequestActivityRow(request: request)
                         .padding(.leading, 10)
-                        .overlay(alignment: .leading) {
-                            if let highlightColor = rowHighlightColor(for: request) {
-                                RoundedRectangle(cornerRadius: 1)
-                                    .fill(highlightColor)
-                                    .frame(width: 3)
-                                    .padding(.leading, 5)
-                            }
-                        }
                 }
             }
 
@@ -652,21 +625,15 @@ private struct SessionActivityRow: View {
                     .foregroundStyle(.tertiary)
                     .padding(.leading, 10)
 
+                // Per-row dimming: only rows whose descendant (currently active
+                // and `done=false`) is about to replace them get dimmed. Other
+                // done rows render normally.
                 ForEach(activity.doneRequests) { request in
                     RequestActivityRow(request: request)
                         .padding(.leading, 10)
-                        .overlay(alignment: .leading) {
-                            if let highlightColor = rowHighlightColor(for: request) {
-                                RoundedRectangle(cornerRadius: 1)
-                                    .fill(highlightColor)
-                                    .frame(width: 3)
-                                    .padding(.leading, 5)
-                            }
-                        }
+                        .opacity(request.isPendingReplacement ? 0.4 : 1.0)
                 }
             }
-
-            keepaliveSection
         }
     }
 
@@ -694,83 +661,12 @@ private struct SessionActivityRow: View {
     }
 
     @ViewBuilder
-    private var keepaliveSection: some View {
-        if ConfigService.shared.keepaliveEnabled,
-           activity.supportsKeepalive {
-            // Per-session keepalive controls
-            HStack(spacing: 6) {
-                Picker("", selection: keepaliveModeBinding) {
-                    Text(String(localized: "Off")).tag(KeepaliveMode.off)
-                    Text(String(localized: "Manual")).tag(KeepaliveMode.manual)
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 120)
-                .controlSize(.mini)
-
-                if activity.keepaliveMode == .manual {
-                    if isInFlight {
-                        ProgressView()
-                            .controlSize(.mini)
-                    } else if let result = lastResult {
-                        Image(systemName: result ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .foregroundStyle(result ? .green : .red)
-                            .font(.caption)
-                    } else {
-                        Button(String(localized: "Send")) {
-                            proxyController?.sendManualKeepalive(for: activity.sessionID)
-                        }
-                        .controlSize(.mini)
-                        .disabled(!activity.canSendKeepalive)
-                        .help(activity.canSendKeepalive
-                            ? String(localized: "Send a cache-warming keepalive request")
-                            : String(localized: "Waiting for lineage to be established"))
-                    }
-                }
-
-                if let reason = activity.keepaliveDisabledReason {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                        .font(.caption2)
-                    Text(reason)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-            .padding(.leading, 10)
-
-            // Per-session keepalive stats
-            if activity.keepaliveCount > 0,
-               let cachePercent = activity.lastKeepaliveCacheReadPercent {
-                HStack(spacing: 4) {
-                    Text(keepaliveStatsText(cachePercent: cachePercent))
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-
-                    if let lastAt = activity.lastKeepaliveAt {
-                        Text(relativeTime(since: lastAt))
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-                .padding(.leading, 10)
-            }
-        }
-    }
-
-    @ViewBuilder
     private var sessionStats: some View {
         HStack(spacing: 8) {
             if activity.completedRequests > 0 {
                 ProxyMetricLabel(
                     label: String(localized: "done"),
                     value: "\(activity.completedRequests)"
-                )
-            }
-            if activity.keepaliveCount > 0 {
-                ProxyMetricLabel(
-                    label: String(localized: "ka"),
-                    value: "\(activity.keepaliveCount)"
                 )
             }
             if activity.erroredRequests > 0 {
@@ -801,56 +697,6 @@ private struct SessionActivityRow: View {
             return String(format: "%.2f", cost)
         }
     }
-
-    private func keepaliveStatsText(cachePercent: Double) -> String {
-        let readTokens = abbreviatedTokenCount(activity.lastKeepaliveCacheReadTokens ?? 0)
-        let writeTokens = abbreviatedTokenCount(activity.lastKeepaliveCacheCreationTokens ?? 0)
-        return String(
-            format: NSLocalizedString(
-                "proxy.keepalive.stats",
-                value: "#keepalive: %d  last: %.0f%% cache read, %@ read / %@ write, %d out tok",
-                comment: "Proxy popup keepalive stats: count, cache read percent, cache read tokens, cache write tokens, output tokens."
-            ),
-            activity.keepaliveCount,
-            cachePercent,
-            readTokens,
-            writeTokens,
-            activity.lastKeepaliveOutputTokens ?? 0
-        )
-    }
-
-    private func abbreviatedTokenCount(_ count: Int) -> String {
-        if count >= 1_000_000 {
-            return String(format: "%.2fM", Double(count) / 1_000_000)
-        } else if count >= 10_000 {
-            return String(format: "%.0fK", Double(count) / 1_000)
-        } else if count >= 1_000 {
-            return String(format: "%.1fK", Double(count) / 1_000)
-        } else {
-            return "\(count)"
-        }
-    }
-
-    private func relativeTime(since date: Date) -> String {
-        let seconds = Int(Date().timeIntervalSince(date))
-        if seconds < 60 {
-            return "\(seconds)s"
-        } else if seconds < 3600 {
-            return "\(seconds / 60)m"
-        } else {
-            return "\(seconds / 3600)h"
-        }
-    }
-
-    private func rowHighlightColor(for request: ProxyRequestActivity) -> Color? {
-        if request.isKeepalive {
-            return .green
-        }
-        if request.isMainAgentShaped {
-            return .accentColor
-        }
-        return nil
-    }
 }
 
 // MARK: - Request Activity Row
@@ -871,12 +717,6 @@ private struct RequestActivityRow: View {
 
     var body: some View {
         HStack(spacing: 5) {
-            if request.isKeepalive {
-                Image(systemName: "bolt.fill")
-                    .font(.caption)
-                    .foregroundStyle(.green)
-                    .help(String(localized: "Keepalive request"))
-            }
             if let modelName = compactModelName {
                 Text(verbatim: paddedLabel(modelName, width: StatField.modelLabelWidth))
                     .font(rowFont)
@@ -886,11 +726,40 @@ private struct RequestActivityRow: View {
             }
             leftStats
             Spacer()
-            Text(request.startedAt, style: .timer)
-                .font(rowFont)
-                .foregroundStyle(.tertiary)
-                .contentTransition(.numericText())
+            // Right-aligned age timer, constrained to 4 chars wide:
+            //   under 10 min  → m:ss (0:00–9:59)
+            //   under 1 hour  → Nm   (10m–59m, space-padded)
+            //   1 hour+       → Nh   (1h+, space-padded)
+            TimelineView(.periodic(from: request.startedAt, by: 1)) { context in
+                Text(verbatim: Self.compactElapsed(from: request.startedAt, to: context.date))
+                    .font(rowFont)
+                    .foregroundStyle(.tertiary)
+                    .contentTransition(.numericText())
+            }
         }
+    }
+
+    /// Format elapsed time into at most 4 characters, left-padded with spaces.
+    /// - `m:ss` while under 10 minutes (already fits 4 chars exactly).
+    /// - `Nm` once `m:ss` would overflow 4 chars (10 min and above).
+    /// - `Nh` once the hour count kicks in.
+    /// Unrealistically long ages (≥ 1000 h) overflow but still render sensibly.
+    static func compactElapsed(from start: Date, to end: Date) -> String {
+        let totalSeconds = max(0, Int(end.timeIntervalSince(start)))
+        let raw: String
+        if totalSeconds < 600 {
+            let m = totalSeconds / 60
+            let s = totalSeconds % 60
+            raw = "\(m):" + String(format: "%02d", s)
+        } else if totalSeconds < 3600 {
+            raw = "\(totalSeconds / 60)m"
+        } else {
+            raw = "\(totalSeconds / 3600)h"
+        }
+        if raw.count < 4 {
+            return String(repeating: " ", count: 4 - raw.count) + raw
+        }
+        return raw
     }
 
     @ViewBuilder

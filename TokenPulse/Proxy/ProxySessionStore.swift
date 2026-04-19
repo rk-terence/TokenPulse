@@ -1,7 +1,14 @@
 import Foundation
 
-/// Tracks active proxy sessions, including Anthropic and conservatively
-/// identified Codex/OpenAI sessions.
+/// Tracks proxy traffic and maintains the in-memory lineage tree across
+/// all proxied requests. Replaces the pre-refactor Claude-Code-specific
+/// lineage + manual keep-alive bookkeeping.
+///
+/// - Sessions are a thin UI grouping layer keyed by the agent's session
+///   header (e.g. `X-Claude-Code-Session-Id`, OpenAI `session_id`); they do
+///   not drive lineage tracking directly.
+/// - The `LineageTree` lives here and grows whenever upstream returns 2xx.
+///   Every request's done-leaf status is derived from the tree.
 actor ProxySessionStore {
 
     struct CostSnapshot: Sendable {
@@ -9,101 +16,49 @@ actor ProxySessionStore {
         let estimatedCostUSDByAPI: [ProxyAPIFlavor: Double]
     }
 
-    struct KeepaliveRequestContext: Sendable {
-        let path: String
-        let body: Data
-        let headers: [(name: String, value: String)]
-    }
-
-    private struct OpenAIThreadRecord: Sendable {
-        var parentThreadID: String?
-        var sessionID: String
-    }
-
     struct Session: Sendable {
         var sessionID: String
         var lastSeenAt: Date
         var inFlightRequestCount: Int
-        // Phase 2 additions:
-        var lastRequestBody: Data?
-        var lastRequestHeaders: [(name: String, value: String)]
-        var lastKnownModel: String?
-        var lastKeepaliveAt: Date?
-        var keepaliveSuccessCount: Int
-        var keepaliveFailureCount: Int
-        var lastKeepaliveTokenUsage: TokenUsage?
-        var isKeepaliveDisabled: Bool
-        var keepaliveMode: KeepaliveMode
-        // Per-session request counters (completed/errored real requests):
         var completedRequestCount: Int
         var erroredRequestCount: Int
-        // Cumulative token usage and estimated cost:
         var totalInputTokens: Int
         var totalOutputTokens: Int
         var totalCacheReadInputTokens: Int
         var totalCacheCreationInputTokens: Int
         var estimatedCostUSD: Double
-        // Lineage tracking for keepalive:
-        var totalRequestsSeen: Int
-        var lineageFingerprint: LineageFingerprint?
-        var lineageMessagesDescriptor: String?
-        var lineageRequestPath: String?
-        var lineageRequestBody: Data?
-        var lineageRequestHeaders: [(name: String, value: String)]
-        var lineageEstablished: Bool
-        var keepaliveDisabledReason: String?
-        var activeAcceptedLineageRequestID: UUID?
-        var activeAcceptedLineageRequestPath: String?
-        var activeAcceptedLineageRequestBody: Data?
-        var activeAcceptedLineageRequestHeaders: [(name: String, value: String)]
     }
 
     /// A snapshot of a session's stats and its currently active requests, for UI display.
     struct SessionSnapshot: Sendable {
         let sessionID: String
         let lastSeenAt: Date
-        let lastKeepaliveAt: Date?
         let completedRequestCount: Int
         let erroredRequestCount: Int
-        let keepaliveTotalCount: Int
         let activeRequests: [ProxyRequestActivity]
         let doneRequests: [ProxyRequestActivity]
-        let lastKeepaliveRequest: ProxyRequestActivity?
         let totalInputTokens: Int
         let totalOutputTokens: Int
         let totalCacheReadInputTokens: Int
         let totalCacheCreationInputTokens: Int
         let estimatedCostUSD: Double
-        let isKeepaliveDisabled: Bool
-        let keepaliveDisabledReason: String?
-        let keepaliveMode: KeepaliveMode
-        let lineageEstablished: Bool
-        let lastKeepaliveTokenUsage: TokenUsage?
-    }
-
-    /// Result of evaluating an incoming request against the tracked main-agent lineage.
-    enum LineageEvaluation: Sendable {
-        /// Request accepted as a main-agent continuation; keepalive body updated.
-        case tracked
-        /// Request does not look like the main agent (side traffic); ignored.
-        case ignored
-        /// Was tracking, but this request diverges; keepalive disabled for the session.
-        case diverged(reason: String)
-        /// Keepalive already disabled for this session.
-        case alreadyDisabled
-        /// Within the first 2 requests; still identifying the main agent.
-        case pendingIdentification
     }
 
     private var sessions: [String: Session] = [:]
-    private var openAIThreadRecords: [String: OpenAIThreadRecord] = [:]
-    private var openAISessionAliases: [String: String] = [:]
     /// In-flight requests keyed by their UUID, with the owning session ID stored alongside.
     private var activeRequests: [UUID: (sessionID: String, activity: ProxyRequestActivity)] = [:]
-    /// Recently completed requests shown in the session's done section.
+    /// Recently completed requests shown in the session's done section (untracked/other sessions
+    /// keep their completed requests here on a short timer). For flavored sessions the done
+    /// list is derived from the lineage tree leaves and this map is unused.
     private var doneRequestsBySession: [String: [ProxyRequestActivity]] = [:]
-    /// Only the most recent completed keepalive is shown per session.
-    private var lastKeepaliveRequestBySession: [String: ProxyRequestActivity] = [:]
+    /// Final `ProxyRequestActivity` snapshot for every completed request that landed in the
+    /// lineage tree. Keyed by request UUID, this preserves model name, byte counts, timing,
+    /// cost, etc. so the UI can render a full row for any tree-leaf node. Entries are
+    /// removed when the corresponding node is pruned from the tree.
+    private var treeDoneActivities: [UUID: ProxyRequestActivity] = [:]
+
+    /// The in-memory lineage tree. Grown on 2xx responses; consulted for UI leaf queries.
+    private var lineageTree: LineageTree = LineageTree()
 
     // Byte counters for throughput and one-shot upload display.
     private var totalBytesReceived: Int = 0
@@ -136,64 +91,37 @@ actor ProxySessionStore {
         onRequestDone = callback
     }
 
+    // MARK: - Session identity
+
     /// Resolve an incoming request identity into the session bucket used by the UI and metrics.
     func resolveSessionID(for identity: ProxySessionIdentity) -> String {
         guard let flavor = identity.flavor,
               let rawSessionID = identity.rawSessionID else {
             return ProxySessionID.other
         }
-
-        switch flavor {
-        case .anthropicMessages:
-            return ProxySessionID.make(rawSessionID, flavor: flavor)
-        case .openAIResponses:
-            return resolveOpenAISessionID(
-                threadID: rawSessionID,
-                parentThreadID: identity.parentRawSessionID
-            )
-        }
+        return ProxySessionID.make(rawSessionID, flavor: flavor)
     }
 
-    func currentSessionID(for sessionID: String) -> String {
-        canonicalSessionID(sessionID)
-    }
+    func currentSessionID(for sessionID: String) -> String { sessionID }
 
     func currentSessionID(forRequest requestID: UUID, fallback sessionID: String) -> String {
-        if let activeSessionID = activeRequests[requestID]?.sessionID {
-            return canonicalSessionID(activeSessionID)
-        }
-        return canonicalSessionID(sessionID)
+        activeRequests[requestID]?.sessionID ?? sessionID
     }
 
-    /// Atomically resolve a request into its canonical session bucket and
-    /// register the in-flight request against that bucket.
+    /// Register an in-flight request under its owning session bucket.
     func beginRequest(
         identity: ProxySessionIdentity,
         id: UUID,
-        body: Data,
-        headers: [(name: String, value: String)],
         model: String?,
-        promptDescriptor: String?,
-        isMainAgentShaped: Bool,
         kind: ProxyRequestKind = .request
     ) -> String {
         let sessionID = resolveSessionID(for: identity)
         touch(sessionID)
         incrementInFlight(sessionID)
-        if ProxySessionID.supportsTrackedSession(sessionID) {
-            storeRequestContext(
-                body: body,
-                headers: headers,
-                model: model,
-                for: sessionID
-            )
-        }
         startRequest(
             id: id,
             sessionID: sessionID,
             model: model,
-            promptDescriptor: promptDescriptor,
-            isMainAgentShaped: isMainAgentShaped,
             kind: kind
         )
         return sessionID
@@ -202,64 +130,40 @@ actor ProxySessionStore {
     /// Record that a session was seen (creates it if new) and return its state.
     @discardableResult
     func touch(_ sessionID: String) -> Session {
-        let resolvedSessionID = canonicalSessionID(sessionID)
         let now = Date()
-        if var existing = sessions[resolvedSessionID] {
+        if var existing = sessions[sessionID] {
             existing.lastSeenAt = now
-            sessions[resolvedSessionID] = existing
+            sessions[sessionID] = existing
             return existing
         } else {
             let session = Session(
-                sessionID: resolvedSessionID,
+                sessionID: sessionID,
                 lastSeenAt: now,
                 inFlightRequestCount: 0,
-                lastRequestBody: nil,
-                lastRequestHeaders: [],
-                lastKnownModel: nil,
-                lastKeepaliveAt: nil,
-                keepaliveSuccessCount: 0,
-                keepaliveFailureCount: 0,
-                lastKeepaliveTokenUsage: nil,
-                isKeepaliveDisabled: false,
-                keepaliveMode: .off,
                 completedRequestCount: 0,
                 erroredRequestCount: 0,
                 totalInputTokens: 0,
                 totalOutputTokens: 0,
                 totalCacheReadInputTokens: 0,
                 totalCacheCreationInputTokens: 0,
-                estimatedCostUSD: 0,
-                totalRequestsSeen: 0,
-                lineageFingerprint: nil,
-                lineageMessagesDescriptor: nil,
-                lineageRequestPath: nil,
-                lineageRequestBody: nil,
-                lineageRequestHeaders: [],
-                lineageEstablished: false,
-                keepaliveDisabledReason: nil,
-                activeAcceptedLineageRequestID: nil,
-                activeAcceptedLineageRequestPath: nil,
-                activeAcceptedLineageRequestBody: nil,
-                activeAcceptedLineageRequestHeaders: []
+                estimatedCostUSD: 0
             )
-            sessions[resolvedSessionID] = session
+            sessions[sessionID] = session
             return session
         }
     }
 
     func incrementInFlight(_ sessionID: String) {
-        let resolvedSessionID = canonicalSessionID(sessionID)
-        if var session = sessions[resolvedSessionID] {
+        if var session = sessions[sessionID] {
             session.inFlightRequestCount += 1
-            sessions[resolvedSessionID] = session
+            sessions[sessionID] = session
         }
     }
 
     func decrementInFlight(_ sessionID: String) {
-        let resolvedSessionID = canonicalSessionID(sessionID)
-        if var session = sessions[resolvedSessionID] {
+        if var session = sessions[sessionID] {
             session.inFlightRequestCount = max(0, session.inFlightRequestCount - 1)
-            sessions[resolvedSessionID] = session
+            sessions[sessionID] = session
         }
     }
 
@@ -267,320 +171,109 @@ actor ProxySessionStore {
         Array(sessions.values)
     }
 
-    /// Count of sessions that have been seen recently (within the given interval)
-    /// or still have in-flight requests.
-    func recentSessionCount(within interval: TimeInterval) -> Int {
-        let cutoff = Date().addingTimeInterval(-interval)
-        return sessions.values.filter { session in
-            session.inFlightRequestCount > 0
-                || max(session.lastSeenAt, session.lastKeepaliveAt ?? .distantPast) >= cutoff
-        }.count
-    }
-
-    /// Look up a single session by ID.
     func session(for sessionID: String) -> Session? {
-        sessions[canonicalSessionID(sessionID)]
+        sessions[sessionID]
     }
 
-    /// Mark a session's keepalive as permanently disabled (e.g. after cumulative failures).
-    func disableKeepalive(for sessionID: String) {
-        let resolvedSessionID = canonicalSessionID(sessionID)
-        if var session = sessions[resolvedSessionID] {
-            session.isKeepaliveDisabled = true
-            sessions[resolvedSessionID] = session
-        }
-    }
+    // MARK: - Lineage tree integration
 
-    /// Whether keepalive has been disabled for a session.
-    func isKeepaliveDisabled(for sessionID: String) -> Bool {
-        sessions[canonicalSessionID(sessionID)]?.isKeepaliveDisabled ?? false
-    }
-
-    // MARK: - Phase 2 keepalive support
-
-    /// Store the most recent request body, headers, and model for a session.
-    func storeRequestContext(
-        body: Data,
-        headers: [(name: String, value: String)],
-        model: String?,
-        for sessionID: String
+    /// Attach a request to the lineage tree. Called the moment upstream returns 2xx.
+    /// Stores the full fingerprint on the conversation so downstream callers never
+    /// need to re-derive model / system / tools from the original request body.
+    func attachToTree(
+        requestID: UUID,
+        sessionID: String,
+        fingerprint: LineageFingerprint,
+        messages: [LineageTree.NormalizedMessage],
+        previousResponseID: String?
     ) {
-        let resolvedSessionID = canonicalSessionID(sessionID)
-        if var session = sessions[resolvedSessionID] {
-            session.lastRequestBody = body
-            session.lastRequestHeaders = headers
-            session.lastKnownModel = model
-            sessions[resolvedSessionID] = session
+        let result = lineageTree.attach(
+            requestID: requestID,
+            sessionID: sessionID,
+            fingerprint: fingerprint,
+            messages: messages,
+            previousResponseID: previousResponseID
+        )
+        if var entry = activeRequests[requestID] {
+            entry.activity.conversationID = result.conversationID
+            entry.activity.segmentID = result.segmentID
+            entry.activity.tailIndex = result.tailIndex
+            activeRequests[requestID] = entry
         }
+        onTraffic?(nil)
     }
 
-    /// Retrieve the last stored request body for keepalive use.
-    func lastRequestBody(for sessionID: String) -> Data? {
-        sessions[canonicalSessionID(sessionID)]?.lastRequestBody
-    }
-
-    /// Set the keepalive mode for a session. Clears the disabled reason when switching to `.off`.
-    func setKeepaliveMode(_ mode: KeepaliveMode, for sessionID: String) {
-        let resolvedSessionID = canonicalSessionID(sessionID)
-        if var session = sessions[resolvedSessionID] {
-            session.keepaliveMode = mode
-            if mode == .off {
-                session.isKeepaliveDisabled = false
-                session.keepaliveDisabledReason = nil
-            }
-            sessions[resolvedSessionID] = session
-        }
-    }
-
-    /// Whether a manual keepalive can be sent for a session right now.
-    func canSendManualKeepalive(for sessionID: String) -> Bool {
-        guard let session = sessions[canonicalSessionID(sessionID)] else { return false }
-        return session.keepaliveMode == .manual
-            && !session.isKeepaliveDisabled
-            && session.lineageEstablished
-            && keepaliveRequestContext(for: session) != nil
-    }
-
-    // MARK: - Lineage tracking
-
-    /// Evaluate an incoming request against the tracked main-agent lineage.
-    /// Updates lineage state and returns an evaluation that tells the caller
-    /// whether to start/reset keepalive, stop it, or leave it alone.
-    func evaluateAndTrackLineage(
-        path: String,
-        body: Data,
-        headers: [(name: String, value: String)],
-        model: String?,
-        for sessionID: String,
-        using apiHandler: any ProxyAPIHandler
-    ) -> LineageEvaluation {
-        let resolvedSessionID = canonicalSessionID(sessionID)
-        guard var session = sessions[resolvedSessionID] else { return .ignored }
-
-        // Already disabled — nothing to do.
-        if session.isKeepaliveDisabled {
-            return .alreadyDisabled
-        }
-
-        session.totalRequestsSeen += 1
-        sessions[resolvedSessionID] = session
-
-        // Classify the incoming request.
-        let isMainAgentShaped = apiHandler.isMainAgentRequest(body: body)
-
-        // Phase 1: Lineage not yet established — identify the main agent from
-        // the first 2 requests. We store a candidate fingerprint on the first
-        // main-agent-shaped request but keep the window open until 2 requests
-        // have been seen.
-        if !session.lineageEstablished {
-            if isMainAgentShaped {
-                if session.lineageFingerprint == nil {
-                    // First main-agent-shaped request — store as candidate.
-                    guard let fingerprint = apiHandler.lineageFingerprint(from: body) else {
-                        return .ignored
-                    }
-                    session.lineageFingerprint = fingerprint
-                    session.lineageMessagesDescriptor = apiHandler.messagesDescriptor(from: body)
-                    session.lineageRequestPath = path
-                    session.lineageRequestBody = body
-                    session.lineageRequestHeaders = headers
-                    // Close the window if this is already request #2.
-                    if session.totalRequestsSeen >= 2 {
-                        session.lineageEstablished = true
-                    }
-                    sessions[resolvedSessionID] = session
-                    return .tracked
-                } else {
-                    // Second main-agent-shaped request in window — close the
-                    // window and fall through to the continuation check below.
-                    session.lineageEstablished = true
-                    sessions[resolvedSessionID] = session
-                }
-            } else {
-                // Not main-agent-shaped.
-                if session.totalRequestsSeen >= 2 && session.lineageFingerprint == nil {
-                    // Past identification window without finding a main agent.
-                    disableKeepaliveWithReason(
-                        for: resolvedSessionID,
-                        reason: String(localized: "no main-agent candidate in first 2 requests")
-                    )
-                    return .diverged(reason: "no main-agent candidate in first 2 requests")
-                }
-                if session.totalRequestsSeen >= 2 && session.lineageFingerprint != nil {
-                    // Window closed with a candidate already stored — establish it.
-                    session.lineageEstablished = true
-                    sessions[resolvedSessionID] = session
-                }
-                return session.lineageEstablished ? .ignored : .pendingIdentification
-            }
-        }
-
-        // Reload session after potential updates above.
-        guard let currentSession = sessions[resolvedSessionID] else { return .ignored }
-
-        // Phase 2: Lineage established — classify against tracked fingerprint.
-        if !isMainAgentShaped {
-            return .ignored
-        }
-
-        guard let tracked = currentSession.lineageFingerprint else { return .ignored }
-        guard let incoming = apiHandler.lineageFingerprint(from: body) else { return .ignored }
-
-        // Step 1: Check if system + messages indicate a continuation of the
-        // main agent. If not, this is side traffic (e.g. a subagent with a
-        // different system prompt) — ignore it without disabling keepalive.
-        if incoming.systemCanonical != tracked.systemCanonical {
-            return .ignored
-        }
-
-        let incomingMessages = apiHandler.messagesDescriptor(from: body)
-        if let trackedMessages = currentSession.lineageMessagesDescriptor,
-           let incomingMsg = incomingMessages {
-            if !incomingMsg.hasPrefix(trackedMessages) {
-                let trackedCount = trackedMessages.components(separatedBy: "\nmessage:").count
-                let incomingCount = incomingMsg.components(separatedBy: "\nmessage:").count
-                if incomingCount < trackedCount {
-                    // Fewer messages — side traffic, not a divergence.
-                    return .ignored
-                }
-                let reason = String(localized: "messages not append-only")
-                disableKeepaliveWithReason(for: resolvedSessionID, reason: reason)
-                return .diverged(reason: reason)
-            }
-        }
-
-        // Step 2: System + messages match the main agent continuation. Now
-        // check cache-invalidating fields — if any changed, this is a true
-        // divergence that would break the prompt cache.
-        if incoming.model != tracked.model {
-            let reason = "model changed: \(tracked.model) → \(incoming.model)"
-            disableKeepaliveWithReason(for: resolvedSessionID, reason: reason)
-            return .diverged(reason: reason)
-        }
-        if incoming.toolsCanonical != tracked.toolsCanonical {
-            let reason = String(localized: "tools changed")
-            disableKeepaliveWithReason(for: resolvedSessionID, reason: reason)
-            return .diverged(reason: reason)
-        }
-        if incoming.toolChoiceCanonical != tracked.toolChoiceCanonical {
-            let reason = String(localized: "tool_choice changed")
-            disableKeepaliveWithReason(for: resolvedSessionID, reason: reason)
-            return .diverged(reason: reason)
-        }
-        if incoming.thinkingCanonical != tracked.thinkingCanonical {
-            let reason = String(localized: "thinking config changed")
-            disableKeepaliveWithReason(for: resolvedSessionID, reason: reason)
-            return .diverged(reason: reason)
-        }
-
-        // All checks pass — promote this request as the latest lineage point.
-        if var updated = sessions[resolvedSessionID] {
-            updated.lineageMessagesDescriptor = incomingMessages
-            updated.lineageRequestPath = path
-            updated.lineageRequestBody = body
-            updated.lineageRequestHeaders = headers
-            sessions[resolvedSessionID] = updated
-        }
-        return .tracked
-    }
-
-    /// Prefer an accepted in-flight main-agent continuation as the keepalive source,
-    /// falling back to the last completed tracked lineage request.
-    func keepaliveRequestContext(for sessionID: String) -> KeepaliveRequestContext? {
-        guard let session = sessions[canonicalSessionID(sessionID)] else { return nil }
-        return keepaliveRequestContext(for: session)
-    }
-
-    /// Track an accepted upstream request as the freshest keepalive source while it is still active.
-    func markAcceptedLineageRequestActive(
-        id: UUID,
-        path: String,
-        body: Data,
-        headers: [(name: String, value: String)],
-        for sessionID: String,
-        using apiHandler: any ProxyAPIHandler
+    /// Mark a lineage-tree node as done after the response has been fully received.
+    /// No-op when the request was never attached.
+    func markNodeDone(
+        requestID: UUID,
+        tokenUsage: TokenUsage?,
+        responseID: String?
     ) {
-        guard var session = sessions[sessionID] else { return }
-        guard session.lineageEstablished, !session.isKeepaliveDisabled else { return }
-        guard apiHandler.isMainAgentRequest(body: body) else { return }
-        guard let tracked = session.lineageFingerprint,
-              let incoming = apiHandler.lineageFingerprint(from: body) else {
-            return
-        }
-
-        guard incoming.systemCanonical == tracked.systemCanonical,
-              incoming.model == tracked.model,
-              incoming.toolsCanonical == tracked.toolsCanonical,
-              incoming.toolChoiceCanonical == tracked.toolChoiceCanonical,
-              incoming.thinkingCanonical == tracked.thinkingCanonical else {
-            return
-        }
-
-        let incomingMessages = apiHandler.messagesDescriptor(from: body)
-        if let trackedMessages = session.lineageMessagesDescriptor {
-            guard let incomingMessages, incomingMessages.hasPrefix(trackedMessages) else {
-                return
-            }
-        }
-
-        session.activeAcceptedLineageRequestID = id
-        session.activeAcceptedLineageRequestPath = path
-        session.activeAcceptedLineageRequestBody = body
-        session.activeAcceptedLineageRequestHeaders = headers
-        sessions[sessionID] = session
+        lineageTree.markDone(
+            requestID: requestID,
+            tokenUsage: tokenUsage,
+            responseID: responseID
+        )
     }
 
-    /// Disable keepalive with a human-readable reason for UI display.
-    func disableKeepaliveWithReason(for sessionID: String, reason: String) {
-        let resolvedSessionID = canonicalSessionID(sessionID)
-        if var session = sessions[resolvedSessionID] {
-            session.isKeepaliveDisabled = true
-            session.keepaliveDisabledReason = reason
-            sessions[resolvedSessionID] = session
+    /// Prune inactive lineage-tree leaves and return the IDs removed so callers
+    /// can mirror deletions to SQLite.
+    func pruneLineageTree(retention: TimeInterval) -> LineageTree.PruneResult {
+        let result = lineageTree.prune(retention: retention)
+        for removed in result.removedRequestIDs {
+            treeDoneActivities.removeValue(forKey: removed)
         }
+        return result
     }
 
-    /// Re-enable keepalive for a session after a user-initiated disable.
-    /// Clears the disabled flag and reason. Lineage state is preserved so the
-    /// next tracked request can resume the keepalive loop.
-    func enableKeepalive(for sessionID: String) {
-        let resolvedSessionID = canonicalSessionID(sessionID)
-        if var session = sessions[resolvedSessionID] {
-            session.isKeepaliveDisabled = false
-            session.keepaliveDisabledReason = nil
-            sessions[resolvedSessionID] = session
-        }
-    }
+    /// Test hook: snapshot of the current tree state, used for diagnostics and UI.
+    func lineageTreeSnapshot() -> LineageTree { lineageTree }
 
-    /// The reason keepalive was disabled for a session, if any.
-    func keepaliveDisabledReason(for sessionID: String) -> String? {
-        sessions[canonicalSessionID(sessionID)]?.keepaliveDisabledReason
-    }
-
-    /// Record keepalive result for a session. On success, accumulates cost.
-    func recordKeepaliveResult(
-        for sessionID: String,
-        success: Bool,
-        tokenUsage: TokenUsage,
-        apiFlavor: ProxyAPIFlavor
-    ) {
-        let resolvedSessionID = canonicalSessionID(sessionID)
-        if var session = sessions[resolvedSessionID] {
-            session.lastKeepaliveAt = Date()
-            if success {
-                session.keepaliveSuccessCount += 1
-                session.lastKeepaliveTokenUsage = tokenUsage
-                // Accumulate keepalive cost into the session total.
-                if let pricing = ModelPricingTable.pricing(for: session.lastKnownModel) {
-                    let cost = tokenUsage.cost(for: pricing)
-                    session.estimatedCostUSD += cost
-                    accumulateCost(cost, for: apiFlavor)
-                }
-            } else {
-                session.keepaliveFailureCount += 1
-            }
-            sessions[resolvedSessionID] = session
+    /// Build the `LineageContext` needed to mirror a request's tree coordinates
+    /// into SQLite. Returns nil when the request is not currently tracked by the tree.
+    func lineageContext(for requestID: UUID) -> ProxyEventLogger.LineageContext? {
+        guard let (segmentID, nodeIndex) = lineageTree.nodeLocations[requestID],
+              let segment = lineageTree.segments[segmentID],
+              let conversation = lineageTree.conversation(withID: segment.conversationID) else {
+            return nil
         }
+        let node = segment.nodes[nodeIndex]
+        let fingerprint = conversation.fingerprint
+        let targetSegmentID = segment.id
+
+        // Walk parent chain from root → target. Each row's `messages_json` uses
+        // the segment's cached serialization (populated once per mutation), so
+        // ancestors don't re-encode on every request. `isTarget` tells the
+        // logger which row is allowed to rewrite `messages_json` on conflict.
+        var chain: [ProxyEventLogger.LineageContext.SegmentRow] = []
+        var visitedID: UUID? = targetSegmentID
+        while let currentID = visitedID {
+            guard let current = lineageTree.segments[currentID] else { break }
+            let json = lineageTree.cachedMessagesJSON(for: currentID)
+            chain.insert(
+                ProxyEventLogger.LineageContext.SegmentRow(
+                    id: current.id,
+                    parentSegmentID: current.parentSegmentID,
+                    parentSplitIndex: current.parentSplitIndex,
+                    messagesJSON: json,
+                    isTarget: current.id == targetSegmentID
+                ),
+                at: 0
+            )
+            visitedID = current.parentSegmentID
+        }
+
+        return ProxyEventLogger.LineageContext(
+            conversationID: segment.conversationID,
+            segmentID: targetSegmentID,
+            tailIndex: node.tailIndex,
+            previousResponseID: node.previousResponseID,
+            fingerprintHash: fingerprint.conversationKey.fingerprintHash,
+            fingerprint: fingerprint,
+            flavor: fingerprint.flavor,
+            segmentChain: chain
+        )
     }
 
     // MARK: - Token usage accumulation
@@ -592,8 +285,7 @@ actor ProxySessionStore {
         for sessionID: String,
         apiFlavor: ProxyAPIFlavor
     ) {
-        let resolvedSessionID = canonicalSessionID(sessionID)
-        guard var session = sessions[resolvedSessionID] else { return }
+        guard var session = sessions[sessionID] else { return }
         session.totalInputTokens += usage.inputTokens ?? 0
         session.totalOutputTokens += usage.outputTokens ?? 0
         session.totalCacheReadInputTokens += usage.cacheReadInputTokens ?? 0
@@ -603,7 +295,7 @@ actor ProxySessionStore {
             session.estimatedCostUSD += cost
             accumulateCost(cost, for: apiFlavor)
         }
-        sessions[resolvedSessionID] = session
+        sessions[sessionID] = session
     }
 
     /// Cumulative estimated cost since proxy start (survives session expiration).
@@ -614,8 +306,6 @@ actor ProxySessionStore {
         )
     }
 
-    /// Reset all transient counters while keeping sessions operational for keepalive.
-    /// Preserves request context (body, headers, model) needed by keepalive loops.
     /// Reset only the cumulative cost estimate to zero. Per-session costs are preserved.
     func resetCost() {
         cumulativeEstimatedCostUSD = 0
@@ -629,18 +319,16 @@ actor ProxySessionStore {
         id: UUID,
         sessionID: String,
         model: String?,
-        promptDescriptor: String?,
-        isMainAgentShaped: Bool,
         kind: ProxyRequestKind = .request
     ) {
-        let resolvedSessionID = canonicalSessionID(sessionID)
         let activity = ProxyRequestActivity(
             id: id,
             kind: kind,
             state: .uploading,
             modelID: model,
-            promptDescriptor: promptDescriptor,
-            isMainAgentShaped: isMainAgentShaped,
+            conversationID: nil,
+            segmentID: nil,
+            tailIndex: nil,
             bytesSent: 0,
             bytesReceived: 0,
             lastDataAt: nil,
@@ -651,20 +339,14 @@ actor ProxySessionStore {
             tokenUsage: nil,
             estimatedCost: nil
         )
-        if kind == .keepalive {
-            activeRequests = activeRequests.filter { key, value in
-                key == id || value.sessionID != resolvedSessionID || !value.activity.isKeepalive
-            }
-            lastKeepaliveRequestBySession.removeValue(forKey: resolvedSessionID)
-        }
-        activeRequests[id] = (sessionID: resolvedSessionID, activity: activity)
+        activeRequests[id] = (sessionID: sessionID, activity: activity)
         onTraffic?(.upload)
     }
 
     /// Transition a request from `.uploading` to `.waiting` once the upload is complete.
     func markRequestWaiting(id: UUID) {
         guard var entry = activeRequests[id] else { return }
-        guard entry.activity.state == .uploading else { return }  // Only advance from .uploading
+        guard entry.activity.state == .uploading else { return }
         entry.activity.state = .waiting
         entry.activity.lastDataAt = Date()
         activeRequests[id] = entry
@@ -674,7 +356,7 @@ actor ProxySessionStore {
     /// Transition a request from `.uploading` or `.waiting` to `.receiving` once response headers arrive.
     func markRequestReceiving(id: UUID) {
         guard var entry = activeRequests[id] else { return }
-        guard entry.activity.state == .uploading || entry.activity.state == .waiting else { return }  // Only advance from .uploading or .waiting
+        guard entry.activity.state == .uploading || entry.activity.state == .waiting else { return }
         entry.activity.state = .receiving
         entry.activity.lastDataAt = Date()
         entry.activity.receivingStartedAt = Date()
@@ -683,14 +365,11 @@ actor ProxySessionStore {
     }
 
     /// Record the timestamp of the first upstream data chunk (once per request).
-    /// This is more accurate than `receivingStartedAt` for TTFT measurement on
-    /// streaming responses where headers may arrive before the first token.
     func markFirstDataReceived(id: UUID) {
         guard var entry = activeRequests[id] else { return }
-        guard entry.activity.firstDataAt == nil else { return }  // Only record the first chunk
+        guard entry.activity.firstDataAt == nil else { return }
         entry.activity.firstDataAt = Date()
         activeRequests[id] = entry
-        // No onTraffic call — updateRequestBytes follows immediately and handles that.
     }
 
     /// Update the cumulative bytes sent to upstream for a request.
@@ -722,50 +401,45 @@ actor ProxySessionStore {
     /// Cumulative bytes received since the actor was created. Used for KB/s computation.
     func cumulativeBytesReceived() -> Int { totalBytesReceived }
 
-    /// Finalize a request, promoting only non-errored responses into the session's
-    /// done section where prompt-based replacement is evaluated.
+    /// Finalize a request. Successful completions that are NOT part of the lineage
+    /// tree (unknown flavor or missing fingerprint) land in the short-lived
+    /// `doneRequestsBySession` bucket for UI display.
     func markRequestDone(id: UUID, errored: Bool, tokenUsage: TokenUsage?, estimatedCost: Double?) {
         guard var entry = activeRequests.removeValue(forKey: id) else { return }
-        let resolvedSessionID = canonicalSessionID(entry.sessionID)
-        entry.sessionID = resolvedSessionID
         let completedAt = Date()
         entry.activity.state = .done
         entry.activity.completedAt = completedAt
         entry.activity.tokenUsage = tokenUsage
         entry.activity.estimatedCost = estimatedCost
 
-        // A response is "complete" when no transport/HTTP error occurred.
-        // We don't require stopReason because the streaming capture buffer
-        // may be truncated (4 MB cap) and miss the final message_delta event.
         let isComplete = !errored
-        if isComplete && entry.activity.isKeepalive {
-            lastKeepaliveRequestBySession[resolvedSessionID] = entry.activity
-        } else if isComplete {
-            insertDoneRequest(entry.activity, for: resolvedSessionID)
+        if isComplete {
+            if entry.activity.conversationID == nil {
+                // Untracked traffic: keep a short-lived copy in the done bucket.
+                insertUntrackedDoneRequest(entry.activity, for: entry.sessionID)
+            } else {
+                // Tracked traffic: cache the full activity so tree-leaf rendering has
+                // model name / byte counts / timing / cost even after the in-flight
+                // entry is dropped.
+                treeDoneActivities[id] = entry.activity
+            }
         }
 
-        if var session = sessions[resolvedSessionID] {
-            if session.activeAcceptedLineageRequestID == id {
-                session.activeAcceptedLineageRequestID = nil
-                session.activeAcceptedLineageRequestPath = nil
-                session.activeAcceptedLineageRequestBody = nil
-                session.activeAcceptedLineageRequestHeaders = []
-            }
+        if var session = sessions[entry.sessionID] {
             if isComplete {
                 session.completedRequestCount += 1
             } else {
                 session.erroredRequestCount += 1
             }
-            sessions[resolvedSessionID] = session
+            sessions[entry.sessionID] = session
         }
         onTraffic?(nil)
-        // Only successful completions spawn the cost-transformation particle.
-        // 4xx/5xx/transport failures typically don't accrue provider cost,
-        // so animating them would be a false positive.
         if isComplete {
             onRequestDone?()
         }
     }
+
+    // MARK: - Snapshot
 
     /// Return a snapshot of all sessions with their stats and in-flight requests,
     /// sorted by most-recently-seen first.
@@ -774,31 +448,78 @@ actor ProxySessionStore {
         for (_, entry) in activeRequests {
             activeRequestsBySession[entry.sessionID, default: []].append(entry.activity)
         }
+
+        // Lineage-tree leaves are collected per conversation, then bucketed
+        // back into whichever session contributed each leaf. A conversation
+        // can span multiple sessions (rare but legal) so we rely on the
+        // sessionID recorded on each node. Prefer the cached `ProxyRequestActivity`
+        // captured at completion so rows show model / bytes / cost; fall back to
+        // a tree-only synthesis if the cache has already expired.
+        //
+        // `displayableDoneLeaves` returns both true leaves (no descendants) and
+        // pending-replacement leaves (descendants exist but are still done=false).
+        // The `isPendingReplacement` flag drives the per-row dimming in the popup.
+        var leafActivityBySession: [String: [ProxyRequestActivity]] = [:]
+        for leaf in lineageTree.displayableDoneLeaves() {
+            guard let (segmentID, nodeIndex) = lineageTree.nodeLocations[leaf.requestID],
+                  let segment = lineageTree.segments[segmentID] else {
+                continue
+            }
+            let node = segment.nodes[nodeIndex]
+            var activity: ProxyRequestActivity
+            if let cached = treeDoneActivities[leaf.requestID] {
+                activity = cached
+            } else {
+                let conversationModel = lineageTree
+                    .conversation(withID: segment.conversationID)?
+                    .fingerprint
+                    .model
+                activity = ProxyRequestActivity(
+                    id: node.requestID,
+                    kind: .request,
+                    state: .done,
+                    modelID: conversationModel,
+                    conversationID: segment.conversationID,
+                    segmentID: segment.id,
+                    tailIndex: node.tailIndex,
+                    bytesSent: 0,
+                    bytesReceived: 0,
+                    lastDataAt: nil,
+                    startedAt: node.createdAt,
+                    receivingStartedAt: nil,
+                    firstDataAt: nil,
+                    completedAt: node.doneAt,
+                    tokenUsage: node.tokenUsage,
+                    estimatedCost: nil
+                )
+            }
+            activity.isPendingReplacement = leaf.isPendingReplacement
+            leafActivityBySession[node.sessionID, default: []].append(activity)
+        }
+
+        // For untracked sessions ("other" or missing flavor) merge in the
+        // short-retention done bucket.
+        for (sessionID, requests) in doneRequestsBySession {
+            leafActivityBySession[sessionID, default: []].append(contentsOf: requests)
+        }
+
         return sessions.values.map { session in
             SessionSnapshot(
                 sessionID: session.sessionID,
                 lastSeenAt: session.lastSeenAt,
-                lastKeepaliveAt: session.lastKeepaliveAt,
                 completedRequestCount: session.completedRequestCount,
                 erroredRequestCount: session.erroredRequestCount,
-                keepaliveTotalCount: session.keepaliveSuccessCount + session.keepaliveFailureCount,
                 activeRequests: activeRequestsBySession[session.sessionID] ?? [],
-                doneRequests: doneRequestsBySession[session.sessionID] ?? [],
-                lastKeepaliveRequest: lastKeepaliveRequestBySession[session.sessionID],
+                doneRequests: (leafActivityBySession[session.sessionID] ?? [])
+                    .sorted { ($0.completedAt ?? $0.startedAt) < ($1.completedAt ?? $1.startedAt) },
                 totalInputTokens: session.totalInputTokens,
                 totalOutputTokens: session.totalOutputTokens,
                 totalCacheReadInputTokens: session.totalCacheReadInputTokens,
                 totalCacheCreationInputTokens: session.totalCacheCreationInputTokens,
-                estimatedCostUSD: session.estimatedCostUSD,
-                isKeepaliveDisabled: session.isKeepaliveDisabled,
-                keepaliveDisabledReason: session.keepaliveDisabledReason,
-                keepaliveMode: session.keepaliveMode,
-                lineageEstablished: session.lineageEstablished,
-                lastKeepaliveTokenUsage: session.lastKeepaliveTokenUsage
+                estimatedCostUSD: session.estimatedCostUSD
             )
         }.sorted {
-            max($0.lastSeenAt, $0.lastKeepaliveAt ?? .distantPast)
-                > max($1.lastSeenAt, $1.lastKeepaliveAt ?? .distantPast)
+            $0.lastSeenAt > $1.lastSeenAt
         }
     }
 
@@ -810,42 +531,38 @@ actor ProxySessionStore {
     func expireSessions(olderThan date: Date, otherOlderThan otherDate: Date) -> [String] {
         var expired: [String] = []
         for (id, session) in sessions {
-            let cutoff = usesShortRetentionWindow(for: id, session: session) ? otherDate : date
-            guard max(session.lastSeenAt, session.lastKeepaliveAt ?? .distantPast) < cutoff,
+            let cutoff = ProxySessionID.usesShortRetentionWindow(for: id) ? otherDate : date
+            guard session.lastSeenAt < cutoff,
                   session.inFlightRequestCount == 0 else {
                 continue
             }
             expired.append(id)
         }
+        let expiredSet = Set(expired)
         for id in expired {
             sessions.removeValue(forKey: id)
             doneRequestsBySession.removeValue(forKey: id)
-            lastKeepaliveRequestBySession.removeValue(forKey: id)
         }
-        if !expired.isEmpty {
-            let expiredSessionIDs = Set(expired)
-            openAIThreadRecords = openAIThreadRecords.filter { _, record in
-                !expiredSessionIDs.contains(record.sessionID)
+        // Drop cached done-leaf activities whose tree-side node belonged to an
+        // expired session. Rare (the lineage tree usually holds nodes longer
+        // than sessions) but keeps memory from leaking across evictions.
+        treeDoneActivities = treeDoneActivities.filter { requestID, _ in
+            guard let (segmentID, nodeIndex) = lineageTree.nodeLocations[requestID],
+                  let segment = lineageTree.segments[segmentID] else {
+                return false
             }
-            openAISessionAliases = openAISessionAliases.filter { sourceSessionID, destinationSessionID in
-                !expiredSessionIDs.contains(sourceSessionID)
-                    && !expiredSessionIDs.contains(destinationSessionID)
-            }
-            reconcileOpenAIThreadSessions()
+            return !expiredSet.contains(segment.nodes[nodeIndex].sessionID)
         }
         return expired
     }
 
-    /// Remove non-main-agent done requests older than the given cutoff.
-    /// Main-agent requests persist for the session lifetime.
-    func pruneStaleDoneRequests(olderThan cutoff: Date, otherOlderThan otherCutoff: Date) {
+    /// Remove untracked done requests older than the given cutoff.
+    /// Flavored sessions store their done leaves in the lineage tree which
+    /// has its own prune cycle.
+    func pruneStaleDoneRequests(otherOlderThan otherCutoff: Date) {
         for (sessionID, requests) in doneRequestsBySession {
-            let session = sessions[sessionID]
             let filtered = requests.filter { request in
-                if let session, usesShortDoneRequestRetentionWindow(for: sessionID, session: session) {
-                    return (request.completedAt ?? request.startedAt) >= otherCutoff
-                }
-                return request.isMainAgentShaped || (request.completedAt ?? request.startedAt) >= cutoff
+                (request.completedAt ?? request.startedAt) >= otherCutoff
             }
             if filtered.isEmpty {
                 doneRequestsBySession.removeValue(forKey: sessionID)
@@ -855,265 +572,16 @@ actor ProxySessionStore {
         }
     }
 
-    /// Clear the main-agent flag on a done request after lineage evaluation
-    /// determines it is not part of the tracked main-agent lineage.
-    func clearMainAgentFlag(requestID: UUID, sessionID: String) {
-        let resolvedSessionID = canonicalSessionID(sessionID)
-        guard var doneRequests = doneRequestsBySession[resolvedSessionID] else { return }
-        guard let index = doneRequests.firstIndex(where: { $0.id == requestID }) else { return }
-        doneRequests[index].isMainAgentShaped = false
-        doneRequestsBySession[resolvedSessionID] = doneRequests
-        onTraffic?(nil)
-    }
+    // MARK: - Private helpers
 
-    private func insertDoneRequest(_ activity: ProxyRequestActivity, for sessionID: String) {
-        let resolvedSessionID = canonicalSessionID(sessionID)
-        var doneRequests = doneRequestsBySession[resolvedSessionID] ?? []
-        if let replacementIndex = replacementIndex(for: activity, in: doneRequests) {
-            doneRequests.remove(at: replacementIndex)
-        }
+    private func insertUntrackedDoneRequest(_ activity: ProxyRequestActivity, for sessionID: String) {
+        var doneRequests = doneRequestsBySession[sessionID] ?? []
         doneRequests.append(activity)
-        doneRequestsBySession[resolvedSessionID] = doneRequests
-    }
-
-    private func usesShortRetentionWindow(for sessionID: String, session: Session) -> Bool {
-        ProxySessionID.usesShortRetentionWindow(
-            for: sessionID,
-            lineageEstablished: session.lineageEstablished
-        )
-    }
-
-    private func usesShortDoneRequestRetentionWindow(for sessionID: String, session: Session) -> Bool {
-        ProxySessionID.usesShortDoneRequestRetentionWindow(
-            for: sessionID,
-            lineageEstablished: session.lineageEstablished
-        )
+        doneRequestsBySession[sessionID] = doneRequests
     }
 
     private func accumulateCost(_ cost: Double, for apiFlavor: ProxyAPIFlavor) {
         cumulativeEstimatedCostUSD += cost
         cumulativeEstimatedCostUSDByAPI[apiFlavor, default: 0] += cost
-    }
-
-    private func keepaliveRequestContext(for session: Session) -> KeepaliveRequestContext? {
-        if let path = session.activeAcceptedLineageRequestPath,
-           let body = session.activeAcceptedLineageRequestBody {
-            return KeepaliveRequestContext(
-                path: path,
-                body: body,
-                headers: session.activeAcceptedLineageRequestHeaders
-            )
-        }
-        if let path = session.lineageRequestPath,
-           let body = session.lineageRequestBody {
-            return KeepaliveRequestContext(
-                path: path,
-                body: body,
-                headers: session.lineageRequestHeaders
-            )
-        }
-        return nil
-    }
-
-    private func replacementIndex(
-        for newActivity: ProxyRequestActivity,
-        in doneRequests: [ProxyRequestActivity]
-    ) -> Int? {
-        guard let newPrompt = newActivity.promptDescriptor, !newPrompt.isEmpty else {
-            return nil
-        }
-
-        return doneRequests.enumerated()
-            .filter { _, oldActivity in
-                guard oldActivity.modelID == newActivity.modelID,
-                      let oldPrompt = oldActivity.promptDescriptor,
-                      !oldPrompt.isEmpty else {
-                    return false
-                }
-                return newPrompt.contains(oldPrompt)
-            }
-            .max { lhs, rhs in
-                let lhsLength = lhs.element.promptDescriptor?.count ?? 0
-                let rhsLength = rhs.element.promptDescriptor?.count ?? 0
-                if lhsLength == rhsLength {
-                    return (lhs.element.completedAt ?? lhs.element.startedAt)
-                        < (rhs.element.completedAt ?? rhs.element.startedAt)
-                }
-                return lhsLength < rhsLength
-            }?
-            .offset
-    }
-
-    private func resolveOpenAISessionID(threadID: String, parentThreadID: String?) -> String {
-        let normalizedThreadID = ProxySessionID.normalizedRawID(threadID)
-        let normalizedParentThreadID = ProxySessionID.normalizedOptionalRawID(parentThreadID)
-        let existingRecord = openAIThreadRecords[normalizedThreadID]
-        let effectiveParentThreadID: String?
-        if normalizedParentThreadID == normalizedThreadID {
-            effectiveParentThreadID = nil
-        } else {
-            effectiveParentThreadID = normalizedParentThreadID ?? existingRecord?.parentThreadID
-        }
-        let initialSessionID: String
-        if let effectiveParentThreadID,
-           let rootThreadID = highestKnownOpenAIAncestor(startingAt: effectiveParentThreadID) {
-            initialSessionID = ProxySessionID.make(rootThreadID, flavor: .openAIResponses)
-        } else {
-            initialSessionID = ProxySessionID.make(normalizedThreadID, flavor: .openAIResponses)
-        }
-
-        openAIThreadRecords[normalizedThreadID] = OpenAIThreadRecord(
-            parentThreadID: effectiveParentThreadID,
-            sessionID: initialSessionID
-        )
-
-        reconcileOpenAIThreadSessions()
-        return openAIThreadRecords[normalizedThreadID]?.sessionID ?? initialSessionID
-    }
-
-    private func highestKnownOpenAIAncestor(startingAt threadID: String) -> String? {
-        var currentThreadID = threadID
-        var highestKnownThreadID: String?
-        var visitedThreadIDs = Set<String>()
-
-        while visitedThreadIDs.insert(currentThreadID).inserted,
-              let record = openAIThreadRecords[currentThreadID] {
-            highestKnownThreadID = currentThreadID
-            guard let parentThreadID = record.parentThreadID else {
-                break
-            }
-            currentThreadID = parentThreadID
-        }
-
-        return highestKnownThreadID
-    }
-
-    private func reconcileOpenAIThreadSessions() {
-        for threadID in openAIThreadRecords.keys.sorted() {
-            guard var record = openAIThreadRecords[threadID] else { continue }
-            let desiredSessionID = desiredOpenAISessionID(for: threadID)
-            guard record.sessionID != desiredSessionID else { continue }
-            migrateOpenAISessionData(from: record.sessionID, to: desiredSessionID)
-            record.sessionID = desiredSessionID
-            openAIThreadRecords[threadID] = record
-        }
-    }
-
-    private func desiredOpenAISessionID(for threadID: String) -> String {
-        guard let record = openAIThreadRecords[threadID],
-              let parentThreadID = record.parentThreadID,
-              let rootThreadID = highestKnownOpenAIAncestor(startingAt: parentThreadID) else {
-            return ProxySessionID.make(threadID, flavor: .openAIResponses)
-        }
-
-        return ProxySessionID.make(rootThreadID, flavor: .openAIResponses)
-    }
-
-    private func migrateOpenAISessionData(from sourceSessionID: String, to destinationSessionID: String) {
-        guard sourceSessionID != destinationSessionID,
-              ProxySessionID.flavor(for: sourceSessionID) == .openAIResponses,
-              ProxySessionID.flavor(for: destinationSessionID) == .openAIResponses else {
-            return
-        }
-
-        let canonicalDestinationSessionID = canonicalSessionID(destinationSessionID)
-        openAISessionAliases[sourceSessionID] = canonicalDestinationSessionID
-
-        let sourceSession = sessions[sourceSessionID]
-        let destinationSession = sessions[canonicalDestinationSessionID]
-
-        if let sourceSession {
-            sessions[canonicalDestinationSessionID] = mergedOpenAISession(
-                source: sourceSession,
-                destination: destinationSession,
-                destinationSessionID: canonicalDestinationSessionID
-            )
-            sessions.removeValue(forKey: sourceSessionID)
-        }
-
-        reassignOpenAIRequestState(from: sourceSessionID, to: canonicalDestinationSessionID)
-    }
-
-    private func mergedOpenAISession(
-        source: Session,
-        destination: Session?,
-        destinationSessionID: String
-    ) -> Session {
-        let preferredContextSource: Session
-        if let destination, destination.lastSeenAt > source.lastSeenAt {
-            preferredContextSource = destination
-        } else {
-            preferredContextSource = source
-        }
-
-        return Session(
-            sessionID: destinationSessionID,
-            lastSeenAt: max(destination?.lastSeenAt ?? .distantPast, source.lastSeenAt),
-            inFlightRequestCount: (destination?.inFlightRequestCount ?? 0) + source.inFlightRequestCount,
-            lastRequestBody: preferredContextSource.lastRequestBody,
-            lastRequestHeaders: preferredContextSource.lastRequestHeaders,
-            lastKnownModel: preferredContextSource.lastKnownModel,
-            lastKeepaliveAt: nil,
-            keepaliveSuccessCount: 0,
-            keepaliveFailureCount: 0,
-            lastKeepaliveTokenUsage: nil,
-            isKeepaliveDisabled: false,
-            keepaliveMode: .off,
-            completedRequestCount: (destination?.completedRequestCount ?? 0) + source.completedRequestCount,
-            erroredRequestCount: (destination?.erroredRequestCount ?? 0) + source.erroredRequestCount,
-            totalInputTokens: (destination?.totalInputTokens ?? 0) + source.totalInputTokens,
-            totalOutputTokens: (destination?.totalOutputTokens ?? 0) + source.totalOutputTokens,
-            totalCacheReadInputTokens: (destination?.totalCacheReadInputTokens ?? 0) + source.totalCacheReadInputTokens,
-            totalCacheCreationInputTokens: (destination?.totalCacheCreationInputTokens ?? 0) + source.totalCacheCreationInputTokens,
-            estimatedCostUSD: (destination?.estimatedCostUSD ?? 0) + source.estimatedCostUSD,
-            totalRequestsSeen: 0,
-            lineageFingerprint: nil,
-            lineageMessagesDescriptor: nil,
-            lineageRequestPath: nil,
-            lineageRequestBody: nil,
-            lineageRequestHeaders: [],
-            lineageEstablished: false,
-            keepaliveDisabledReason: nil,
-            activeAcceptedLineageRequestID: nil,
-            activeAcceptedLineageRequestPath: nil,
-            activeAcceptedLineageRequestBody: nil,
-            activeAcceptedLineageRequestHeaders: []
-        )
-    }
-
-    private func reassignOpenAIRequestState(from sourceSessionID: String, to destinationSessionID: String) {
-        let matchingActiveRequestIDs = activeRequests.compactMap { requestID, entry in
-            entry.sessionID == sourceSessionID ? requestID : nil
-        }
-        for requestID in matchingActiveRequestIDs {
-            guard let entry = activeRequests[requestID] else { continue }
-            activeRequests[requestID] = (sessionID: destinationSessionID, activity: entry.activity)
-        }
-
-        if let sourceDoneRequests = doneRequestsBySession.removeValue(forKey: sourceSessionID) {
-            doneRequestsBySession[destinationSessionID, default: []].append(contentsOf: sourceDoneRequests)
-        }
-
-        if let sourceLastKeepalive = lastKeepaliveRequestBySession.removeValue(forKey: sourceSessionID) {
-            let destinationLastKeepalive = lastKeepaliveRequestBySession[destinationSessionID]
-            let destinationCompletedAt = destinationLastKeepalive?.completedAt ?? .distantPast
-            let sourceCompletedAt = sourceLastKeepalive.completedAt ?? .distantPast
-            if sourceCompletedAt >= destinationCompletedAt {
-                lastKeepaliveRequestBySession[destinationSessionID] = sourceLastKeepalive
-            }
-        }
-    }
-
-    private func canonicalSessionID(_ sessionID: String) -> String {
-        var currentSessionID = sessionID
-        var visitedSessionIDs = Set<String>()
-
-        while visitedSessionIDs.insert(currentSessionID).inserted,
-              let nextSessionID = openAISessionAliases[currentSessionID],
-              nextSessionID != currentSessionID {
-            currentSessionID = nextSessionID
-        }
-
-        return currentSessionID
     }
 }

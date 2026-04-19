@@ -6,7 +6,7 @@ final class ConfigService {
     static let shared = ConfigService()
 
     /// Current on-disk schema version. Bump when adding fields that need migration.
-    private static let currentConfigVersion = 6
+    private static let currentConfigVersion = 7
     private static let defaultAnthropicUpstreamURL = "https://zenmux.ai/api/anthropic"
     private static let defaultOpenAIUpstreamURL = "https://api.openai.com"
 
@@ -41,23 +41,9 @@ final class ConfigService {
         didSet { save() }
     }
 
-    var keepaliveEnabled: Bool {
-        didSet { save() }
-    }
-
-    var keepaliveIntervalSeconds: Int {
-        didSet { save() }
-    }
-
-    var proxyInactivityTimeoutSeconds: Int {
-        didSet { save() }
-    }
-
+    /// Single on/off toggle for the unified proxy event log (metadata + deduplicated payloads).
+    /// When disabled, no SQLite database is opened and nothing is written to disk.
     var saveProxyEventLog: Bool {
-        didSet { save() }
-    }
-
-    var saveProxyPayloads: Bool {
         didSet { save() }
     }
 
@@ -78,11 +64,7 @@ final class ConfigService {
         self.anthropicUpstreamURL = loaded.config.anthropicUpstreamURL
         self.openAIUpstreamURL = loaded.config.openAIUpstreamURL
         self.proxyPort = loaded.config.proxyPort
-        self.keepaliveEnabled = loaded.config.keepaliveEnabled
-        self.keepaliveIntervalSeconds = loaded.config.keepaliveIntervalSeconds
-        self.proxyInactivityTimeoutSeconds = loaded.config.proxyInactivityTimeoutSeconds
         self.saveProxyEventLog = loaded.config.saveProxyEventLog
-        self.saveProxyPayloads = loaded.config.saveProxyPayloads
 
         // Persist migrated config if the on-disk version was outdated.
         if loaded.migrated {
@@ -109,10 +91,11 @@ final class ConfigService {
         var openAIUpstreamURL: String?
         var proxyUpstreamURL: String?
         var proxyPort: Int?
+        var saveProxyEventLog: Bool?
+        // Retained for migration only — no longer written.
         var keepaliveEnabled: Bool?
         var keepaliveIntervalSeconds: Int?
         var proxyInactivityTimeoutSeconds: Int?
-        var saveProxyEventLog: Bool?
         var saveProxyPayloads: Bool?
     }
 
@@ -129,11 +112,7 @@ final class ConfigService {
         var anthropicUpstreamURL: String
         var openAIUpstreamURL: String
         var proxyPort: Int
-        var keepaliveEnabled: Bool
-        var keepaliveIntervalSeconds: Int
-        var proxyInactivityTimeoutSeconds: Int
         var saveProxyEventLog: Bool
-        var saveProxyPayloads: Bool
     }
 
     private static func load() -> LoadResult {
@@ -149,11 +128,7 @@ final class ConfigService {
                     anthropicUpstreamURL: defaultAnthropicUpstreamURL,
                     openAIUpstreamURL: defaultOpenAIUpstreamURL,
                     proxyPort: 8080,
-                    keepaliveEnabled: false,
-                    keepaliveIntervalSeconds: 240,
-                    proxyInactivityTimeoutSeconds: 900,
-                    saveProxyEventLog: true,
-                    saveProxyPayloads: false
+                    saveProxyEventLog: true
                 ),
                 migrated: true
             )
@@ -174,11 +149,7 @@ final class ConfigService {
                 anthropicUpstreamURL: migratedAnthropicUpstreamURL,
                 openAIUpstreamURL: file.openAIUpstreamURL ?? defaultOpenAIUpstreamURL,
                 proxyPort: file.proxyPort ?? 8080,
-                keepaliveEnabled: file.keepaliveEnabled ?? false,
-                keepaliveIntervalSeconds: file.keepaliveIntervalSeconds ?? 240,
-                proxyInactivityTimeoutSeconds: file.proxyInactivityTimeoutSeconds ?? 900,
-                saveProxyEventLog: file.saveProxyEventLog ?? true,
-                saveProxyPayloads: file.saveProxyPayloads ?? false
+                saveProxyEventLog: file.saveProxyEventLog ?? true
             ),
             migrated: needsMigration
         )
@@ -195,11 +166,11 @@ final class ConfigService {
             openAIUpstreamURL: openAIUpstreamURL,
             proxyUpstreamURL: nil,
             proxyPort: proxyPort,
-            keepaliveEnabled: keepaliveEnabled,
-            keepaliveIntervalSeconds: keepaliveIntervalSeconds,
-            proxyInactivityTimeoutSeconds: proxyInactivityTimeoutSeconds,
             saveProxyEventLog: saveProxyEventLog,
-            saveProxyPayloads: saveProxyPayloads
+            keepaliveEnabled: nil,
+            keepaliveIntervalSeconds: nil,
+            proxyInactivityTimeoutSeconds: nil,
+            saveProxyPayloads: nil
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

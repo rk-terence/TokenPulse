@@ -1,24 +1,44 @@
 import Foundation
 
 protocol ProxyAPIHandler: Sendable {
-    var keepaliveRequestPath: String { get }
+    var flavor: ProxyAPIFlavor { get }
 
     func acceptsRequest(method: String, path: String) -> Bool
     func upstreamPath(for requestPath: String) -> String
     func sessionIdentity(for request: ProxyHTTPRequest) -> ProxySessionIdentity
     func extractModel(from body: Data) -> String?
     func isStreamingRequest(body: Data) -> Bool
-    func promptDescriptor(from body: Data) -> String?
-    func isMainAgentRequest(body: Data) -> Bool
+
+    /// Lineage fingerprint (cache-identity shape) for the request body. nil if the
+    /// body lacks a `model` field (non-tracked traffic such as token counting).
     func lineageFingerprint(from body: Data) -> LineageFingerprint?
-    func messagesDescriptor(from body: Data) -> String?
-    func buildKeepaliveBody(from body: Data) -> Data?
+
+    /// Normalized messages / input stack carried by the request body. Empty when
+    /// the provider uses `previous_response_id` alone (OpenAI path).
+    func normalizedLineageMessages(from body: Data) -> [LineageTree.NormalizedMessage]
+
+    /// OpenAI `previous_response_id` if present; always nil for Anthropic.
+    func previousResponseID(from body: Data) -> String?
+
+    /// Extract the upstream response ID from a captured response body.
+    /// Anthropic returns `message.id` (`msg_*`); OpenAI returns `response.id` (`resp_*`).
+    func extractResponseID(from data: Data, streaming: Bool) -> String?
+
     func parseTokenUsage(from data: Data, streaming: Bool) -> TokenUsage
+
+    /// Whether the parsed token usage carries a definitive "response complete"
+    /// signal from upstream. Used to distinguish a fully-received response from
+    /// a 2xx-but-truncated stream.
+    ///
+    /// - Anthropic: any non-nil `stop_reason` in `message_delta`.
+    /// - OpenAI Responses: `status == "completed"` in `response.completed`.
+    func isResponseComplete(_ usage: TokenUsage) -> Bool
+
     func proxyErrorBody(message: String) -> Data
 }
 
 struct AnthropicProxyAPIHandler: ProxyAPIHandler {
-    let keepaliveRequestPath = "/v1/messages"
+    let flavor: ProxyAPIFlavor = .anthropicMessages
 
     func acceptsRequest(method: String, path: String) -> Bool {
         method.uppercased() == "POST"
@@ -44,29 +64,32 @@ struct AnthropicProxyAPIHandler: ProxyAPIHandler {
         ProxyRequestBody.isStreaming(from: body)
     }
 
-    func promptDescriptor(from body: Data) -> String? {
-        ProxyRequestBody.promptDescriptor(from: body)
-    }
-
-    func isMainAgentRequest(body: Data) -> Bool {
-        ProxyRequestBody.hasTools(from: body)
-            && !ProxyRequestBody.hasJSONSchemaOutputConfig(from: body)
-    }
-
     func lineageFingerprint(from body: Data) -> LineageFingerprint? {
-        ProxyRequestBody.lineageFingerprint(from: body)
+        ProxyRequestBody.lineageFingerprint(from: body, flavor: flavor)
     }
 
-    func messagesDescriptor(from body: Data) -> String? {
-        ProxyRequestBody.messagesDescriptor(from: body)
+    func normalizedLineageMessages(from body: Data) -> [LineageTree.NormalizedMessage] {
+        ProxyRequestBody.normalizedLineageMessages(from: body, flavor: flavor)
     }
 
-    func buildKeepaliveBody(from body: Data) -> Data? {
-        KeepaliveRequestBuilder.build(from: body)
+    func previousResponseID(from body: Data) -> String? {
+        nil
+    }
+
+    func extractResponseID(from data: Data, streaming: Bool) -> String? {
+        ProxyHTTPUtils.extractAnthropicMessageID(from: data, streaming: streaming)
     }
 
     func parseTokenUsage(from data: Data, streaming: Bool) -> TokenUsage {
         ProxyHTTPUtils.parseTokenUsage(from: data, streaming: streaming)
+    }
+
+    func isResponseComplete(_ usage: TokenUsage) -> Bool {
+        // Any non-nil stop_reason indicates Anthropic produced a terminal
+        // `message_delta` event. Valid values include end_turn, max_tokens,
+        // stop_sequence, tool_use, pause_turn, refusal. All count as "server
+        // finished producing this message."
+        usage.stopReason != nil
     }
 
     func proxyErrorBody(message: String) -> Data {
