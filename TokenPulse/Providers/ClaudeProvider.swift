@@ -7,12 +7,6 @@ struct ClaudeProvider: UsageProvider {
     let shortLabel = "C"
     let brandColor = Color.orange
 
-    private let session: URLSession
-
-    init(session: URLSession = .shared) {
-        self.session = session
-    }
-
     func isConfigured() -> Bool {
         (try? readAccessToken()) != nil
     }
@@ -20,6 +14,8 @@ struct ClaudeProvider: UsageProvider {
     func fetchUsage() async throws -> UsageData {
         let token = try readAccessToken()
         let request = buildRequest(token: token)
+        let session = try await UpstreamNetworking.makeSessionFromCurrentSettings()
+        defer { session.finishTasksAndInvalidate() }
         let (data, response) = try await session.data(for: request)
 
         if let http = response as? HTTPURLResponse, http.statusCode == 429 {

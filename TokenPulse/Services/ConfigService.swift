@@ -6,7 +6,7 @@ final class ConfigService {
     static let shared = ConfigService()
 
     /// Current on-disk schema version. Bump when adding fields that need migration.
-    private static let currentConfigVersion = 7
+    private static let currentConfigVersion = 10
     private static let defaultAnthropicUpstreamURL = "https://zenmux.ai/api/anthropic"
     private static let defaultOpenAIUpstreamURL = "https://api.openai.com"
 
@@ -41,10 +41,82 @@ final class ConfigService {
         didSet { save() }
     }
 
+    var upstreamHTTPSProxyEnabled: Bool {
+        didSet { save() }
+    }
+
+    var useSystemUpstreamProxy: Bool {
+        didSet { save() }
+    }
+
+    var upstreamHTTPProxyURL: String {
+        didSet { save() }
+    }
+
+    var upstreamHTTPSProxyURL: String {
+        didSet { save() }
+    }
+
     /// Single on/off toggle for the unified proxy event log (metadata + deduplicated payloads).
     /// When disabled, no SQLite database is opened and nothing is written to disk.
     var saveProxyEventLog: Bool {
         didSet { save() }
+    }
+
+    var customUpstreamProxySetting: UpstreamHTTPSProxySetting {
+        if upstreamHTTPSProxyEnabled {
+            let httpProxy: ProxyEndpoint?
+            do {
+                httpProxy = try ProxyEndpoint.parseOptional(urlString: upstreamHTTPProxyURL)
+            } catch {
+                return .invalid(String(localized: "HTTP proxy URL: \(error.localizedDescription)"))
+            }
+
+            let httpsProxy: ProxyEndpoint?
+            do {
+                httpsProxy = try ProxyEndpoint.parseOptional(urlString: upstreamHTTPSProxyURL)
+            } catch {
+                return .invalid(String(localized: "HTTPS proxy URL: \(error.localizedDescription)"))
+            }
+
+            return .configured(
+                HTTPSProxyConfiguration(
+                    httpProxy: httpProxy,
+                    httpsProxy: httpsProxy
+                )
+            )
+        }
+
+        return .disabled
+    }
+
+    var systemUpstreamProxySetting: UpstreamHTTPSProxySetting {
+        if let configuration = HTTPSProxyConfiguration.systemConfiguration() {
+            return .configured(configuration)
+        }
+
+        return .disabled
+    }
+
+    var effectiveUpstreamProxySetting: UpstreamHTTPSProxySetting {
+        let customSetting = customUpstreamProxySetting
+        if upstreamHTTPSProxyEnabled || customSetting.validationError != nil {
+            return customSetting
+        }
+
+        if useSystemUpstreamProxy {
+            return systemUpstreamProxySetting
+        }
+
+        return .disabled
+    }
+
+    var customUpstreamProxyValidationError: String? {
+        customUpstreamProxySetting.validationError
+    }
+
+    var systemUpstreamProxySummary: String? {
+        systemUpstreamProxySetting.proxyConfiguration?.summaryDescription
     }
 
     func isProviderEnabled(_ id: String) -> Bool {
@@ -64,6 +136,10 @@ final class ConfigService {
         self.anthropicUpstreamURL = loaded.config.anthropicUpstreamURL
         self.openAIUpstreamURL = loaded.config.openAIUpstreamURL
         self.proxyPort = loaded.config.proxyPort
+        self.upstreamHTTPSProxyEnabled = loaded.config.upstreamHTTPSProxyEnabled
+        self.useSystemUpstreamProxy = loaded.config.useSystemUpstreamProxy
+        self.upstreamHTTPProxyURL = loaded.config.upstreamHTTPProxyURL
+        self.upstreamHTTPSProxyURL = loaded.config.upstreamHTTPSProxyURL
         self.saveProxyEventLog = loaded.config.saveProxyEventLog
 
         // Persist migrated config if the on-disk version was outdated.
@@ -91,6 +167,10 @@ final class ConfigService {
         var openAIUpstreamURL: String?
         var proxyUpstreamURL: String?
         var proxyPort: Int?
+        var upstreamHTTPSProxyEnabled: Bool?
+        var useSystemUpstreamProxy: Bool?
+        var upstreamHTTPProxyURL: String?
+        var upstreamHTTPSProxyURL: String?
         var saveProxyEventLog: Bool?
         // Retained for migration only — no longer written.
         var keepaliveEnabled: Bool?
@@ -112,6 +192,10 @@ final class ConfigService {
         var anthropicUpstreamURL: String
         var openAIUpstreamURL: String
         var proxyPort: Int
+        var upstreamHTTPSProxyEnabled: Bool
+        var useSystemUpstreamProxy: Bool
+        var upstreamHTTPProxyURL: String
+        var upstreamHTTPSProxyURL: String
         var saveProxyEventLog: Bool
     }
 
@@ -128,6 +212,10 @@ final class ConfigService {
                     anthropicUpstreamURL: defaultAnthropicUpstreamURL,
                     openAIUpstreamURL: defaultOpenAIUpstreamURL,
                     proxyPort: 8080,
+                    upstreamHTTPSProxyEnabled: false,
+                    useSystemUpstreamProxy: true,
+                    upstreamHTTPProxyURL: "",
+                    upstreamHTTPSProxyURL: "",
                     saveProxyEventLog: true
                 ),
                 migrated: true
@@ -139,6 +227,13 @@ final class ConfigService {
         let migratedAnthropicUpstreamURL = file.anthropicUpstreamURL
             ?? file.proxyUpstreamURL
             ?? defaultAnthropicUpstreamURL
+        let migratedCustomProxyURL = (file.configVersion ?? 0) < currentConfigVersion
+            ? (file.upstreamHTTPProxyURL ?? file.upstreamHTTPSProxyURL ?? "")
+            : ""
+        let resolvedHTTPProxyURL = file.upstreamHTTPProxyURL
+            ?? migratedCustomProxyURL
+        let resolvedHTTPSProxyURL = file.upstreamHTTPSProxyURL
+            ?? migratedCustomProxyURL
 
         return LoadResult(
             config: ResolvedConfig(
@@ -149,6 +244,10 @@ final class ConfigService {
                 anthropicUpstreamURL: migratedAnthropicUpstreamURL,
                 openAIUpstreamURL: file.openAIUpstreamURL ?? defaultOpenAIUpstreamURL,
                 proxyPort: file.proxyPort ?? 8080,
+                upstreamHTTPSProxyEnabled: file.upstreamHTTPSProxyEnabled ?? false,
+                useSystemUpstreamProxy: file.useSystemUpstreamProxy ?? true,
+                upstreamHTTPProxyURL: resolvedHTTPProxyURL,
+                upstreamHTTPSProxyURL: resolvedHTTPSProxyURL,
                 saveProxyEventLog: file.saveProxyEventLog ?? true
             ),
             migrated: needsMigration
@@ -166,6 +265,10 @@ final class ConfigService {
             openAIUpstreamURL: openAIUpstreamURL,
             proxyUpstreamURL: nil,
             proxyPort: proxyPort,
+            upstreamHTTPSProxyEnabled: upstreamHTTPSProxyEnabled,
+            useSystemUpstreamProxy: useSystemUpstreamProxy,
+            upstreamHTTPProxyURL: upstreamHTTPProxyURL,
+            upstreamHTTPSProxyURL: upstreamHTTPSProxyURL,
             saveProxyEventLog: saveProxyEventLog,
             keepaliveEnabled: nil,
             keepaliveIntervalSeconds: nil,

@@ -7,12 +7,6 @@ struct ZenMuxProvider: UsageProvider {
     let shortLabel = "Z"
     let brandColor = Color.blue
 
-    private let session: URLSession
-
-    init(session: URLSession = .shared) {
-        self.session = session
-    }
-
     func isConfigured() -> Bool {
         (try? KeychainService.readGenericPassword(service: Self.keychainService)) != nil
     }
@@ -35,8 +29,11 @@ struct ZenMuxProvider: UsageProvider {
             cookieError = error.localizedDescription
         }
 
-        let primaryData = try await fetchManagementAPI(apiKey: apiKey)
-        let (summaryData, summaryError) = await fetchSubscriptionSummary(cookies: cookies)
+        let session = try await UpstreamNetworking.makeSessionFromCurrentSettings()
+        defer { session.finishTasksAndInvalidate() }
+
+        let primaryData = try await fetchManagementAPI(apiKey: apiKey, session: session)
+        let (summaryData, summaryError) = await fetchSubscriptionSummary(cookies: cookies, session: session)
 
         let summaryIssue = summaryData == nil ? (cookieError ?? summaryError) : nil
         return buildUsageData(primary: primaryData, summary: summaryData, summaryIssue: summaryIssue)
@@ -81,7 +78,7 @@ struct ZenMuxProvider: UsageProvider {
 
     // MARK: - Management API (primary)
 
-    private func fetchManagementAPI(apiKey: String) async throws -> ZenMuxData {
+    private func fetchManagementAPI(apiKey: String, session: URLSession) async throws -> ZenMuxData {
         var req = URLRequest(url: URL(string: Self.managementEndpoint)!)
         req.httpMethod = "GET"
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
@@ -100,7 +97,10 @@ struct ZenMuxProvider: UsageProvider {
 
     // MARK: - Subscription summary (optional, cookie-based)
 
-    private func fetchSubscriptionSummary(cookies: ZenMuxCookies?) async -> (ZenMuxSummaryData?, String?) {
+    private func fetchSubscriptionSummary(
+        cookies: ZenMuxCookies?,
+        session: URLSession
+    ) async -> (ZenMuxSummaryData?, String?) {
         guard let cookies else { return (nil, nil) }
 
         var components = URLComponents(string: Self.summaryEndpoint)!

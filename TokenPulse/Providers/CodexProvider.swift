@@ -35,12 +35,6 @@ struct CodexProvider: UsageProvider {
     let shortLabel = "X"
     let brandColor = Color.green
 
-    private let session: URLSession
-
-    init(session: URLSession = .shared) {
-        self.session = session
-    }
-
     func isConfigured() -> Bool {
         CodexAuthStore.configurationStatus().isConfigured
     }
@@ -48,6 +42,8 @@ struct CodexProvider: UsageProvider {
     func fetchUsage() async throws -> UsageData {
         let auth = try CodexAuthStore.readChatGPTSession()
         let request = buildRequest(auth: auth)
+        let session = try await UpstreamNetworking.makeSessionFromCurrentSettings()
+        defer { session.finishTasksAndInvalidate() }
         let (data, response) = try await session.data(for: request)
 
         guard let http = response as? HTTPURLResponse else {

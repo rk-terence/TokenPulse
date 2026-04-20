@@ -18,6 +18,7 @@ final class ProxyForwarder: Sendable {
     private let apiHandler: any ProxyAPIHandler
     private let eventLogger: ProxyEventLogger?
     private let proxyPort: Int
+    private let upstreamHTTPSProxySetting: UpstreamHTTPSProxySetting
     /// Shared session for non-streaming requests — preserves TCP/TLS connection reuse.
     private let nonStreamingSession: URLSession
     private let nonStreamingPoolDelegate: NonStreamingPoolDelegate
@@ -26,20 +27,24 @@ final class ProxyForwarder: Sendable {
         upstreamBaseURL: String,
         apiFlavor: ProxyAPIFlavor,
         apiHandler: any ProxyAPIHandler,
+        upstreamHTTPSProxySetting: UpstreamHTTPSProxySetting = .disabled,
         eventLogger: ProxyEventLogger? = nil,
         proxyPort: Int = 0
     ) {
         self.upstreamBaseURL = upstreamBaseURL
         self.apiFlavor = apiFlavor
         self.apiHandler = apiHandler
+        self.upstreamHTTPSProxySetting = upstreamHTTPSProxySetting
         self.eventLogger = eventLogger
         self.proxyPort = proxyPort
 
         let poolDelegate = NonStreamingPoolDelegate()
         self.nonStreamingPoolDelegate = poolDelegate
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 300
-        config.timeoutIntervalForResource = 600
+        let config = UpstreamNetworking.makeSessionConfiguration(
+            proxyConfiguration: upstreamHTTPSProxySetting.proxyConfiguration,
+            timeoutIntervalForRequest: 300,
+            timeoutIntervalForResource: 600
+        )
         self.nonStreamingSession = URLSession(configuration: config,
                                                delegate: poolDelegate,
                                                delegateQueue: nil)
@@ -84,6 +89,26 @@ final class ProxyForwarder: Sendable {
             body: request.body,
             streaming: wantsStreaming
         )
+
+        if case .invalid(let message) = upstreamHTTPSProxySetting {
+            let sessionID = await sessionStore.resolveSessionID(for: sessionIdentity)
+            await metrics.recordFailed()
+            let response = proxyErrorResponse(
+                status: 502,
+                message: String(localized: "Bad Gateway: invalid upstream HTTPS proxy setting: \(message)")
+            )
+            await eventLogger?.logRequestFailed(
+                requestID: nil,
+                session: sessionID,
+                model: model,
+                request: requestLog,
+                response: response.loggedResponse,
+                durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
+                error: "invalid upstream HTTPS proxy setting"
+            )
+            writeErrorToClient(writer: request.writer, response: response)
+            return
+        }
 
         guard let url = URL(string: urlString) else {
             let sessionID = await sessionStore.resolveSessionID(for: sessionIdentity)
@@ -236,9 +261,11 @@ final class ProxyForwarder: Sendable {
                     await sessionStore.markRequestWaiting(id: requestID)
                 }
             }
-            let delegateConfig = URLSessionConfiguration.default
-            delegateConfig.timeoutIntervalForRequest = 300
-            delegateConfig.timeoutIntervalForResource = 600
+            let delegateConfig = UpstreamNetworking.makeSessionConfiguration(
+                proxyConfiguration: upstreamHTTPSProxySetting.proxyConfiguration,
+                timeoutIntervalForRequest: 300,
+                timeoutIntervalForResource: 600
+            )
             let delegateSession = URLSession(configuration: delegateConfig,
                                               delegate: streamingDelegate,
                                               delegateQueue: nil)
