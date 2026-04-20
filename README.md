@@ -54,21 +54,33 @@ If you use many AI providers and want comprehensive coverage, use CodexBar. If y
 
 ### Build from source
 
-Requires Xcode 15+ and macOS 14 Sonoma.
+Requires macOS 14 Sonoma and the Xcode Command Line Tools (`xcode-select --install`). Xcode.app is not required — the full toolchain ships with the Command Line Tools.
 
 ```bash
-git clone git@github.com:rk-terence/TokenPulse.git
+git clone https://github.com/rk-terence/TokenPulse.git
 cd TokenPulse
-cp Local.xcconfig.example Local.xcconfig
-# Edit Local.xcconfig and set your Apple Developer Team ID
-open TokenPulse.xcodeproj
+
+# Debug build
+swift build
+
+# Release .app bundle at dist/TokenPulse.app (adhoc-signed)
+bash Scripts/package_app.sh
+
+# Install to ~/Applications
+mkdir -p ~/Applications
+rm -rf ~/Applications/TokenPulse.app
+ditto dist/TokenPulse.app ~/Applications/TokenPulse.app
 ```
 
-Build and run from Xcode (`Cmd+R`), or from the command line:
+#### Signing mode
 
-```bash
-xcodebuild -scheme TokenPulse -configuration Debug build
-```
+`Scripts/package_app.sh` reads `TOKENPULSE_SIGNING`:
+
+| Value | Behavior |
+|---|---|
+| `adhoc` (default) | `codesign --sign -` with `TokenPulse.entitlements`. Launches locally without a developer account. Each rebuild produces a new signature hash, so macOS Keychain and Login Items will prompt for re-approval after every rebuild. |
+| `off` | No codesign step. Only useful for debugging the packaging flow. |
+| A signing identity | Passed to `codesign --sign`. Adds hardened runtime (`--options runtime`) and applies the entitlements. Use this for a stable signature that doesn't retrigger Keychain/Login Items prompts on rebuild, e.g.:<br/>`TOKENPULSE_SIGNING="Developer ID Application: Your Name (TEAMID)" bash Scripts/package_app.sh` |
 
 ## Setup
 

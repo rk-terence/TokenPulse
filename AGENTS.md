@@ -4,24 +4,29 @@ Use this file for high-signal repo instructions only. Product docs live in [READ
 
 ## Build, install, verify
 
+Builds use Swift Package Manager. Xcode.app is not required; the Command Line Tools (`swift`, `iconutil`, `codesign`) are sufficient.
+
 ```bash
-# Prerequisite: create Local.xcconfig from Local.xcconfig.example and fill in the required local settings
-open TokenPulse.xcodeproj
+# Build a debug binary (at .build/debug/TokenPulse)
+swift build
 
-# Build a debug app bundle
-xcodebuild -scheme TokenPulse -configuration Debug build
+# Package a release .app bundle (adhoc-signed) at dist/TokenPulse.app
+bash Scripts/package_app.sh
 
-# Install for local use: build Release and replace ~/Applications/TokenPulse.app
-xcodebuild -scheme TokenPulse -configuration Release build
+# Install for local use: replace ~/Applications/TokenPulse.app
 mkdir -p ~/Applications
 rm -rf ~/Applications/TokenPulse.app
-ditto "$(xcodebuild -scheme TokenPulse -configuration Release -showBuildSettings | awk -F ' = ' '/BUILT_PRODUCTS_DIR/ {print $2; exit}')/TokenPulse.app" ~/Applications/TokenPulse.app
+ditto dist/TokenPulse.app ~/Applications/TokenPulse.app
 ```
 
-- Run Xcode builds outside the sandbox so Xcode services can initialize normally.
-- If the user asks to "build" the app, default to a Debug build.
-- If the user asks to "install" the app, default to a Release build and replace `~/Applications/TokenPulse.app`.
-- Do not rely on `xcodebuild test` in the current shared scheme. Add or select a real test target before using tests as verification.
+- If the user asks to "build" the app, default to `swift build` (debug).
+- If the user asks to "install" the app, default to `bash Scripts/package_app.sh` + the `ditto` copy above.
+- `Scripts/package_app.sh` honors `CONFIGURATION` (default `release`), `OUTPUT_DIR` (default `dist/`), and `TOKENPULSE_SIGNING`:
+  - `adhoc` (default) — `codesign --sign -` with `TokenPulse/TokenPulse.entitlements`. No developer account needed, but the signature hash changes every rebuild, which re-prompts Keychain ACLs and invalidates Login Items approval.
+  - `off` — skip codesign entirely (the bundle won't launch on Apple Silicon).
+  - A signing identity string (e.g. `"Developer ID Application: Name (TEAMID)"`) — passed through to `codesign --sign` with `--options runtime` plus entitlements. Use when a stable signature matters (Keychain persistence, Login Items, notarization).
+- The entitlements file declares `com.apple.security.app-sandbox = false` only. `keychain-access-groups` is intentionally absent because adhoc signatures cannot legitimately claim team-restricted entitlements on macOS.
+- No SwiftPM test target exists yet. Don't claim tests as verification — use a build and, for UI-affecting changes, a smoke launch of `dist/TokenPulse.app`.
 
 ## Code conventions
 

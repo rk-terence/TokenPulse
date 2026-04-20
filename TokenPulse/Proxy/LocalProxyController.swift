@@ -83,6 +83,7 @@ final class LocalProxyController {
     var onRunningChanged: ((Bool) -> Void)?
 
     private var server: ProxyHTTPServer?
+    private var serverGeneration: UInt64 = 0
     private let sessionStore = ProxySessionStore()
     private let metricsStore = ProxyMetricsStore()
     private let anthropicAPIHandler: any ProxyAPIHandler = AnthropicProxyAPIHandler()
@@ -145,7 +146,8 @@ final class LocalProxyController {
         let openAIHandler = openAIAPIHandler
 
         do {
-            var startedServer: ProxyHTTPServer?
+            serverGeneration &+= 1
+            let thisGeneration = serverGeneration
             let httpServer = try ProxyHTTPServer(
                 port: UInt16(clamping: port),
                 requestValidator: { method, path in
@@ -218,7 +220,7 @@ final class LocalProxyController {
                 },
                 onReady: { [weak self] actualPort in
                     Task { @MainActor [weak self] in
-                        guard let self, let startedServer, self.server === startedServer else { return }
+                        guard let self, self.serverGeneration == thisGeneration, self.server != nil else { return }
                         self.listeningPort = Int(actualPort)
                         self.isRunning = true
                         ProxyLogger.log("Proxy controller started on port \(self.listeningPort)")
@@ -228,7 +230,7 @@ final class LocalProxyController {
                 },
                 onFailure: { [weak self] errorMessage in
                     Task { @MainActor [weak self] in
-                        guard let self, let startedServer, self.server === startedServer else { return }
+                        guard let self, self.serverGeneration == thisGeneration else { return }
                         self.refreshTask?.cancel()
                         self.refreshTask = nil
                         self.server = nil
@@ -244,7 +246,6 @@ final class LocalProxyController {
                     }
                 }
             )
-            startedServer = httpServer
             httpServer.start()
             self.server = httpServer
         } catch {
@@ -284,6 +285,7 @@ final class LocalProxyController {
 
         server?.stop()
         server = nil
+        serverGeneration &+= 1
         anthropicForwarder = nil
         openAIForwarder = nil
 
