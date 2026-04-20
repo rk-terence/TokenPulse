@@ -12,7 +12,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationService.shared.requestAuthorization()
 
         // Register providers
-        providerManager.register(ClaudeProvider())
         providerManager.register(CodexProvider())
         providerManager.register(ZenMuxProvider())
 

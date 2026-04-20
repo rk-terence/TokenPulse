@@ -6,12 +6,13 @@ final class ConfigService {
     static let shared = ConfigService()
 
     /// Current on-disk schema version. Bump when adding fields that need migration.
-    private static let currentConfigVersion = 7
+    private static let currentConfigVersion = 8
     private static let defaultAnthropicUpstreamURL = "https://zenmux.ai/api/anthropic"
     private static let defaultOpenAIUpstreamURL = "https://api.openai.com"
 
     /// Factory defaults for provider enablement.
-    static let factoryEnabledProviders: [String: Bool] = ["claude": false, "codex": false, "zenmux": true]
+    static let factoryEnabledProviders: [String: Bool] = ["codex": false, "zenmux": true]
+    private static let supportedProviderIDs = Set(factoryEnabledProviders.keys)
 
     var launchAtLogin: Bool {
         didSet { save() }
@@ -135,7 +136,7 @@ final class ConfigService {
         }
 
         let needsMigration = (file.configVersion ?? 0) < currentConfigVersion
-        let resolvedProviders = file.enabledProviders ?? factoryEnabledProviders
+        let resolvedProviders = resolvedEnabledProviders(file.enabledProviders)
         let migratedAnthropicUpstreamURL = file.anthropicUpstreamURL
             ?? file.proxyUpstreamURL
             ?? defaultAnthropicUpstreamURL
@@ -153,6 +154,17 @@ final class ConfigService {
             ),
             migrated: needsMigration
         )
+    }
+
+    private static func resolvedEnabledProviders(_ loaded: [String: Bool]?) -> [String: Bool] {
+        var resolved = factoryEnabledProviders
+        guard let loaded else { return resolved }
+
+        for (id, enabled) in loaded where supportedProviderIDs.contains(id) {
+            resolved[id] = enabled
+        }
+
+        return resolved
     }
 
     private func save() {

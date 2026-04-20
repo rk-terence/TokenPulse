@@ -216,22 +216,6 @@ private struct ProvidersTab: View {
             subtitle: String(localized: "Enable the services you want to monitor and make sure TokenPulse can access the credentials it needs.")
         ) {
             SettingsCard(
-                title: String(localized: "Claude"),
-                description: String(localized: "Claude uses credentials already stored on this Mac, so there is nothing extra to paste here.")
-            ) {
-                Toggle(String(localized: "Enable Claude"), isOn: claudeEnabledBinding)
-
-                if config.isProviderEnabled("claude") {
-                    Divider()
-                    SettingsStatusRow(
-                        label: String(localized: "Credential status"),
-                        value: claudeStatus,
-                        tint: claudeConfigured ? .green : .secondary
-                    )
-                }
-            }
-
-            SettingsCard(
                 title: String(localized: "Codex"),
                 description: String(localized: "Codex reads your existing local Codex login and uses that to monitor ChatGPT subscription usage.")
             ) {
@@ -317,16 +301,6 @@ private struct ProvidersTab: View {
 
     // MARK: - Enabled bindings
 
-    private var claudeEnabledBinding: Binding<Bool> {
-        Binding(
-            get: { config.isProviderEnabled("claude") },
-            set: { newValue in
-                config.setProviderEnabled("claude", newValue)
-                manager.providerEnabledChanged()
-            }
-        )
-    }
-
     private var zenMuxEnabledBinding: Binding<Bool> {
         Binding(
             get: { config.isProviderEnabled("zenmux") },
@@ -348,14 +322,6 @@ private struct ProvidersTab: View {
     }
 
     // MARK: - Credential status
-
-    private var claudeConfigured: Bool {
-        ClaudeProvider().isConfigured()
-    }
-
-    private var claudeStatus: String {
-        claudeConfigured ? String(localized: "Connected") : String(localized: "Not found")
-    }
 
     private var zenMuxConfigured: Bool {
         (try? KeychainService.readGenericPassword(service: ZenMuxProvider.keychainService)) != nil

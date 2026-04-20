@@ -23,23 +23,8 @@ struct ZenMuxProvider: UsageProvider {
             throw ZenMuxProviderError.missingAPIKey
         }
 
-        // Keep these requests sequential. A user report tied the async-let path here
-        // to a Swift concurrency runtime crash during app startup.
-        let cookies: ZenMuxCookies?
-        let cookieError: String?
-        do {
-            cookies = try ChromeCookieService.extractZenMuxCookies()
-            cookieError = nil
-        } catch {
-            cookies = nil
-            cookieError = error.localizedDescription
-        }
-
         let primaryData = try await fetchManagementAPI(apiKey: apiKey)
-        let (summaryData, summaryError) = await fetchSubscriptionSummary(cookies: cookies)
-
-        let summaryIssue = summaryData == nil ? (cookieError ?? summaryError) : nil
-        return buildUsageData(primary: primaryData, summary: summaryData, summaryIssue: summaryIssue)
+        return buildUsageData(primary: primaryData)
     }
 
     func classifyError(_ error: Error) -> FailureDisposition {
@@ -77,7 +62,6 @@ struct ZenMuxProvider: UsageProvider {
     static let keychainService = "TokenPulse-ZenMuxAPIKey"
 
     private static let managementEndpoint = "https://zenmux.ai/api/v1/management/subscription/detail"
-    private static let summaryEndpoint = "https://zenmux.ai/api/dashboard/cost/query/subscription_summary"
 
     // MARK: - Management API (primary)
 
@@ -98,37 +82,9 @@ struct ZenMuxProvider: UsageProvider {
         return try JSONDecoder().decode(ZenMuxResponse.self, from: data).data
     }
 
-    // MARK: - Subscription summary (optional, cookie-based)
-
-    private func fetchSubscriptionSummary(cookies: ZenMuxCookies?) async -> (ZenMuxSummaryData?, String?) {
-        guard let cookies else { return (nil, nil) }
-
-        var components = URLComponents(string: Self.summaryEndpoint)!
-        components.queryItems = [URLQueryItem(name: "ctoken", value: cookies.ctoken)]
-
-        var req = URLRequest(url: components.url!)
-        req.httpMethod = "GET"
-        let cookieHeader = "ctoken=\(cookies.ctoken); sessionId=\(cookies.sessionId); sessionId.sig=\(cookies.sessionIdSig)"
-        req.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
-        req.setValue("TokenPulse/1.0", forHTTPHeaderField: "User-Agent")
-
-        do {
-            let (data, response) = try await session.data(for: req)
-            guard let http = response as? HTTPURLResponse,
-                  (200..<300).contains(http.statusCode) else {
-                let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-                return (nil, String(localized: "Summary API HTTP \(code)"))
-            }
-            let decoded = try JSONDecoder().decode(ZenMuxSummaryResponse.self, from: data).data
-            return (decoded, nil)
-        } catch {
-            return (nil, error.localizedDescription)
-        }
-    }
-
     // MARK: - Build UsageData
 
-    private func buildUsageData(primary d: ZenMuxData, summary: ZenMuxSummaryData?, summaryIssue: String? = nil) -> UsageData {
+    private func buildUsageData(primary d: ZenMuxData) -> UsageData {
         let fiveHour = d.quota5Hour.map { q in
             WindowUsage(utilization: (q.usagePercentage ?? 0) * 100.0, resetsAt: parseISO8601(q.resetsAt))
         }
@@ -157,20 +113,6 @@ struct ZenMuxProvider: UsageProvider {
         if let q = d.quotaMonthly {
             if let v = q.maxFlows { extras["moMaxFlows"] = String(format: "%.0f", v) }
             if let v = q.maxValueUsd { extras["moMaxUsd"] = String(format: "%.2f", v) }
-        }
-
-        // Monthly utilization from subscription summary
-        if let summary, let monthlyMax = d.quotaMonthly?.maxValueUsd, monthlyMax > 0 {
-            let totalCost = summary.totalCost
-            let utilization = totalCost / monthlyMax * 100.0
-            extras["moUtilization"] = String(format: "%.1f", utilization)
-            extras["moUsedUsd"] = String(format: "%.2f", totalCost)
-            extras["moRequestCounts"] = summary.requestCounts
-            extras["moTotalTokens"] = summary.totalTokens
-        }
-
-        if let summaryIssue {
-            extras["moSummaryIssue"] = summaryIssue
         }
 
         // Monthly resets at (plan expiry)
@@ -258,40 +200,6 @@ private struct ZenMuxQuota: Decodable {
         case remainingFlows = "remaining_flows"
         case usedValueUsd = "used_value_usd"
         case maxValueUsd = "max_value_usd"
-    }
-}
-
-// MARK: - Subscription summary response models
-
-private struct ZenMuxSummaryResponse: Decodable {
-    let data: ZenMuxSummaryData
-}
-
-private struct ZenMuxSummaryData: Decodable {
-    let totalCost: Double
-    let inputCost: Double
-    let outputCost: Double
-    let otherCost: Double
-    let requestCounts: String
-    let totalTokens: String
-
-    enum CodingKeys: String, CodingKey {
-        case totalCost, inputCost, outputCost, otherCost, requestCounts, totalTokens
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        // These come as strings from the API
-        let totalStr = try container.decode(String.self, forKey: .totalCost)
-        let inputStr = try container.decode(String.self, forKey: .inputCost)
-        let outputStr = try container.decode(String.self, forKey: .outputCost)
-        let otherStr = try container.decode(String.self, forKey: .otherCost)
-        totalCost = Double(totalStr) ?? 0
-        inputCost = Double(inputStr) ?? 0
-        outputCost = Double(outputStr) ?? 0
-        otherCost = Double(otherStr) ?? 0
-        requestCounts = try container.decode(String.self, forKey: .requestCounts)
-        totalTokens = try container.decode(String.self, forKey: .totalTokens)
     }
 }
 

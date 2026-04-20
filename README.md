@@ -35,8 +35,7 @@ A macOS menu bar app that monitors AI platform token usage and adds local proxy 
 | Provider | Auth method | What it shows |
 |----------|-------------|---------------|
 | **Codex** | Local Codex ChatGPT login (`$CODEX_HOME/auth.json` when `CODEX_HOME` is set; otherwise `~/.codex/auth.json`) | 5h window, weekly window, plan tier |
-| **Claude** (Anthropic) | Keychain (Claude Code OAuth token) | 5h window, 7-day quota, Opus quota |
-| **ZenMux** | Management API key + Chrome cookies (auto-extracted) | 5h window, 7-day quota, monthly utilization*, tier, account status |
+| **ZenMux** | Management API key | 5h window, 7-day quota, monthly cap, tier, account status |
 
 ## Why TokenPulse?
 
@@ -48,7 +47,7 @@ A macOS menu bar app that monitors AI platform token usage and adds local proxy 
 - **Minimal by design** — TokenPulse is ~28 source files with a simple `UsageProvider` protocol and an actor-based proxy subsystem. No SwiftSyntax macros, no helper processes, no multi-strategy fallback chains. The entire codebase is easy to audit, fork, and modify.
 - **Machine-readable output** — Provider refresh results write a normalized snapshot to `~/.tokenpulse/raw_usage.json`, and the proxy can write status snapshots to `~/.tokenpulse/proxy_status.json` whenever proxy logging infrastructure is enabled. Shell scripts and external tools can consume both without scraping or IPC.
 
-If you use many AI providers and want comprehensive coverage, use CodexBar. If you use Codex, Claude, and/or ZenMux and want something small and direct with local proxy observability, TokenPulse is for you.
+If you use many AI providers and want comprehensive coverage, use CodexBar. If you use Codex and/or ZenMux and want something small and direct with local proxy observability, TokenPulse is for you.
 
 ## Install
 
@@ -84,10 +83,6 @@ ditto dist/TokenPulse.app ~/Applications/TokenPulse.app
 
 ## Setup
 
-### Claude provider
-
-TokenPulse reads your Claude Code OAuth credentials from the macOS Keychain automatically. If you're signed into [Claude Code](https://claude.ai/claude-code), you usually only need to enable the Claude provider in **Settings > Providers**.
-
 ### Codex provider
 
 TokenPulse reads your existing Codex ChatGPT login from `$CODEX_HOME/auth.json` when `CODEX_HOME` is set. If `CODEX_HOME` is not set, it reads `~/.codex/auth.json`. There is no fallback to `~/.codex/auth.json` when `CODEX_HOME` is set. To set it up:
@@ -104,7 +99,7 @@ If your Codex CLI is currently using API key billing, or TokenPulse shows the Co
 2. Open **Settings > Providers > ZenMux** and paste the key
 3. Click **Save** — the key is stored securely in your macOS Keychain
 
-*Monthly utilization requires an active ZenMux session in Chrome. TokenPulse reads Chrome's encrypted cookies automatically (via the Keychain-stored Chrome Safe Storage key). If Chrome cookies are unavailable, everything else still works — only the monthly usage bar is hidden, and the monthly cap is shown as a static value instead.
+TokenPulse uses the management API only for ZenMux. The app shows the monthly cap and billing-cycle reset date exposed by that API, but not a monthly utilization percentage.
 
 ## Usage
 
@@ -173,8 +168,8 @@ All fields are in `~/.tokenpulse/config.json`:
 TokenPulse updates a normalized provider status snapshot at `~/.tokenpulse/raw_usage.json` whenever a provider refresh result is applied. Example:
 
 ```bash
-# Get Claude 5-hour utilization
-jq '.providers.claude.fiveHour.utilization' ~/.tokenpulse/raw_usage.json
+# Get Codex 5-hour utilization
+jq '.providers.codex.fiveHour.utilization' ~/.tokenpulse/raw_usage.json
 
 # Check if any provider is in error state
 jq '.providers | to_entries[] | select(.value.status == "error")' ~/.tokenpulse/raw_usage.json
@@ -200,8 +195,8 @@ Provider usage notifications are sent per provider. Grant notification permissio
 TokenPulse/
 ├── App/            # AppDelegate, StatusBarController, entry point
 ├── Models/         # UsageData, ProviderStatus, ProviderConfig
-├── Providers/      # UsageProvider protocol + Codex, Claude, ZenMux implementations
-├── Services/       # KeychainService, ChromeCookieService, ConfigService, PollingManager, ProviderManager, NotificationService
+├── Providers/      # UsageProvider protocol + Codex and ZenMux implementations
+├── Services/       # KeychainService, ConfigService, PollingManager, ProviderManager, NotificationService
 ├── Proxy/          # HTTP server, route handlers, request forwarder, session store, event logger, metrics
 ├── Views/          # PopoverView, SettingsView (SwiftUI)
 └── Rendering/      # BarIconRenderer (Core Graphics)

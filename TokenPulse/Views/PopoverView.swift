@@ -315,8 +315,6 @@ private struct QuotaGrid: View {
 
             // Provider-specific extras
             switch entry.id {
-            case "claude":
-                claudeExtras
             case "codex":
                 codexExtras
             case "zenmux":
@@ -327,26 +325,6 @@ private struct QuotaGrid: View {
         }
         .grayscale(tone.grayscaleAmount)
         .opacity(tone.opacity)
-    }
-
-    // MARK: - Claude extras
-
-    @ViewBuilder
-    private var claudeExtras: some View {
-        if let opusStr = data.extras["opusUtilization"],
-           let opus = Double(opusStr) {
-            HStack(spacing: 4) {
-                Text("Opus")
-                    .font(.body)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 36, alignment: .trailing)
-                MiniBar(percentage: opus)
-                Text(String(format: "%.0f%%", opus))
-                    .font(.body.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(width: 42, alignment: .trailing)
-            }
-        }
     }
 
     // MARK: - ZenMux extras
@@ -362,16 +340,7 @@ private struct QuotaGrid: View {
 
     @ViewBuilder
     private var zenMuxExtras: some View {
-        // Monthly utilization (from subscription_summary) or fallback to cap-only display
-        if let utilizationStr = data.extras["moUtilization"],
-           let utilization = Double(utilizationStr) {
-            QuotaRow(
-                label: "mo",
-                utilization: utilization,
-                resetsAt: data.extras["moResetsAt"].flatMap { ISO8601DateFormatter().date(from: $0) },
-                detail: usdDetail(used: "moUsedUsd", max: "moMaxUsd")
-            )
-        } else if let maxUsd = data.extras["moMaxUsd"] {
+        if let maxUsd = data.extras["moMaxUsd"] {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     Text("mo")
@@ -382,10 +351,10 @@ private struct QuotaGrid: View {
                         .font(.body.monospacedDigit())
                         .foregroundStyle(.tertiary)
                 }
-                if let issue = data.extras["moSummaryIssue"] {
-                    Text(issue)
+                if let resetsAt = data.extras["moResetsAt"].flatMap({ ISO8601DateFormatter().date(from: $0) }) {
+                    Text("resets \(resetsAt, style: .relative)")
                         .font(.caption)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(.secondary)
                         .padding(.leading, 32)
                 }
             }
