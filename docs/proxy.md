@@ -15,7 +15,7 @@ It forwards requests transparently while adding two capabilities:
 - request observability with per-request token tracking and cost estimation
 - a universal content tree over proxied requests, used for popup UI display and payload deduplication in the event log
 
-When the upstream HTTPS proxy setting is enabled in TokenPulse, all outbound forwarding from this local proxy is sent through that configured proxy as well.
+Outbound forwarding from this local proxy follows TokenPulse's upstream proxy setting: a custom upstream HTTP/HTTPS proxy when one is configured, the macOS system proxy when `useSystemUpstreamProxy` is enabled, and a direct connection otherwise. Custom-proxy changes require restarting the local proxy to apply to forwarded traffic.
 
 # Why it exists
 

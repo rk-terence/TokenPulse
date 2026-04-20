@@ -228,14 +228,6 @@ final class ConfigService {
         let migratedAnthropicUpstreamURL = file.anthropicUpstreamURL
             ?? file.proxyUpstreamURL
             ?? defaultAnthropicUpstreamURL
-        let migratedCustomProxyURL = (file.configVersion ?? 0) < currentConfigVersion
-            ? (file.upstreamHTTPProxyURL ?? file.upstreamHTTPSProxyURL ?? "")
-            : ""
-        let resolvedHTTPProxyURL = file.upstreamHTTPProxyURL
-            ?? migratedCustomProxyURL
-        let resolvedHTTPSProxyURL = file.upstreamHTTPSProxyURL
-            ?? migratedCustomProxyURL
-
         return LoadResult(
             config: ResolvedConfig(
                 launchAtLogin: file.launchAtLogin,
@@ -247,8 +239,8 @@ final class ConfigService {
                 proxyPort: file.proxyPort ?? 8080,
                 upstreamHTTPSProxyEnabled: file.upstreamHTTPSProxyEnabled ?? false,
                 useSystemUpstreamProxy: file.useSystemUpstreamProxy ?? true,
-                upstreamHTTPProxyURL: resolvedHTTPProxyURL,
-                upstreamHTTPSProxyURL: resolvedHTTPSProxyURL,
+                upstreamHTTPProxyURL: file.upstreamHTTPProxyURL ?? "",
+                upstreamHTTPSProxyURL: file.upstreamHTTPSProxyURL ?? "",
                 saveProxyEventLog: file.saveProxyEventLog ?? true
             ),
             migrated: needsMigration
