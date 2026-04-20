@@ -445,6 +445,66 @@ private struct ProxyTab: View {
             }
 
             SettingsCard(
+                title: String(localized: "System proxy"),
+                description: String(localized: "Use the current macOS HTTP or HTTPS proxy settings for outbound upstream requests when no custom proxy is configured.")
+            ) {
+                Toggle(String(localized: "Use macOS system proxy settings"), isOn: $config.useSystemUpstreamProxy)
+
+                if config.useSystemUpstreamProxy {
+                    Text(
+                        config.systemUpstreamProxySummary
+                            ?? String(localized: "No system HTTP or HTTPS proxy is currently configured.")
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            SettingsCard(
+                title: String(localized: "Custom upstream proxy"),
+                description: String(localized: "Override the macOS system proxy with a specific upstream HTTP or HTTPS proxy.")
+            ) {
+                Toggle(String(localized: "Use custom upstream proxy"), isOn: $config.upstreamHTTPSProxyEnabled)
+
+                if config.upstreamHTTPSProxyEnabled {
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 14) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(String(localized: "HTTP proxy URL"))
+                                .font(.headline)
+
+                            TextField(
+                                String(localized: "http://127.0.0.1:7890"),
+                                text: $config.upstreamHTTPProxyURL
+                            )
+                            .textFieldStyle(.roundedBorder)
+                        }
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(String(localized: "HTTPS proxy URL"))
+                                .font(.headline)
+
+                            TextField(
+                                String(localized: "http://127.0.0.1:7890"),
+                                text: $config.upstreamHTTPSProxyURL
+                            )
+                            .textFieldStyle(.roundedBorder)
+                        }
+                    }
+
+                    Text(
+                        config.customUpstreamProxyValidationError
+                            ?? String(localized: "Each field applies only to its matching traffic, like macOS system proxy settings. Leave a field blank to disable proxying for that traffic. Custom values override the macOS system proxy settings when enabled. Provider refreshes pick this up on the next request; restart the local proxy to apply it to forwarded traffic.")
+                    )
+                    .font(.caption)
+                    .foregroundStyle(config.customUpstreamProxyValidationError == nil ? Color.secondary : Color.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            SettingsCard(
                 title: String(localized: "Logging"),
                 description: String(localized: "Store proxy metadata and deduplicated request/response payloads locally.")
             ) {

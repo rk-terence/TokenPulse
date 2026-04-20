@@ -7,12 +7,6 @@ struct ZenMuxProvider: UsageProvider {
     let shortLabel = "Z"
     let brandColor = Color.blue
 
-    private let session: URLSession
-
-    init(session: URLSession = .shared) {
-        self.session = session
-    }
-
     func isConfigured() -> Bool {
         (try? KeychainService.readGenericPassword(service: Self.keychainService)) != nil
     }
@@ -23,7 +17,10 @@ struct ZenMuxProvider: UsageProvider {
             throw ZenMuxProviderError.missingAPIKey
         }
 
-        let primaryData = try await fetchManagementAPI(apiKey: apiKey)
+        let session = try await UpstreamNetworking.makeSessionFromCurrentSettings()
+        defer { session.finishTasksAndInvalidate() }
+
+        let primaryData = try await fetchManagementAPI(apiKey: apiKey, session: session)
         return buildUsageData(primary: primaryData)
     }
 
@@ -65,7 +62,7 @@ struct ZenMuxProvider: UsageProvider {
 
     // MARK: - Management API (primary)
 
-    private func fetchManagementAPI(apiKey: String) async throws -> ZenMuxData {
+    private func fetchManagementAPI(apiKey: String, session: URLSession) async throws -> ZenMuxData {
         var req = URLRequest(url: URL(string: Self.managementEndpoint)!)
         req.httpMethod = "GET"
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")

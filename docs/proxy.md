@@ -15,6 +15,8 @@ It forwards requests transparently while adding two capabilities:
 - request observability with per-request token tracking and cost estimation
 - a universal content tree over proxied requests, used for popup UI display and payload deduplication in the event log
 
+When the upstream HTTPS proxy setting is enabled in TokenPulse, all outbound forwarding from this local proxy is sent through that configured proxy as well.
+
 # Why it exists
 
 The proxy provides visibility that upstream APIs do not surface directly in local tools: per-request token usage, per-session aggregation, model selection, byte counts, request timing, and estimated cost. It also assembles proxied requests into a **content tree** — a conversation-level structure where each tree node is a content checkpoint (a point in the conversation's message-prefix space) and each attached request is an attempt at that checkpoint. Nodes dedupe shared conversation prefixes across requests, so the event logger stores message content once per node instead of once per request.

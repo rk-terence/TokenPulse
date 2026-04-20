@@ -27,6 +27,7 @@ A macOS menu bar app that monitors AI platform token usage and adds local proxy 
 ### General
 
 - **Configurable polling** — 60s, 2min, or 5min intervals
+- **Outbound HTTPS proxy** — Optional upstream proxy support for provider refreshes and proxied upstream traffic
 - **Launch at login** — Optional auto-start via macOS Service Management
 - **No Dock icon** — Runs as a pure menu bar app
 
@@ -161,6 +162,10 @@ All fields are in `~/.tokenpulse/config.json`:
 | `proxyPort` | `8080` | Listening port on 127.0.0.1 |
 | `anthropicUpstreamURL` | `https://zenmux.ai/api/anthropic` | Anthropic Messages upstream base URL |
 | `openAIUpstreamURL` | `https://api.openai.com` | OpenAI Responses upstream base URL |
+| `useSystemUpstreamProxy` | `true` | Use the current macOS HTTP/HTTPS proxy settings for outbound upstream traffic when no custom proxy is enabled |
+| `upstreamHTTPSProxyEnabled` | `false` | Enable custom upstream proxy overrides |
+| `upstreamHTTPProxyURL` | `""` | Custom HTTP proxy URL for HTTP traffic only |
+| `upstreamHTTPSProxyURL` | `""` | Custom HTTPS proxy URL for HTTPS traffic only |
 | `saveProxyEventLog` | `true` | Master on/off for the proxy event log. When enabled, SQLite metadata, lineage-deduplicated payloads, bounded raw request/response captures, and status snapshots are written; when disabled, no database is opened |
 
 ## Data export
