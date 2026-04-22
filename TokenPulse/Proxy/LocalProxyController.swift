@@ -14,6 +14,7 @@ final class LocalProxyController {
     private static let restartStopDelay: Duration = .milliseconds(150)
     private static let restartStartupTimeout: Duration = .milliseconds(900)
     private static let restartPollInterval: Duration = .milliseconds(50)
+    private static let lifecycleWaitPollInterval: TimeInterval = 0.01
 
     // MARK: - Per-session activity snapshot for UI
 
@@ -94,11 +95,13 @@ final class LocalProxyController {
     private var refreshTask: Task<Void, Never>?
     private var trafficRefreshTask: Task<Void, Never>?
     private var restartTask: Task<Void, Never>?
+    private var shutdownTask: Task<Void, Never>?
     private var trafficRefreshPending = false
     private var currentAnthropicUpstreamURL: String?
 
     /// Start the proxy server on the given port, serving both supported API routes.
     func start(port: Int, anthropicUpstreamURL: String, openAIUpstreamURL: String) {
+        waitForInFlightShutdownIfNeeded()
         guard server == nil else { return }
 
         let config = ConfigService.shared
@@ -258,7 +261,13 @@ final class LocalProxyController {
     }
 
     func stop() {
-        stopInternal(cancelRestartTask: true)
+        _ = beginShutdown(cancelRestartTask: true)
+    }
+
+    func stopAndWait() async {
+        if let shutdownTask = beginShutdown(cancelRestartTask: true) {
+            await shutdownTask.value
+        }
     }
 
     func restart(port: Int, anthropicUpstreamURL: String, openAIUpstreamURL: String) {
@@ -273,11 +282,15 @@ final class LocalProxyController {
         }
     }
 
-    private func stopInternal(cancelRestartTask: Bool) {
+    private func beginShutdown(cancelRestartTask: Bool) -> Task<Void, Never>? {
         if cancelRestartTask {
             restartTask?.cancel()
             restartTask = nil
             isRestarting = false
+        }
+
+        if let shutdownTask {
+            return shutdownTask
         }
 
         refreshTask?.cancel()
@@ -294,20 +307,6 @@ final class LocalProxyController {
 
         let logger = eventLogger
         let metStore = metricsStore
-
-        Task {
-            guard let logger else { return }
-            await logger.logProxyStopped()
-            let snapshot = await metStore.snapshot()
-            await logger.writeStatusSnapshot(
-                enabled: false,
-                port: 0,
-                activeSessions: 0,
-                metrics: snapshot,
-                force: true
-            )
-            await logger.close()
-        }
         eventLogger = nil
 
         isRunning = false
@@ -317,7 +316,28 @@ final class LocalProxyController {
         lastUploadBytes = 0
         downloadBytesPerSec = 0
         currentAnthropicUpstreamURL = nil
-        ProxyLogger.log("Proxy controller stopped")
+
+        let shutdownTask = Task { [weak self] in
+            if let logger {
+                await logger.logProxyStopped()
+                let snapshot = await metStore.snapshot()
+                await logger.writeStatusSnapshot(
+                    enabled: false,
+                    port: 0,
+                    activeSessions: 0,
+                    metrics: snapshot,
+                    force: true
+                )
+                await logger.close()
+            }
+
+            await MainActor.run {
+                self?.shutdownTask = nil
+            }
+            ProxyLogger.log("Proxy controller stopped")
+        }
+        self.shutdownTask = shutdownTask
+        return shutdownTask
     }
 
     private func performRestart(port: Int, anthropicUpstreamURL: String, openAIUpstreamURL: String) async {
@@ -329,7 +349,9 @@ final class LocalProxyController {
         }
 
         for attempt in 1...Self.restartAttempts {
-            stopInternal(cancelRestartTask: false)
+            if let shutdownTask = beginShutdown(cancelRestartTask: false) {
+                await shutdownTask.value
+            }
             guard !Task.isCancelled else { return }
 
             try? await Task.sleep(for: Self.restartStopDelay)
@@ -364,6 +386,25 @@ final class LocalProxyController {
         }
 
         return isRunning
+    }
+
+    private func waitForInFlightShutdownIfNeeded() {
+        guard let shutdownTask else { return }
+
+        let waitGroup = DispatchGroup()
+        waitGroup.enter()
+
+        Task {
+            await shutdownTask.value
+            waitGroup.leave()
+        }
+
+        while waitGroup.wait(timeout: .now()) != .success {
+            _ = RunLoop.current.run(
+                mode: .default,
+                before: Date(timeIntervalSinceNow: Self.lifecycleWaitPollInterval)
+            )
+        }
     }
 
     /// Reset the cumulative proxy cost estimate to zero.
