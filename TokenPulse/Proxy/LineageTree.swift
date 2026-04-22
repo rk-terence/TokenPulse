@@ -111,6 +111,87 @@ struct ContentTree: Sendable {
         let createdNode: Bool
     }
 
+    struct AttachPreview: Sendable {
+        enum MatchKind: String, Sendable {
+            case root = "root"
+            case existingNode = "existing_node"
+            case newChild = "new_child"
+            case previousResponseLink = "previous_response_link"
+        }
+
+        let matchKind: MatchKind
+        let matchedPrefixCount: Int
+        let deltaMessages: [NormalizedMessage]
+        let fullMessages: [NormalizedMessage]
+        let previousResponseID: String?
+        let fingerprintHash: String
+        fileprivate let matchedNodeID: UUID?
+        fileprivate let cumulativeHash: String
+    }
+
+    func previewAttach(
+        fingerprint: LineageFingerprint,
+        messages: [NormalizedMessage],
+        previousResponseID: String?
+    ) -> AttachPreview {
+        let key = fingerprint.conversationKey
+
+        if messages.isEmpty,
+           let previousResponseID,
+           let ownerNodeID = responseIDIndex[previousResponseID] {
+            return AttachPreview(
+                matchKind: .previousResponseLink,
+                matchedPrefixCount: 0,
+                deltaMessages: [],
+                fullMessages: messages,
+                previousResponseID: previousResponseID,
+                fingerprintHash: key.fingerprintHash,
+                matchedNodeID: ownerNodeID,
+                cumulativeHash: Self.emptyPrefixHash()
+            )
+        }
+
+        if messages.isEmpty {
+            return AttachPreview(
+                matchKind: .root,
+                matchedPrefixCount: 0,
+                deltaMessages: [],
+                fullMessages: messages,
+                previousResponseID: previousResponseID,
+                fingerprintHash: key.fingerprintHash,
+                matchedNodeID: conversations[key]?.rootNodeID,
+                cumulativeHash: Self.emptyPrefixHash()
+            )
+        }
+
+        let prefixHashes = Self.computePrefixHashes(messages: messages)
+        let conversation = conversations[key]
+        let conversationHashes = nodesByHash[key] ?? [:]
+        var matchedPrefixCount = 0
+        var matchedNodeID = conversation?.rootNodeID
+
+        for index in stride(from: messages.count, through: 0, by: -1) {
+            if let nodeID = conversationHashes[prefixHashes[index]] {
+                matchedPrefixCount = index
+                matchedNodeID = nodeID
+                break
+            }
+        }
+
+        let matchKind: AttachPreview.MatchKind = matchedPrefixCount == messages.count ? .existingNode : .newChild
+        let deltaMessages = matchedPrefixCount == messages.count ? [] : Array(messages[matchedPrefixCount...])
+        return AttachPreview(
+            matchKind: matchKind,
+            matchedPrefixCount: matchedPrefixCount,
+            deltaMessages: deltaMessages,
+            fullMessages: messages,
+            previousResponseID: previousResponseID,
+            fingerprintHash: key.fingerprintHash,
+            matchedNodeID: matchedNodeID,
+            cumulativeHash: prefixHashes[messages.count]
+        )
+    }
+
     /// Attach a newly-parsed proxy request to the tree. The request starts in
     /// the in-flight state; callers must call `finishRequest` on completion.
     ///
@@ -131,13 +212,17 @@ struct ContentTree: Sendable {
         previousResponseID: String?,
         now: Date = Date()
     ) -> AttachResult {
+        let preview = previewAttach(
+            fingerprint: fingerprint,
+            messages: messages,
+            previousResponseID: previousResponseID
+        )
         let key = fingerprint.conversationKey
 
         // 1) OpenAI previous_response_id with no body messages: force-link to
         //    the node that produced the referenced upstream response.
-        if messages.isEmpty,
-           let previousResponseID,
-           let ownerNodeID = responseIDIndex[previousResponseID],
+        if preview.matchKind == .previousResponseLink,
+           let ownerNodeID = preview.matchedNodeID,
            let ownerNode = nodes[ownerNodeID] {
             recordRequest(
                 id: requestID,
@@ -167,7 +252,7 @@ struct ContentTree: Sendable {
         //    previous_response_id: attach to the root node (empty prefix) and
         //    return. Descendants cannot match against this request unless a
         //    later one produces a responseID linkage.
-        if messages.isEmpty {
+        if preview.matchKind == .root {
             recordRequest(
                 id: requestID,
                 nodeID: conversation.rootNodeID,
@@ -188,20 +273,9 @@ struct ContentTree: Sendable {
         // 4) Precompute prefix hashes once (O(N)) and trim-and-match against
         //    `nodesByHash[key]` from k=N down to k=0. The root node is always
         //    registered at k=0 so the loop always terminates.
-        let prefixHashes = Self.computePrefixHashes(messages: messages)
-        let convHashes = nodesByHash[key] ?? [:]
-        var matchedK = 0
-        var matchedNodeID = conversation.rootNodeID
-        for k in stride(from: messages.count, through: 0, by: -1) {
-            if let id = convHashes[prefixHashes[k]] {
-                matchedK = k
-                matchedNodeID = id
-                break
-            }
-        }
-
         // 5) Full prefix already exists — attach to the matched node.
-        if matchedK == messages.count {
+        if preview.matchKind == .existingNode,
+           let matchedNodeID = preview.matchedNodeID {
             recordRequest(
                 id: requestID,
                 nodeID: matchedNodeID,
@@ -221,19 +295,18 @@ struct ContentTree: Sendable {
 
         // 6) Partial match — create a new child node with the trimmed-off
         //    suffix as its delta.
-        let delta = Array(messages[matchedK..<messages.count])
         let newNodeID = UUID()
         let newNode = Node(
             id: newNodeID,
             conversationID: conversation.id,
-            parentNodeID: matchedNodeID,
-            deltaMessages: delta,
-            cumulativeHash: prefixHashes[messages.count],
+            parentNodeID: preview.matchedNodeID ?? conversation.rootNodeID,
+            deltaMessages: preview.deltaMessages,
+            cumulativeHash: preview.cumulativeHash,
             lastActivityAt: now,
             deltaMessagesJSONCache: nil
         )
         nodes[newNodeID] = newNode
-        childrenByNode[matchedNodeID, default: []].append(newNodeID)
+        childrenByNode[preview.matchedNodeID ?? conversation.rootNodeID, default: []].append(newNodeID)
         nodesByHash[key, default: [:]][newNode.cumulativeHash] = newNodeID
         recordRequest(
             id: requestID,
