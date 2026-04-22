@@ -2,6 +2,8 @@ import AppKit
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private static let terminationCleanupPollInterval: TimeInterval = 0.01
+
     private var statusBarController: StatusBarController?
     private var pollingManager: PollingManager?
     private var proxyController: LocalProxyController?
@@ -46,6 +48,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 port: ConfigService.shared.proxyPort,
                 anthropicUpstreamURL: ConfigService.shared.anthropicUpstreamURL,
                 openAIUpstreamURL: ConfigService.shared.openAIUpstreamURL
+            )
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        pollingManager?.stop()
+
+        guard let proxyController else { return }
+
+        let cleanupGroup = DispatchGroup()
+        cleanupGroup.enter()
+
+        Task { @MainActor in
+            await proxyController.stopAndWait()
+            cleanupGroup.leave()
+        }
+
+        while cleanupGroup.wait(timeout: .now()) != .success {
+            _ = RunLoop.current.run(
+                mode: .default,
+                before: Date(timeIntervalSinceNow: Self.terminationCleanupPollInterval)
             )
         }
     }
