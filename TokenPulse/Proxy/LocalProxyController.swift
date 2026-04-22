@@ -98,6 +98,13 @@ final class LocalProxyController {
     private var shutdownTask: Task<Void, Never>?
     private var trafficRefreshPending = false
     private var currentAnthropicUpstreamURL: String?
+    @ObservationIgnored private var hiddenSessions: [String: Date] = [:]
+
+    /// Hide the given session from the popup until new activity arrives.
+    func hideSession(_ sessionID: String) {
+        hiddenSessions[sessionID] = Date()
+        sessionActivities.removeAll { $0.sessionID == sessionID }
+    }
 
     /// Start the proxy server on the given port, serving both supported API routes.
     func start(port: Int, anthropicUpstreamURL: String, openAIUpstreamURL: String) {
@@ -484,15 +491,21 @@ final class LocalProxyController {
             try? await Task.sleep(for: .milliseconds(50))
             guard !Task.isCancelled, let self else { return }
 
+            let capturedHidden = self.hiddenSessions
             let activitySnapshots = await sessStore.snapshotSessionActivities()
             let uploadSize = await sessStore.lastUploadSize()
             let costSnapshot = await sessStore.costSnapshot()
-            let activities = Self.visibleSessionActivities(from: activitySnapshots, now: Date())
+            let (activities, activeSessionCount, stalledHideIDs) = Self.visibleSessionActivities(
+                from: activitySnapshots,
+                now: Date(),
+                hiddenSessions: capturedHidden
+            )
 
+            for id in stalledHideIDs { self.hiddenSessions.removeValue(forKey: id) }
             self.sessionActivities = activities
             self.lastUploadBytes = uploadSize
             self.proxyStatus = ProxyStatus(
-                activeSessions: activities.count,
+                activeSessions: activeSessionCount,
                 totalRequestsForwarded: self.proxyStatus.totalRequestsForwarded,
                 totalInputTokens: self.proxyStatus.totalInputTokens,
                 totalOutputTokens: self.proxyStatus.totalOutputTokens,
@@ -531,6 +544,9 @@ final class LocalProxyController {
                         for sessionID in expiredSessionIDs {
                             await logger?.logSessionExpired(session: sessionID)
                         }
+                        await MainActor.run {
+                            for id in expiredSessionIDs { self?.hiddenSessions.removeValue(forKey: id) }
+                        }
                     }
                     await sessStore.pruneStaleDoneRequests(
                         otherOlderThan: now.addingTimeInterval(-Self.otherTrafficRetentionSeconds)
@@ -547,6 +563,7 @@ final class LocalProxyController {
                     }
                 }
 
+                let capturedHidden = await MainActor.run { self?.hiddenSessions ?? [:] }
                 let snapshot = await metStore.snapshot()
                 let activitySnapshots = await sessStore.snapshotSessionActivities()
                 let uploadSize  = await sessStore.lastUploadSize()
@@ -563,15 +580,20 @@ final class LocalProxyController {
                 prevTransfer     = (sent: 0, received: bytesRx)
                 prevTransferDate = now
 
-                let activities = Self.visibleSessionActivities(from: activitySnapshots, now: now)
+                let (activities, activeSessionCount, stalledHideIDs) = Self.visibleSessionActivities(
+                    from: activitySnapshots,
+                    now: now,
+                    hiddenSessions: capturedHidden
+                )
 
                 await MainActor.run {
                     guard !Task.isCancelled else { return }
+                    for id in stalledHideIDs { self?.hiddenSessions.removeValue(forKey: id) }
                     self?.sessionActivities   = activities
                     self?.lastUploadBytes     = uploadSize
                     self?.downloadBytesPerSec = downloadSpeed
                     self?.proxyStatus = ProxyStatus(
-                        activeSessions: activities.count,
+                        activeSessions: activeSessionCount,
                         totalRequestsForwarded: snapshot.totalRequestsForwarded,
                         totalInputTokens: snapshot.totalInputTokens,
                         totalOutputTokens: snapshot.totalOutputTokens,
@@ -587,16 +609,32 @@ final class LocalProxyController {
 
     private static func visibleSessionActivities(
         from snapshots: [ProxySessionStore.SessionSnapshot],
-        now: Date
-    ) -> [SessionActivity] {
+        now: Date,
+        hiddenSessions: [String: Date]
+    ) -> (activities: [SessionActivity], activeSessionCount: Int, stalledHideIDs: [String]) {
         let identifiedCutoff = now.addingTimeInterval(-sessionVisibilitySeconds)
         let otherCutoff = now.addingTimeInterval(-otherTrafficRetentionSeconds)
 
         var result: [SessionActivity] = []
+        var activeSessionCount = 0
+        var stalledHideIDs: [String] = []
+
         for snap in snapshots {
             let sortedActive = snap.activeRequests.sorted { $0.startedAt > $1.startedAt }
             let sortedDone = snap.doneRequests.sorted {
                 ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt)
+            }
+
+            // Check if this session is hidden, and if so whether new activity resurfaces it.
+            if let hideDate = hiddenSessions[snap.sessionID] {
+                let hasNewActive = sortedActive.contains { $0.startedAt > hideDate }
+                let hasNewDone = sortedDone.contains { $0.startedAt > hideDate }
+                if !hasNewActive && !hasNewDone {
+                    // Still hidden — skip.
+                    continue
+                }
+                // New activity arrived after the hide — resurface and clean up.
+                stalledHideIDs.append(snap.sessionID)
             }
 
             let visibleActive: [ProxyRequestActivity]
@@ -620,6 +658,8 @@ final class LocalProxyController {
                 visibleDone = sortedDone
             }
 
+            activeSessionCount += 1
+
             result.append(SessionActivity(
                 sessionID: snap.sessionID,
                 completedRequests: snap.completedRequestCount,
@@ -633,6 +673,6 @@ final class LocalProxyController {
                 estimatedCostUSD: snap.estimatedCostUSD
             ))
         }
-        return result
+        return (activities: result, activeSessionCount: activeSessionCount, stalledHideIDs: stalledHideIDs)
     }
 }

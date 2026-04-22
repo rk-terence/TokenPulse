@@ -1,12 +1,46 @@
 import AppKit
 import SwiftUI
 
+/// Borderless floating panel used in place of `NSPopover` so the popup has
+/// no arrow/tip and reads as a plain rounded rectangle. Nonactivating so
+/// opening the popup doesn't steal focus from the user's frontmost app.
+final class FloatingPopupWindow: NSPanel {
+    init() {
+        super.init(
+            contentRect: NSRect(x: 0, y: 0, width: 384, height: 100),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: true
+        )
+        isFloatingPanel = true
+        level = .popUpMenu
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        // Snap in/out like a native menu — no fade. .utilityWindow was adding
+        // a ~150ms fade that made the popup feel slow.
+        animationBehavior = .none
+        isReleasedWhenClosed = false
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        hidesOnDeactivate = false
+    }
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
 @MainActor
 final class StatusBarController {
+    private static let popupCornerRadius: CGFloat = 10
+    private static let popupTopGap: CGFloat = 6
+
     private let statusItem: NSStatusItem
-    private let popover = NSPopover()
+    private let popupWindow = FloatingPopupWindow()
+    private let hostingController: NSHostingController<PopoverView>
+    private var hostingSizeObservation: NSKeyValueObservation?
     nonisolated(unsafe) private var eventMonitor: Any?
     nonisolated(unsafe) private var localEventMonitor: Any?
+    nonisolated(unsafe) private var resignKeyObserver: Any?
 
     private weak var proxyController: LocalProxyController?
     private var isPinned = false
@@ -87,22 +121,67 @@ final class StatusBarController {
         self.proxyController = proxyController
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
-        // Popover content
-        let view = PopoverView(
+        // Build hosting controller first so callbacks can reference a nonnull
+        // popupWindow via self.
+        let host = NSHostingController(
+            rootView: PopoverView(
+                manager: providerManager,
+                proxyController: proxyController
+            )
+        )
+        host.sizingOptions = [.preferredContentSize]
+        self.hostingController = host
+
+        // Host the SwiftUI content inside a rounded NSVisualEffectView so we
+        // keep the native popover material + shadow but drop the arrow.
+        let background = NSVisualEffectView()
+        background.material = .popover
+        background.blendingMode = .behindWindow
+        background.state = .active
+        background.wantsLayer = true
+        background.layer?.cornerRadius = Self.popupCornerRadius
+        background.layer?.masksToBounds = true
+
+        host.view.translatesAutoresizingMaskIntoConstraints = false
+        background.addSubview(host.view)
+        NSLayoutConstraint.activate([
+            host.view.topAnchor.constraint(equalTo: background.topAnchor),
+            host.view.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            host.view.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            host.view.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+        ])
+        popupWindow.contentView = background
+
+        // Rewire the pin / settings callbacks now that self exists.
+        host.rootView = PopoverView(
             manager: providerManager,
             proxyController: proxyController,
             onTogglePin: { [weak self] pinned in
                 self?.setPinned(pinned)
             },
             onOpenSettings: { [weak self] in
-                self?.popover.performClose(nil)
+                self?.hidePopup()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                     providerManager.openSettings()
                 }
             }
         )
-        popover.contentViewController = NSHostingController(rootView: view)
-        popover.behavior = .transient
+
+        // Track SwiftUI's preferred content size so the window follows content
+        // growth/shrinkage (e.g., new sessions arriving) while staying anchored
+        // to its top-left corner.
+        hostingSizeObservation = host.observe(\.preferredContentSize, options: [.new]) { [weak self] _, _ in
+            Task { @MainActor [weak self] in
+                self?.applyPreferredContentSize()
+            }
+        }
+
+        // Warm up SwiftUI so the first click doesn't pay a cold-render cost.
+        // Give the content view a real frame, force a synchronous layout pass,
+        // then size the window to the SwiftUI preferred size.
+        background.frame = NSRect(x: 0, y: 0, width: 384, height: 600)
+        host.view.layoutSubtreeIfNeeded()
+        applyPreferredContentSize(preservingAnchor: false)
 
         // Handle both left and right clicks
         if let button = statusItem.button {
@@ -111,10 +190,24 @@ final class StatusBarController {
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
-        // Close popover on external clicks (only when not pinned)
+        // Close popup on external clicks (only when not pinned)
         eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            guard let self, !self.isPinned, self.popover.isShown else { return }
-            self.popover.performClose(nil)
+            Task { @MainActor [weak self] in
+                guard let self, !self.isPinned, self.popupWindow.isVisible else { return }
+                self.hidePopup()
+            }
+        }
+
+        // Close popup when it resigns key (e.g. user switches apps via Cmd-Tab).
+        resignKeyObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification,
+            object: popupWindow,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, !self.isPinned, self.popupWindow.isVisible else { return }
+                self.hidePopup()
+            }
         }
 
         // Subscribe to proxy traffic events. A nil direction means a UI-refresh
@@ -151,8 +244,10 @@ final class StatusBarController {
     deinit {
         animationTimer?.invalidate()
         appearanceObservation?.invalidate()
+        hostingSizeObservation?.invalidate()
         if let eventMonitor    { NSEvent.removeMonitor(eventMonitor) }
         if let localEventMonitor { NSEvent.removeMonitor(localEventMonitor) }
+        if let resignKeyObserver { NotificationCenter.default.removeObserver(resignKeyObserver) }
     }
 
     // MARK: - Public
@@ -177,7 +272,6 @@ final class StatusBarController {
 
     private func setPinned(_ pinned: Bool) {
         isPinned = pinned
-        popover.behavior = pinned ? .applicationDefined : .transient
     }
 
     // MARK: - Event ingest
@@ -332,10 +426,59 @@ final class StatusBarController {
     }
 
     private func togglePopover(_ sender: Any?) {
-        if popover.isShown {
-            popover.performClose(sender)
-        } else if let button = statusItem.button {
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        if popupWindow.isVisible {
+            hidePopup()
+        } else {
+            showPopup()
+        }
+    }
+
+    private func showPopup() {
+        guard let button = statusItem.button,
+              let buttonWindow = button.window else { return }
+
+        // Make sure the window has a sensible size before the first show.
+        applyPreferredContentSize(preservingAnchor: false)
+
+        let buttonFrameInScreen = buttonWindow.convertToScreen(
+            button.convert(button.bounds, to: nil)
+        )
+        let screenFrame = buttonWindow.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
+        let size = popupWindow.frame.size
+
+        let desiredX = buttonFrameInScreen.midX - size.width / 2
+        let clampedX = max(
+            screenFrame.minX + 4,
+            min(desiredX, screenFrame.maxX - size.width - 4)
+        )
+        let originY = buttonFrameInScreen.minY - Self.popupTopGap - size.height
+
+        popupWindow.setFrameOrigin(NSPoint(x: clampedX, y: originY))
+        popupWindow.makeKeyAndOrderFront(nil)
+    }
+
+    private func hidePopup() {
+        popupWindow.orderOut(nil)
+    }
+
+    /// Resize the popup window to match the SwiftUI content's preferred size.
+    /// Keeps the top-left corner anchored so content growth expands downward.
+    private func applyPreferredContentSize(preservingAnchor: Bool = true) {
+        var size = hostingController.preferredContentSize
+        if size.width <= 1 || size.height <= 1 {
+            // Fall back to the host view's fitting size during the first
+            // measurement pass, before SwiftUI has reported a preferred size.
+            size = hostingController.view.fittingSize
+        }
+        guard size.width > 1, size.height > 1 else { return }
+
+        if preservingAnchor, popupWindow.isVisible {
+            let current = popupWindow.frame
+            let topLeft = NSPoint(x: current.minX, y: current.maxY)
+            let newOrigin = NSPoint(x: topLeft.x, y: topLeft.y - size.height)
+            popupWindow.setFrame(NSRect(origin: newOrigin, size: size), display: true, animate: false)
+        } else {
+            popupWindow.setContentSize(size)
         }
     }
 }

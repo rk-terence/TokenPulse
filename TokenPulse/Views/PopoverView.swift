@@ -574,34 +574,26 @@ private struct SessionActivityRow: View {
                 sessionTitle
                 Spacer()
                 sessionStats
+                sessionMenu
             }
 
             if !activity.activeRequests.isEmpty {
-                Text(String(localized: "Active"))
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .padding(.leading, 10)
-
                 ForEach(activity.activeRequests) { request in
-                    RequestActivityRow(request: request)
+                    RequestActivityRow(request: request, isActive: true)
                         .padding(.leading, 10)
                 }
             }
 
             if !activity.doneRequests.isEmpty {
-                Text(String(localized: "Done"))
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .padding(.leading, 10)
-
                 // Per-row dimming: only rows whose descendant (currently active
                 // and `done=false`) is about to replace them get dimmed. Other
                 // done rows render normally.
                 ForEach(activity.doneRequests) { request in
-                    RequestActivityRow(request: request)
+                    RequestActivityRow(request: request, isActive: false)
                         .padding(.leading, 10)
                         .opacity(request.isPendingReplacement ? 0.4 : 1.0)
                 }
+                .padding(.top, activity.activeRequests.isEmpty ? 0 : 4)
             }
         }
     }
@@ -611,11 +603,11 @@ private struct SessionActivityRow: View {
         if let agentName = activity.agentName,
            !activity.isOtherTraffic {
             Text(localizedTrackedSessionTitle(agentName: agentName, shortID: activity.shortID))
-                .font(.callout)
+                .font(.body.weight(.medium))
                 .foregroundStyle(.secondary)
         } else {
             Text(activity.rowTitle)
-                .font(.callout)
+                .font(.body.weight(.medium))
                 .foregroundStyle(.secondary)
         }
     }
@@ -630,28 +622,53 @@ private struct SessionActivityRow: View {
     }
 
     @ViewBuilder
+    private var sessionMenu: some View {
+        Menu {
+            Button(
+                NSLocalizedString(
+                    "proxy.session.hide",
+                    value: "Hide session",
+                    comment: "Menu item to hide a proxy session from the popup"
+                )
+            ) {
+                proxyController?.hideSession(activity.sessionID)
+            }
+        } label: {
+            Image(systemName: "chevron.right")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.secondary)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .padding(.leading, 6)
+    }
+
+    @ViewBuilder
     private var sessionStats: some View {
         HStack(spacing: 8) {
             if activity.completedRequests > 0 {
                 ProxyMetricLabel(
                     label: String(localized: "done"),
-                    value: "\(activity.completedRequests)"
+                    value: "\(activity.completedRequests)",
+                    font: .body
                 )
             }
             if activity.erroredRequests > 0 {
                 HStack(spacing: 3) {
                     Text(String(localized: "err"))
-                        .font(.callout)
+                        .font(.body)
                         .foregroundStyle(.red.opacity(0.7))
                     Text("\(activity.erroredRequests)")
-                        .font(.callout.monospacedDigit())
+                        .font(.body.monospacedDigit())
                         .foregroundStyle(.red)
                 }
             }
             if activity.estimatedCostUSD > 0 {
                 ProxyMetricLabel(
                     label: "$",
-                    value: formatCost(activity.estimatedCostUSD)
+                    value: formatCost(activity.estimatedCostUSD),
+                    font: .body
                 )
             }
         }
@@ -672,6 +689,7 @@ private struct SessionActivityRow: View {
 
 private struct RequestActivityRow: View {
     let request: ProxyRequestActivity
+    let isActive: Bool
 
     private enum StatField {
         static let modelLabelWidth = 8
@@ -704,6 +722,15 @@ private struct RequestActivityRow: View {
                     .font(rowFont)
                     .foregroundStyle(.tertiary)
                     .contentTransition(.numericText())
+            }
+        }
+        .overlay(alignment: .leading) {
+            if isActive {
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(Color.accentColor)
+                    .frame(width: 2)
+                    .offset(x: -6)
+                    .allowsHitTesting(false)
             }
         }
     }
@@ -1102,14 +1129,15 @@ private struct RequestActivityRow: View {
 private struct ProxyMetricLabel: View {
     let label: String
     let value: String
+    var font: Font = .callout
 
     var body: some View {
         HStack(spacing: 3) {
             Text(label)
-                .font(.callout)
+                .font(font)
                 .foregroundStyle(.tertiary)
             Text(value)
-                .font(.callout.monospacedDigit())
+                .font(font.monospacedDigit())
                 .foregroundStyle(.secondary)
         }
     }
