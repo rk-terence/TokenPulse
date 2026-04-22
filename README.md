@@ -74,7 +74,7 @@ ditto dist/TokenPulse.app ~/Applications/TokenPulse.app
 
 #### Signing mode
 
-`Scripts/package_app.sh` reads `TOKENPULSE_SIGNING`:
+`Scripts/package_app.sh` reads `TOKENPULSE_SIGNING` from the current shell environment first, then falls back to `./.env` if present:
 
 | Value | Behavior |
 |---|---|

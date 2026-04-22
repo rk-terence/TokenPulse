@@ -5,7 +5,6 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="TokenPulse"
 CONFIGURATION="${CONFIGURATION:-release}"
-SIGNING_MODE="${TOKENPULSE_SIGNING:-adhoc}"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/dist}"
 SWIFT_BUILD_ARGS=(
     --package-path "$ROOT_DIR"
@@ -22,6 +21,35 @@ ICONSET_SOURCE_DIR="$ROOT_DIR/TokenPulse/Assets.xcassets/AppIcon.appiconset"
 ICONSET_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tokenpulse-iconset.XXXXXX")"
 ICON_PATH="$RESOURCES_DIR/AppIcon.icns"
 ENTITLEMENTS_PATH="$ROOT_DIR/TokenPulse/TokenPulse.entitlements"
+
+resolve_signing_mode() {
+    if [[ -n "${TOKENPULSE_SIGNING:-}" ]]; then
+        printf '%s\n' "$TOKENPULSE_SIGNING"
+        return
+    fi
+
+    local dotenv_path="$ROOT_DIR/.env"
+    if [[ -f "$dotenv_path" ]]; then
+        local dotenv_signing_mode
+        dotenv_signing_mode="$(
+            DOTENV_PATH="$dotenv_path" bash -c '
+                set -a
+                # shellcheck source=/dev/null
+                source "$DOTENV_PATH"
+                set +a
+                printf "%s" "${TOKENPULSE_SIGNING:-}"
+            '
+        )"
+        if [[ -n "$dotenv_signing_mode" ]]; then
+            printf '%s\n' "$dotenv_signing_mode"
+            return
+        fi
+    fi
+
+    printf 'adhoc\n'
+}
+
+SIGNING_MODE="$(resolve_signing_mode)"
 
 cleanup() {
     rm -rf "$ICONSET_DIR"

@@ -21,7 +21,7 @@ ditto dist/TokenPulse.app ~/Applications/TokenPulse.app
 
 - If the user asks to "build" the app, default to `swift build` (debug).
 - If the user asks to "install" the app, default to `bash Scripts/package_app.sh` + the `ditto` copy above.
-- `Scripts/package_app.sh` honors `CONFIGURATION` (default `release`), `OUTPUT_DIR` (default `dist/`), and `TOKENPULSE_SIGNING`:
+- `Scripts/package_app.sh` honors `CONFIGURATION` (default `release`), `OUTPUT_DIR` (default `dist/`), and `TOKENPULSE_SIGNING` from the current shell environment or `./.env`:
   - `adhoc` (default) — `codesign --sign -` with `TokenPulse/TokenPulse.entitlements`. No developer account needed, but the signature hash changes every rebuild, which re-prompts Keychain ACLs and invalidates Login Items approval.
   - `off` — skip codesign entirely (the bundle won't launch on Apple Silicon).
   - A signing identity string (e.g. `"Developer ID Application: Name (TEAMID)"`) — passed through to `codesign --sign` with `--options runtime` plus entitlements. Use when a stable signature matters (Keychain persistence, Login Items, notarization).
