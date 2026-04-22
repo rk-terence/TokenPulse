@@ -208,6 +208,22 @@ actor ProxySessionStore {
         onTraffic?(nil)
     }
 
+    /// Preview what attaching this request would add to the content tree,
+    /// without mutating the tree. Used by the content blocklist guard to scan
+    /// only the delta messages (content new in this request) before deciding
+    /// whether to reject or forward.
+    func previewTreeAttach(
+        fingerprint: LineageFingerprint,
+        messages: [ContentTree.NormalizedMessage],
+        previousResponseID: String?
+    ) -> ContentTree.AttachPreview {
+        contentTree.previewAttach(
+            fingerprint: fingerprint,
+            messages: messages,
+            previousResponseID: previousResponseID
+        )
+    }
+
     /// Finalize a tree request. `succeeded` is true only for streams that
     /// completed cleanly — upstream errors, client disconnects, and
     /// incomplete streams all pass `succeeded: false`. No-op when the

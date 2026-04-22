@@ -377,6 +377,7 @@ private struct ProxyTab: View {
     var proxyController: LocalProxyController?
 
     @State private var portText: String = ""
+    @State private var blocklistNewKeyword: String = ""
 
     private var proxyEnabledBinding: Binding<Bool> {
         Binding(
@@ -518,6 +519,53 @@ private struct ProxyTab: View {
                 }
             }
 
+            SettingsCard(
+                title: String(localized: "Content Blocklist"),
+                description: String(localized: "Reject requests whose newly-added content contains any of these keywords. Prefix with re: for a regex pattern. Changes apply on the next proxy restart.")
+            ) {
+                if !config.contentBlocklistKeywords.isEmpty {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(config.contentBlocklistKeywords.enumerated()), id: \.offset) { index, keyword in
+                            if index > 0 {
+                                Divider()
+                            }
+                            HStack {
+                                Text(keyword)
+                                    .font(.system(.body, design: .monospaced))
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                Spacer(minLength: 0)
+                                Button {
+                                    config.contentBlocklistKeywords.remove(at: index)
+                                } label: {
+                                    Image(systemName: "minus.circle.fill")
+                                        .foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel(String(localized: "Remove keyword"))
+                            }
+                            .padding(.vertical, 6)
+                        }
+                    }
+
+                    Divider()
+                }
+
+                HStack(spacing: 8) {
+                    TextField(
+                        String(localized: "Keyword or re: pattern"),
+                        text: $blocklistNewKeyword
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { addBlocklistKeyword() }
+
+                    Button(String(localized: "Add")) {
+                        addBlocklistKeyword()
+                    }
+                    .disabled(blocklistNewKeyword.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+
             if let controller = proxyController, controller.isRunning {
                 SettingsCard(
                     title: String(localized: "Live status"),
@@ -594,6 +642,14 @@ private struct ProxyTab: View {
             anthropicUpstreamURL: config.anthropicUpstreamURL,
             openAIUpstreamURL: config.openAIUpstreamURL
         )
+    }
+
+    private func addBlocklistKeyword() {
+        let trimmed = blocklistNewKeyword.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty,
+              !config.contentBlocklistKeywords.contains(trimmed) else { return }
+        config.contentBlocklistKeywords.append(trimmed)
+        blocklistNewKeyword = ""
     }
 }
 

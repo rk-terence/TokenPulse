@@ -6,7 +6,7 @@ final class ConfigService {
     static let shared = ConfigService()
 
     /// Current on-disk schema version. Bump when adding fields that need migration.
-    private static let currentConfigVersion = 10
+    private static let currentConfigVersion = 11
     private static let defaultAnthropicUpstreamURL = "https://zenmux.ai/api/anthropic"
     private static let defaultOpenAIUpstreamURL = "https://api.openai.com"
 
@@ -61,6 +61,13 @@ final class ConfigService {
     /// Single on/off toggle for the unified proxy event log (metadata + deduplicated payloads).
     /// When disabled, no SQLite database is opened and nothing is written to disk.
     var saveProxyEventLog: Bool {
+        didSet { save() }
+    }
+
+    /// Keywords for the content blocklist. Plain strings are matched as
+    /// case-insensitive substrings; strings prefixed with `re:` are compiled
+    /// as regular expressions. Changes take effect on the next proxy restart.
+    var contentBlocklistKeywords: [String] {
         didSet { save() }
     }
 
@@ -142,6 +149,7 @@ final class ConfigService {
         self.upstreamHTTPProxyURL = loaded.config.upstreamHTTPProxyURL
         self.upstreamHTTPSProxyURL = loaded.config.upstreamHTTPSProxyURL
         self.saveProxyEventLog = loaded.config.saveProxyEventLog
+        self.contentBlocklistKeywords = loaded.config.contentBlocklistKeywords
 
         // Persist migrated config if the on-disk version was outdated.
         if loaded.migrated {
@@ -173,6 +181,7 @@ final class ConfigService {
         var upstreamHTTPProxyURL: String?
         var upstreamHTTPSProxyURL: String?
         var saveProxyEventLog: Bool?
+        var contentBlocklistKeywords: [String]?
         // Retained for migration only — no longer written.
         var keepaliveEnabled: Bool?
         var keepaliveIntervalSeconds: Int?
@@ -198,6 +207,7 @@ final class ConfigService {
         var upstreamHTTPProxyURL: String
         var upstreamHTTPSProxyURL: String
         var saveProxyEventLog: Bool
+        var contentBlocklistKeywords: [String]
     }
 
     private static func load() -> LoadResult {
@@ -217,7 +227,8 @@ final class ConfigService {
                     useSystemUpstreamProxy: true,
                     upstreamHTTPProxyURL: "",
                     upstreamHTTPSProxyURL: "",
-                    saveProxyEventLog: true
+                    saveProxyEventLog: true,
+                    contentBlocklistKeywords: []
                 ),
                 migrated: true
             )
@@ -241,7 +252,8 @@ final class ConfigService {
                 useSystemUpstreamProxy: file.useSystemUpstreamProxy ?? true,
                 upstreamHTTPProxyURL: file.upstreamHTTPProxyURL ?? "",
                 upstreamHTTPSProxyURL: file.upstreamHTTPSProxyURL ?? "",
-                saveProxyEventLog: file.saveProxyEventLog ?? true
+                saveProxyEventLog: file.saveProxyEventLog ?? true,
+                contentBlocklistKeywords: file.contentBlocklistKeywords ?? []
             ),
             migrated: needsMigration
         )
@@ -274,6 +286,7 @@ final class ConfigService {
             upstreamHTTPProxyURL: upstreamHTTPProxyURL,
             upstreamHTTPSProxyURL: upstreamHTTPSProxyURL,
             saveProxyEventLog: saveProxyEventLog,
+            contentBlocklistKeywords: contentBlocklistKeywords.isEmpty ? nil : contentBlocklistKeywords,
             keepaliveEnabled: nil,
             keepaliveIntervalSeconds: nil,
             proxyInactivityTimeoutSeconds: nil,

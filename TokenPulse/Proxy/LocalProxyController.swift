@@ -110,12 +110,14 @@ final class LocalProxyController {
         let logger = ProxyEventLogger(enabled: config.saveProxyEventLog)
         self.eventLogger = logger
         let upstreamHTTPSProxySetting = config.effectiveUpstreamProxySetting
+        let contentBlocklistKeywords = config.contentBlocklistKeywords
 
         let anthropicForwarder = ProxyForwarder(
             upstreamBaseURL: anthropicUpstreamURL,
             apiFlavor: .anthropicMessages,
             apiHandler: anthropicAPIHandler,
             upstreamHTTPSProxySetting: upstreamHTTPSProxySetting,
+            contentBlocklistKeywords: contentBlocklistKeywords,
             eventLogger: logger,
             proxyPort: port
         )
@@ -124,6 +126,7 @@ final class LocalProxyController {
             apiFlavor: .openAIResponses,
             apiHandler: openAIAPIHandler,
             upstreamHTTPSProxySetting: upstreamHTTPSProxySetting,
+            contentBlocklistKeywords: contentBlocklistKeywords,
             eventLogger: logger,
             proxyPort: port
         )

@@ -19,6 +19,9 @@ final class ProxyForwarder: Sendable {
     private let eventLogger: ProxyEventLogger?
     private let proxyPort: Int
     private let upstreamHTTPSProxySetting: UpstreamHTTPSProxySetting
+    /// Compiled content blocklist built from user-configured keywords at proxy start.
+    /// Empty by default — zero overhead when no keywords are configured.
+    private let contentBlocklist: ContentBlocklist
     /// Shared session for non-streaming requests — preserves TCP/TLS connection reuse.
     private let nonStreamingSession: URLSession
     private let nonStreamingPoolDelegate: NonStreamingPoolDelegate
@@ -28,6 +31,7 @@ final class ProxyForwarder: Sendable {
         apiFlavor: ProxyAPIFlavor,
         apiHandler: any ProxyAPIHandler,
         upstreamHTTPSProxySetting: UpstreamHTTPSProxySetting = .disabled,
+        contentBlocklistKeywords: [String] = [],
         eventLogger: ProxyEventLogger? = nil,
         proxyPort: Int = 0
     ) {
@@ -35,6 +39,7 @@ final class ProxyForwarder: Sendable {
         self.apiFlavor = apiFlavor
         self.apiHandler = apiHandler
         self.upstreamHTTPSProxySetting = upstreamHTTPSProxySetting
+        self.contentBlocklist = ContentBlocklist(keywords: contentBlocklistKeywords)
         self.eventLogger = eventLogger
         self.proxyPort = proxyPort
 
@@ -142,6 +147,44 @@ final class ProxyForwarder: Sendable {
             urlRequest.addValue(header.value, forHTTPHeaderField: header.name)
         }
 
+        // Parse lineage fields upfront so the content blocklist can preview
+        // the delta before we register the request in the session store.
+        let fingerprint = apiHandler.lineageFingerprint(from: request.body)
+        let normalizedMessages = apiHandler.normalizedLineageMessages(from: request.body)
+        let previousResponseID = apiHandler.previousResponseID(from: request.body)
+
+        // Content blocklist guard: reject before forwarding upstream if the
+        // delta content matches any configured rule. Skipped entirely when no
+        // keywords are configured (isEmpty is O(1)).
+        if !contentBlocklist.isEmpty, let fingerprint {
+            let preview = await sessionStore.previewTreeAttach(
+                fingerprint: fingerprint,
+                messages: normalizedMessages,
+                previousResponseID: previousResponseID
+            )
+            let scannableText = DeltaTextExtractor.scannableText(from: preview.deltaMessages)
+            if let match = contentBlocklist.firstMatch(in: scannableText) {
+                let sessionID = await sessionStore.resolveSessionID(for: sessionIdentity)
+                await metrics.recordFailed()
+                let response = proxyErrorResponse(
+                    status: 403,
+                    message: String(localized: "Blocked by content filter: matched \(match.rule)")
+                )
+                await eventLogger?.logRequestFailed(
+                    requestID: nil,
+                    session: sessionID,
+                    model: model,
+                    request: requestLog,
+                    response: response.loggedResponse,
+                    durationMs: ProxyHTTPUtils.elapsedMilliseconds(since: requestStartedAt),
+                    error: "content-blocklist: \(match.rule)"
+                )
+                writeErrorToClient(writer: request.writer, response: response)
+                await writeStatusSnapshot(sessionStore: sessionStore, metrics: metrics)
+                return
+            }
+        }
+
         // Register the in-flight request in the session store for real-time UI display.
         let requestID = UUID()
         let sessionID = await sessionStore.beginRequest(
@@ -149,9 +192,6 @@ final class ProxyForwarder: Sendable {
             id: requestID,
             model: model
         )
-        let fingerprint = apiHandler.lineageFingerprint(from: request.body)
-        let normalizedMessages = apiHandler.normalizedLineageMessages(from: request.body)
-        let previousResponseID = apiHandler.previousResponseID(from: request.body)
         let loggedRequestID = await eventLogger?.logRequestStarted(
             session: sessionID,
             model: model,
