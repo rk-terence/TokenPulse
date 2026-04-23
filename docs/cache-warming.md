@@ -1,11 +1,13 @@
 ---
 title: Cache Warming and Prompt-Caching Notes
-description: Empirical notes from TokenPulse proxy logs about Anthropic prompt-caching behavior, Claude Code cache-control placement, and future keep-warm design implications.
+description: Empirical notes from TokenPulse proxy logs about Anthropic prompt-caching behavior, Claude Code cache-control placement, background-task notification shape, and future keep-warm design implications.
 ---
 
-This document records what we observed in TokenPulse's own proxy logs while investigating Claude Code / Anthropic prompt-caching behavior on 2026-04-22.
+This document records what we observed in TokenPulse's own proxy logs while investigating Claude Code / Anthropic prompt-caching behavior on 2026-04-22 and 2026-04-23.
 
 It is not a product commitment. It is a design note for a possible future manual or automatic cache-warming feature.
+
+For a broader description of Claude Code's Anthropic request-body structure, async/background-task notification shape, and harness-injected message blocks, see [claude-code-anthropic-structure.md](claude-code-anthropic-structure.md).
 
 # Scope
 
@@ -217,6 +219,110 @@ In other words, the cost win seems to come from preserving cache identity for th
 
 The `say hi` payload was just a very cheap way to create a fresh request that still shared almost all of the expensive prefix.
 
+# Additional findings from later experiments
+
+The follow-up experiments on 2026-04-23 refined the earlier keep-warm hypotheses in a few important ways.
+
+## Background Bash tasks use two different user-side shapes
+
+Claude Code's async/background Bash flow used two distinct request shapes:
+
+1. launch acknowledgment
+2. later completion notification
+
+### Launch acknowledgment
+
+The assistant `tool_use` blocks explicitly set:
+
+- `name = "Bash"`
+- `input.run_in_background = true`
+
+The immediate next user message then carried ordinary `tool_result` blocks whose payloads looked like:
+
+- `Command running in background with ID: ...`
+- `Output is being written to: ...`
+
+So the initial "task accepted" event is still represented as normal tool use / tool result traffic.
+
+### Natural completion notification
+
+When those background tasks finished naturally, the next Anthropic request did **not** use `tool_result`.
+
+Instead, Claude Code injected one or more ordinary `user.text` blocks whose text contained XML-like task notifications:
+
+- `<task-notification>`
+- `<task-id>...`
+- `<tool-use-id>...`
+- `<output-file>...`
+- `<status>completed</status>`
+- `<summary>...</summary>`
+
+If more than one background task finished before the next request, Claude Code grouped them into one `user` message as multiple `text` blocks, one notification per block.
+
+This matters for keep-warm because an async completion frontier is not a `tool_result` frontier once the task has already been accepted into the background. It becomes a `user.text` frontier.
+
+## Task notifications can be grouped, but merged user-prompt cases looked interrupt-specific
+
+In ordinary non-interrupted flows, the observed background completion notifications were either:
+
+- their own `user` message, or
+- grouped with other task-related injected text blocks in the same `user` message
+
+We did observe a case where a `<task-notification>` block and ordinary user prompt text coexisted in the same `user` message, but every such example in the log sample also contained `[Request interrupted by user]`.
+
+So the current best working assumption is:
+
+- treat merged task-notification + ordinary user-prompt messages as an interruption-specific edge case
+- do not assume that shape is part of the normal Claude Code assembly pattern
+
+## `<system-reminder>` blocks are not always first inside a user message
+
+The earlier intuition that `<system-reminder>` always appears at the start of a `user` message was too strong.
+
+Across the later log sample, `<system-reminder>` blocks appeared:
+
+- as the first block in a large harness-scaffolding message
+- after other `<system-reminder>` blocks in that same message
+- after `tool_result` blocks in the same `user` message
+
+Observed reminder families included:
+
+- MCP server instructions
+- skill inventory
+- current-date / context scaffolding
+- task-tools reminders
+- diagnostics reminders
+- side-question wrappers
+
+That means Claude Code's `user` messages are assembled from multiple harness-side components, not just "the user's latest prompt."
+
+## Practical consequence for keep-warm body synthesis
+
+The safest construction strategy is narrower than we first hoped.
+
+### Safest
+
+- exact replay of an observed organic request body
+- exact reuse of an in-flight request body when available
+
+### Usually safe
+
+- advancing a breakpoint only to an observed assistant frontier, such as:
+  - `assistant.text`
+  - `assistant.tool_use`
+- advancing to an observed `user.tool_result` frontier only when replaying the exact real request
+
+### Unsafe without exact replay
+
+- synthesizing a new cache point "inside" a Claude Code `user` message based on semantic guesses about where the stable user prompt starts
+- assuming that harness reminders always sit before or after the same categories of user-side content
+- treating async completion notifications as if they were always standalone messages
+
+In other words:
+
+- if we only have a done request, exact replay or conservative assistant-boundary reuse is the safe default
+- if we have the currently in-flight request body, reusing that exact generation request is safer than reconstructing a future Claude Code `user` message
+
 # Implications for a future TokenPulse feature
 
 Keep-alive is not currently implemented in TokenPulse. If we add it later, the proxy/content-tree work should inform the design.
@@ -245,6 +351,8 @@ If TokenPulse ever synthesizes a keep-warm request, the investigation suggests:
 - keep the appended tail extremely small
 - keep the transient keep-warm instruction outside the intended cached prefix
 - do not assume the literal text matters; the structure matters more than the wording
+- do not synthesize new Claude Code `user`-message interiors unless we are replaying an exact observed body shape
+- treat async background-task completion frontiers as `user.text` task-notification frontiers, not `tool_result` frontiers
 
 ## Timing guidance
 
@@ -284,6 +392,8 @@ Any future implementation should make investigation easy:
 - Do not assume TokenPulse should rewrite or inject `cache_control` fields into user traffic by default.
 - Do not assume a synthetic request is always cheaper than doing nothing.
 - Do not assume a warm request should run once a session is truly complete.
+- Do not assume Claude Code's `user` messages are equivalent to a clean "user prompt" plus optional tool results. Harness-injected reminders, notifications, diagnostics, and interruption markers can all appear inside them.
+- Do not assume a background-task completion will arrive as `tool_result`. In the observed Claude Code Anthropic traffic, natural completion arrived as `user.text` `<task-notification>` blocks.
 
 The evidence here is strong enough to guide experimentation, but not strong enough to justify a silent always-on feature.
 
