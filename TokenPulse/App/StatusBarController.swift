@@ -29,12 +29,20 @@ final class FloatingPopupWindow: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+/// Transparent image view that lets all mouse events pass through to the
+/// status item button beneath it. Used to composite the colored overlay on
+/// top of the template icon without intercepting clicks.
+private final class NonInteractiveImageView: NSImageView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 @MainActor
 final class StatusBarController {
     private static let popupCornerRadius: CGFloat = 10
     private static let popupTopGap: CGFloat = 6
 
     private let statusItem: NSStatusItem
+    private let overlayImageView = NonInteractiveImageView()
     private let popupWindow = FloatingPopupWindow()
     private let hostingController: NSHostingController<PopoverView>
     private var hostingSizeObservation: NSKeyValueObservation?
@@ -188,6 +196,21 @@ final class StatusBarController {
             button.target = self
             button.action = #selector(statusItemClicked(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            button.imagePosition = .imageOnly
+            button.imageScaling = .scaleNone
+
+            // Overlay: non-interactive image view pinned over the button for
+            // the colored accent layer. Clicks fall through via hitTest = nil.
+            overlayImageView.imageScaling = .scaleNone
+            overlayImageView.imageAlignment = .alignCenter
+            overlayImageView.translatesAutoresizingMaskIntoConstraints = false
+            button.addSubview(overlayImageView)
+            NSLayoutConstraint.activate([
+                overlayImageView.leadingAnchor.constraint(equalTo: button.leadingAnchor),
+                overlayImageView.trailingAnchor.constraint(equalTo: button.trailingAnchor),
+                overlayImageView.topAnchor.constraint(equalTo: button.topAnchor),
+                overlayImageView.bottomAnchor.constraint(equalTo: button.bottomAnchor),
+            ])
         }
 
         // Close popup on external clicks (only when not pinned)
@@ -395,8 +418,7 @@ final class StatusBarController {
             particles: barTrack.particles,
             percent: .init(
                 highlight: percentTrack.highlight,
-                settle: percentTrack.settle,
-                alert: currentIconModel.utilization.map { $0 >= 100 } ?? false
+                settle: percentTrack.settle
             ),
             proxyEnabled: proxyController?.isRunning ?? false
         )
@@ -405,13 +427,14 @@ final class StatusBarController {
         // causing the first render after a toggle to pick the stale palette.
         let isDark = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
 
-        let image = BarIconRenderer.renderIcon(
+        let result = BarIconRenderer.renderIcon(
             currentIconModel,
             animation: animation,
             isDarkAppearance: isDark
         )
-        statusItem.button?.image = image
-        statusItem.length = image.size.width
+        statusItem.button?.image = result.template
+        overlayImageView.image = result.overlay
+        statusItem.length = result.size.width
     }
 
     // MARK: - Click handling
