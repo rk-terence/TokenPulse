@@ -884,6 +884,7 @@ private struct RequestActivityRow: View {
         let normalized = modelID.lowercased()
 
         let compactPrefixes: [(prefix: String, label: String)] = [
+            ("gpt-5.5", "GPT-5.5"),
             ("gpt-5.4-mini", "GPT-5.4-mini"),
             ("gpt-5.4-nano", "GPT-5.4-nano"),
             ("gpt-4.1-mini", "GPT-4.1-mini"),

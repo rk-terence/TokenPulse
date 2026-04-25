@@ -812,6 +812,8 @@ enum ModelPricingTable {
 
     // swiftlint:disable line_length
     private static let entries: [String: ModelPricing] = [
+        // OpenAI GPT-5.5 family
+        "gpt-5.5":           ModelPricing(inputPerMTok: 5.0, outputPerMTok: 30.0, cacheReadPerMTok: 0.50, cacheWritePerMTok: 0),
         // OpenAI GPT-5.4 family
         "gpt-5.4-mini":      ModelPricing(inputPerMTok: 0.75, outputPerMTok: 4.50, cacheReadPerMTok: 0.075, cacheWritePerMTok: 0),
         "gpt-5.4-nano":      ModelPricing(inputPerMTok: 0.20, outputPerMTok: 1.25, cacheReadPerMTok: 0.02, cacheWritePerMTok: 0),
