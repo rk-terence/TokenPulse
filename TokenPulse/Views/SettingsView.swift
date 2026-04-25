@@ -521,30 +521,26 @@ private struct ProxyTab: View {
 
             SettingsCard(
                 title: String(localized: "Content Blocklist"),
-                description: String(localized: "Reject requests whose newly-added content contains any of these keywords. Prefix with re: for a regex pattern. Changes apply on the next proxy restart.")
+                description: String(localized: "Reject requests whose newly-added content contains any of these keywords. Prefix with re: for a regex pattern. Each keyword can list exception patterns — a keyword that matches is allowed when any of its exceptions also matches. Changes apply on the next proxy restart.")
             ) {
-                if !config.contentBlocklistKeywords.isEmpty {
+                if !config.contentBlocklistEntries.isEmpty {
                     VStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(config.contentBlocklistKeywords.enumerated()), id: \.offset) { index, keyword in
+                        ForEach(Array(config.contentBlocklistEntries.enumerated()), id: \.element.keyword) { index, entry in
                             if index > 0 {
                                 Divider()
                             }
-                            HStack {
-                                Text(keyword)
-                                    .font(.system(.body, design: .monospaced))
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
-                                Spacer(minLength: 0)
-                                Button {
-                                    config.contentBlocklistKeywords.remove(at: index)
-                                } label: {
-                                    Image(systemName: "minus.circle.fill")
-                                        .foregroundStyle(.secondary)
+                            BlocklistEntryRow(
+                                entry: entry,
+                                onRemoveEntry: {
+                                    removeBlocklistEntry(withKeyword: entry.keyword)
+                                },
+                                onAddWhitelist: { pattern in
+                                    addWhitelistPattern(pattern, forKeyword: entry.keyword)
+                                },
+                                onRemoveWhitelist: { whitelistIndex in
+                                    removeWhitelistPattern(at: whitelistIndex, fromKeyword: entry.keyword)
                                 }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel(String(localized: "Remove keyword"))
-                            }
-                            .padding(.vertical, 6)
+                            )
                         }
                     }
 
@@ -647,9 +643,116 @@ private struct ProxyTab: View {
     private func addBlocklistKeyword() {
         let trimmed = blocklistNewKeyword.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty,
-              !config.contentBlocklistKeywords.contains(trimmed) else { return }
-        config.contentBlocklistKeywords.append(trimmed)
+              !config.contentBlocklistEntries.contains(where: { $0.keyword == trimmed }) else { return }
+        config.contentBlocklistEntries.append(ContentBlocklistEntry(keyword: trimmed))
         blocklistNewKeyword = ""
+    }
+
+    private func removeBlocklistEntry(withKeyword keyword: String) {
+        guard let index = config.contentBlocklistEntries.firstIndex(where: { $0.keyword == keyword }) else { return }
+        config.contentBlocklistEntries.remove(at: index)
+    }
+
+    private func addWhitelistPattern(_ pattern: String, forKeyword keyword: String) {
+        let trimmed = pattern.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty,
+              let index = config.contentBlocklistEntries.firstIndex(where: { $0.keyword == keyword }) else { return }
+        var entry = config.contentBlocklistEntries[index]
+        guard !entry.whitelist.contains(trimmed) else { return }
+        entry.whitelist.append(trimmed)
+        config.contentBlocklistEntries[index] = entry
+    }
+
+    private func removeWhitelistPattern(at whitelistIndex: Int, fromKeyword keyword: String) {
+        guard let index = config.contentBlocklistEntries.firstIndex(where: { $0.keyword == keyword }) else { return }
+        var entry = config.contentBlocklistEntries[index]
+        guard entry.whitelist.indices.contains(whitelistIndex) else { return }
+        entry.whitelist.remove(at: whitelistIndex)
+        config.contentBlocklistEntries[index] = entry
+    }
+}
+
+private struct BlocklistEntryRow: View {
+    let entry: ContentBlocklistEntry
+    let onRemoveEntry: () -> Void
+    let onAddWhitelist: (String) -> Void
+    let onRemoveWhitelist: (Int) -> Void
+
+    @State private var newWhitelistPattern: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(entry.keyword)
+                    .font(.system(.body, design: .monospaced))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 0)
+                Button {
+                    onRemoveEntry()
+                } label: {
+                    Image(systemName: "minus.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(String(localized: "Remove keyword"))
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                if entry.whitelist.isEmpty {
+                    Text(String(localized: "No exceptions"))
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                } else {
+                    ForEach(Array(entry.whitelist.enumerated()), id: \.offset) { whitelistIndex, pattern in
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.turn.down.right")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                            Text(pattern)
+                                .font(.system(.caption, design: .monospaced))
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                            Spacer(minLength: 0)
+                            Button {
+                                onRemoveWhitelist(whitelistIndex)
+                            } label: {
+                                Image(systemName: "minus.circle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(String(localized: "Remove exception"))
+                        }
+                    }
+                }
+
+                HStack(spacing: 8) {
+                    TextField(
+                        String(localized: "Exception pattern"),
+                        text: $newWhitelistPattern
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.small)
+                    .onSubmit { submitWhitelist() }
+
+                    Button(String(localized: "Add exception")) {
+                        submitWhitelist()
+                    }
+                    .controlSize(.small)
+                    .disabled(newWhitelistPattern.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+            .padding(.leading, 16)
+        }
+        .padding(.vertical, 8)
+    }
+
+    private func submitWhitelist() {
+        let trimmed = newWhitelistPattern.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        onAddWhitelist(trimmed)
+        newWhitelistPattern = ""
     }
 }
 

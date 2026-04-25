@@ -6,7 +6,7 @@ final class ConfigService {
     static let shared = ConfigService()
 
     /// Current on-disk schema version. Bump when adding fields that need migration.
-    private static let currentConfigVersion = 11
+    private static let currentConfigVersion = 12
     private static let defaultAnthropicUpstreamURL = "https://zenmux.ai/api/anthropic"
     private static let defaultOpenAIUpstreamURL = "https://api.openai.com"
 
@@ -64,10 +64,13 @@ final class ConfigService {
         didSet { save() }
     }
 
-    /// Keywords for the content blocklist. Plain strings are matched as
-    /// case-insensitive substrings; strings prefixed with `re:` are compiled
-    /// as regular expressions. Changes take effect on the next proxy restart.
-    var contentBlocklistKeywords: [String] {
+    /// Entries for the content blocklist. Each entry is a blocking keyword
+    /// (plain case-insensitive substring, or `re:`-prefixed regex) plus an
+    /// optional list of exception patterns. A request that matches a blocking
+    /// keyword is allowed when any of the keyword's exception patterns also
+    /// matches the same scannable text. Changes take effect on the next proxy
+    /// restart.
+    var contentBlocklistEntries: [ContentBlocklistEntry] {
         didSet { save() }
     }
 
@@ -149,7 +152,7 @@ final class ConfigService {
         self.upstreamHTTPProxyURL = loaded.config.upstreamHTTPProxyURL
         self.upstreamHTTPSProxyURL = loaded.config.upstreamHTTPSProxyURL
         self.saveProxyEventLog = loaded.config.saveProxyEventLog
-        self.contentBlocklistKeywords = loaded.config.contentBlocklistKeywords
+        self.contentBlocklistEntries = loaded.config.contentBlocklistEntries
 
         // Persist migrated config if the on-disk version was outdated.
         if loaded.migrated {
@@ -181,6 +184,10 @@ final class ConfigService {
         var upstreamHTTPProxyURL: String?
         var upstreamHTTPSProxyURL: String?
         var saveProxyEventLog: Bool?
+        var contentBlocklistEntries: [ContentBlocklistEntry]?
+        /// Retained for migration only — pre-version-12 layout stored a flat
+        /// `[String]`. Decoded on load and folded into `contentBlocklistEntries`
+        /// with empty whitelists; never written back.
         var contentBlocklistKeywords: [String]?
         // Retained for migration only — no longer written.
         var keepaliveEnabled: Bool?
@@ -207,7 +214,7 @@ final class ConfigService {
         var upstreamHTTPProxyURL: String
         var upstreamHTTPSProxyURL: String
         var saveProxyEventLog: Bool
-        var contentBlocklistKeywords: [String]
+        var contentBlocklistEntries: [ContentBlocklistEntry]
     }
 
     private static func load() -> LoadResult {
@@ -228,7 +235,7 @@ final class ConfigService {
                     upstreamHTTPProxyURL: "",
                     upstreamHTTPSProxyURL: "",
                     saveProxyEventLog: true,
-                    contentBlocklistKeywords: []
+                    contentBlocklistEntries: []
                 ),
                 migrated: true
             )
@@ -239,6 +246,21 @@ final class ConfigService {
         let migratedAnthropicUpstreamURL = file.anthropicUpstreamURL
             ?? file.proxyUpstreamURL
             ?? defaultAnthropicUpstreamURL
+        let migratedBlocklistEntries: [ContentBlocklistEntry]
+        if let entries = file.contentBlocklistEntries {
+            // Dedupe by keyword in case a hand-edited v12 file repeats one —
+            // SettingsView identifies rows by keyword, so collisions break the UI.
+            var seen = Set<String>()
+            migratedBlocklistEntries = entries.filter { seen.insert($0.keyword).inserted }
+        } else if let legacy = file.contentBlocklistKeywords {
+            var seen = Set<String>()
+            migratedBlocklistEntries = legacy.compactMap { keyword in
+                guard seen.insert(keyword).inserted else { return nil }
+                return ContentBlocklistEntry(keyword: keyword)
+            }
+        } else {
+            migratedBlocklistEntries = []
+        }
         return LoadResult(
             config: ResolvedConfig(
                 launchAtLogin: file.launchAtLogin,
@@ -253,7 +275,7 @@ final class ConfigService {
                 upstreamHTTPProxyURL: file.upstreamHTTPProxyURL ?? "",
                 upstreamHTTPSProxyURL: file.upstreamHTTPSProxyURL ?? "",
                 saveProxyEventLog: file.saveProxyEventLog ?? true,
-                contentBlocklistKeywords: file.contentBlocklistKeywords ?? []
+                contentBlocklistEntries: migratedBlocklistEntries
             ),
             migrated: needsMigration
         )
@@ -286,7 +308,8 @@ final class ConfigService {
             upstreamHTTPProxyURL: upstreamHTTPProxyURL,
             upstreamHTTPSProxyURL: upstreamHTTPSProxyURL,
             saveProxyEventLog: saveProxyEventLog,
-            contentBlocklistKeywords: contentBlocklistKeywords.isEmpty ? nil : contentBlocklistKeywords,
+            contentBlocklistEntries: contentBlocklistEntries.isEmpty ? nil : contentBlocklistEntries,
+            contentBlocklistKeywords: nil,
             keepaliveEnabled: nil,
             keepaliveIntervalSeconds: nil,
             proxyInactivityTimeoutSeconds: nil,

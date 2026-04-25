@@ -19,8 +19,8 @@ final class ProxyForwarder: Sendable {
     private let eventLogger: ProxyEventLogger?
     private let proxyPort: Int
     private let upstreamHTTPSProxySetting: UpstreamHTTPSProxySetting
-    /// Compiled content blocklist built from user-configured keywords at proxy start.
-    /// Empty by default — zero overhead when no keywords are configured.
+    /// Compiled content blocklist built from user-configured entries at proxy start.
+    /// Empty by default — zero overhead when no entries are configured.
     private let contentBlocklist: ContentBlocklist
     /// Shared session for non-streaming requests — preserves TCP/TLS connection reuse.
     private let nonStreamingSession: URLSession
@@ -31,7 +31,7 @@ final class ProxyForwarder: Sendable {
         apiFlavor: ProxyAPIFlavor,
         apiHandler: any ProxyAPIHandler,
         upstreamHTTPSProxySetting: UpstreamHTTPSProxySetting = .disabled,
-        contentBlocklistKeywords: [String] = [],
+        contentBlocklistEntries: [ContentBlocklistEntry] = [],
         eventLogger: ProxyEventLogger? = nil,
         proxyPort: Int = 0
     ) {
@@ -39,7 +39,7 @@ final class ProxyForwarder: Sendable {
         self.apiFlavor = apiFlavor
         self.apiHandler = apiHandler
         self.upstreamHTTPSProxySetting = upstreamHTTPSProxySetting
-        self.contentBlocklist = ContentBlocklist(keywords: contentBlocklistKeywords)
+        self.contentBlocklist = ContentBlocklist(entries: contentBlocklistEntries)
         self.eventLogger = eventLogger
         self.proxyPort = proxyPort
 
