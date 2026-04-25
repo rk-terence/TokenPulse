@@ -8,6 +8,10 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
             && (path == "/v1/responses" || path.hasPrefix("/v1/responses?"))
     }
 
+    func operation(for requestPath: String) -> ProxyRequestOperation {
+        .generation
+    }
+
     func upstreamPath(for requestPath: String) -> String {
         requestPath
     }

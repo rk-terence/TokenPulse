@@ -6,9 +6,10 @@ description: Architecture, request flow, universal content tree, retention, and 
 The proxy is an optional local HTTP proxy that sits between AI tools and upstream APIs. It currently serves two route families on the same local port:
 
 - `POST /v1/messages` for Anthropic Messages traffic
+- `POST /v1/messages/count_tokens` for Anthropic token-counting traffic
 - `POST /v1/responses` for OpenAI Responses traffic
 
-Both handlers also accept query-string variants of those paths, such as `/v1/messages?foo=bar` and `/v1/responses?foo=bar`.
+Handlers also accept query-string variants of those paths, such as `/v1/messages?foo=bar`, `/v1/messages/count_tokens?foo=bar`, and `/v1/responses?foo=bar`.
 
 It forwards requests transparently while adding two capabilities:
 
@@ -66,7 +67,7 @@ flowchart TD
 
 # Content tree
 
-Every proxied request whose body carries a messages-style stack (Anthropic Messages `messages`, OpenAI Responses `input`) — or an OpenAI `previous_response_id` pointer to a previously-seen response — is attached to an in-memory `ContentTree` the moment its body has been fully parsed, before upstream is contacted.
+Every proxied generation request whose body carries a messages-style stack (Anthropic Messages `messages`, OpenAI Responses `input`) — or an OpenAI `previous_response_id` pointer to a previously-seen response — is attached to an in-memory `ContentTree` the moment its body has been fully parsed, before upstream is contacted. Utility routes such as Anthropic token counting are forwarded and logged without creating conversation nodes.
 
 ## Model
 
@@ -169,15 +170,16 @@ sequenceDiagram
 5. Content-Length is validated; body is accumulated if present
 6. Route validation accepts only:
    - `POST /v1/messages` and query-string variants of that path
+   - `POST /v1/messages/count_tokens` and query-string variants of that path
    - `POST /v1/responses` and query-string variants of that path
    Known route + wrong method => 405
    Unknown route => 404
 7. NWResponseWriter is created and the request is dispatched
 8. ProxyForwarder.forward() runs for the matched route
 9. Session is touched, request state is registered, metrics/logging begin
-10. The request body is parsed and the request is attached to the content tree (conversation + node); the request enters its in-flight state
+10. Generation request bodies are parsed and attached to the content tree (conversation + node); utility requests are forwarded without lineage attachment
 11. Upstream request is forwarded via streaming or buffered path
-12. Token usage and estimated cost are recorded
+12. Generation token usage and estimated cost are recorded; utility route results are logged without adding to usage totals
 13. On terminal state the tree request is finalized with `succeeded: true/false` and the tree mirror rows are written to SQLite alongside the request row
 ```
 
@@ -479,7 +481,7 @@ Legacy `proxyUpstreamURL` is still read during config migration and mapped to `a
 | Constraint | Value | Enforced by |
 |------------|-------|-------------|
 | Bind address | `127.0.0.1` (IPv4 loopback only) | `ProxyHTTPServer` |
-| Supported endpoints | `POST /v1/messages` and `POST /v1/responses`, plus query-string variants of those paths | `LocalProxyController.requestValidator` |
+| Supported endpoints | `POST /v1/messages`, `POST /v1/messages/count_tokens`, and `POST /v1/responses`, plus query-string variants of those paths | `LocalProxyController.requestValidator` |
 | Max Content-Length | 50 MB (`50_000_000`) | `ProxyHTTPServer.processRequest()` |
 | Max header size | 64 KB (`65_536`) | `ProxyHTTPServer.readRequest()` |
 | Tracked session retention (Anthropic / OpenAI) | 24 hours since last activity | `LocalProxyController.sessionRetentionSeconds` + `ProxySessionID.usesShortRetentionWindow(...)` |

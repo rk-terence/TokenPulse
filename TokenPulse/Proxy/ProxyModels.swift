@@ -44,7 +44,7 @@ enum ProxyAPIFlavor: String, CaseIterable, Identifiable, Sendable, Codable {
     var supportedRouteDescription: String {
         switch self {
         case .anthropicMessages:
-            return "/v1/messages"
+            return "/v1/messages and /v1/messages/count_tokens"
         case .openAIResponses:
             return "/v1/responses"
         }
@@ -641,6 +641,66 @@ struct ProxyHTTPRequest: Sendable {
 /// The source of a request shown in the proxy activity UI.
 enum ProxyRequestKind: Sendable {
     case request
+    case tokenCount
+
+    var storesDoneActivity: Bool {
+        switch self {
+        case .request:
+            return true
+        case .tokenCount:
+            return false
+        }
+    }
+}
+
+enum ProxyRequestOperation: Sendable {
+    case generation
+    case tokenCount
+
+    var requestKind: ProxyRequestKind {
+        switch self {
+        case .generation:
+            return .request
+        case .tokenCount:
+            return .tokenCount
+        }
+    }
+
+    var tracksLineage: Bool {
+        switch self {
+        case .generation:
+            return true
+        case .tokenCount:
+            return false
+        }
+    }
+
+    var recordsUsageTotals: Bool {
+        switch self {
+        case .generation:
+            return true
+        case .tokenCount:
+            return false
+        }
+    }
+
+    var requiresTerminalSignal: Bool {
+        switch self {
+        case .generation:
+            return true
+        case .tokenCount:
+            return false
+        }
+    }
+
+    var canStream: Bool {
+        switch self {
+        case .generation:
+            return true
+        case .tokenCount:
+            return false
+        }
+    }
 }
 
 /// The state of an in-flight proxy request as seen by the UI.
@@ -878,10 +938,26 @@ enum ProxyHTTPUtils {
     // MARK: - Non-streaming JSON parsing
 
     private static func parseTokenUsageFromJSON(_ data: Data) -> TokenUsage {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let usage = json["usage"] as? [String: Any] else {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return .empty
         }
+
+        guard let usage = json["usage"] as? [String: Any] else {
+            if let inputTokens = json["input_tokens"] as? Int {
+                return TokenUsage(
+                    inputTokens: inputTokens,
+                    outputTokens: nil,
+                    cacheReadInputTokens: nil,
+                    cacheCreationInputTokens: nil,
+                    webSearchCalls: 0,
+                    webFetchCalls: 0,
+                    inputTokensIncludeCacheReads: false,
+                    stopReason: nil
+                )
+            }
+            return .empty
+        }
+
         return TokenUsage(
             inputTokens: usage["input_tokens"] as? Int,
             outputTokens: usage["output_tokens"] as? Int,

@@ -17,7 +17,7 @@ A macOS menu bar app that monitors AI platform token usage and adds local proxy 
 
 ### Local proxy
 
-- **Universal lineage tree** — Groups proxied requests by provider-specific cache identity (model + system/instructions + tools + `tool_choice` + thinking/reasoning). Anthropic strips prompt-caching markers; OpenAI preserves ordered `input` items, including non-message items, while normalizing string content shorthands to typed text input.
+- **Universal lineage tree** — Groups proxied generation requests by provider-specific cache identity (model + system/instructions + tools + `tool_choice` + thinking/reasoning). Anthropic strips prompt-caching markers; OpenAI preserves ordered `input` items, including non-message items, while normalizing string content shorthands to typed text input.
 - **Per-session cost tracking** — Tracks token usage, bytes transferred, and estimated cost per tracked proxy session
 - **Streaming support** — Full HTTP/1.1 proxy with SSE streaming passthrough; parses token usage from both JSON and SSE responses
 - **Traffic indicator** — Menu bar arrows and bar animate when the proxy forwards requests and completions
@@ -118,7 +118,7 @@ When the proxy is off, the arrows and bar dim; the percentage stays at its norma
 
 ## Local proxy
 
-TokenPulse includes an optional local HTTP proxy that sits between your AI tools and upstream APIs. It currently serves **Anthropic Messages** (`/v1/messages`) and **OpenAI Responses** (`/v1/responses`) on the same local port. It forwards requests transparently while adding two capabilities: a **universal lineage tree** for popup display and lineage-aware payload capture, and **per-session observability** that tracks token usage, bytes, and estimated cost.
+TokenPulse includes an optional local HTTP proxy that sits between your AI tools and upstream APIs. It currently serves **Anthropic Messages** (`/v1/messages`), **Anthropic token counting** (`/v1/messages/count_tokens`), and **OpenAI Responses** (`/v1/responses`) on the same local port. It forwards requests transparently while adding two capabilities: a **universal lineage tree** for popup display and lineage-aware payload capture, and **per-session observability** that tracks token usage, bytes, and estimated cost.
 
 ### Setup
 

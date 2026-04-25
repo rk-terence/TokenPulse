@@ -4,13 +4,14 @@ protocol ProxyAPIHandler: Sendable {
     var flavor: ProxyAPIFlavor { get }
 
     func acceptsRequest(method: String, path: String) -> Bool
+    func operation(for requestPath: String) -> ProxyRequestOperation
     func upstreamPath(for requestPath: String) -> String
     func sessionIdentity(for request: ProxyHTTPRequest) -> ProxySessionIdentity
     func extractModel(from body: Data) -> String?
     func isStreamingRequest(body: Data) -> Bool
 
-    /// Lineage fingerprint (cache-identity shape) for the request body. nil if the
-    /// body lacks a `model` field (non-tracked traffic such as token counting).
+    /// Lineage fingerprint (cache-identity shape) for generation requests.
+    /// Utility operations can opt out of tree tracking via `operation(for:)`.
     func lineageFingerprint(from body: Data) -> LineageFingerprint?
 
     /// Normalized messages / input stack carried by the request body. Empty when
@@ -42,7 +43,20 @@ struct AnthropicProxyAPIHandler: ProxyAPIHandler {
 
     func acceptsRequest(method: String, path: String) -> Bool {
         method.uppercased() == "POST"
-            && (path == "/v1/messages" || path.hasPrefix("/v1/messages?"))
+            && (
+                path == "/v1/messages"
+                    || path.hasPrefix("/v1/messages?")
+                    || path == "/v1/messages/count_tokens"
+                    || path.hasPrefix("/v1/messages/count_tokens?")
+            )
+    }
+
+    func operation(for requestPath: String) -> ProxyRequestOperation {
+        if requestPath == "/v1/messages/count_tokens"
+            || requestPath.hasPrefix("/v1/messages/count_tokens?") {
+            return .tokenCount
+        }
+        return .generation
     }
 
     func upstreamPath(for requestPath: String) -> String {

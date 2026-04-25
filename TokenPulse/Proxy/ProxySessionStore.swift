@@ -418,7 +418,8 @@ actor ProxySessionStore {
 
     /// Finalize a request. Successful completions that are NOT part of the lineage
     /// tree (unknown flavor or missing fingerprint) land in the short-lived
-    /// `doneRequestsBySession` bucket for UI display.
+    /// `doneRequestsBySession` bucket for UI display. Utility completions are
+    /// finalized for logging/traffic state but do not affect visible done counts.
     func markRequestDone(id: UUID, errored: Bool, tokenUsage: TokenUsage?, estimatedCost: Double?) {
         guard var entry = activeRequests.removeValue(forKey: id) else { return }
         let completedAt = Date()
@@ -429,10 +430,10 @@ actor ProxySessionStore {
 
         let isComplete = !errored
         if isComplete {
-            if entry.activity.conversationID == nil {
+            if entry.activity.kind.storesDoneActivity && entry.activity.conversationID == nil {
                 // Untracked traffic: keep a short-lived copy in the done bucket.
                 insertUntrackedDoneRequest(entry.activity, for: entry.sessionID)
-            } else {
+            } else if entry.activity.kind.storesDoneActivity {
                 // Tracked traffic: cache the full activity so tree-leaf rendering has
                 // model name / byte counts / timing / cost even after the in-flight
                 // entry is dropped.
@@ -441,16 +442,16 @@ actor ProxySessionStore {
         }
 
         if var session = sessions[entry.sessionID] {
-            if isComplete {
+            if isComplete && entry.activity.kind.storesDoneActivity {
                 session.completedRequestCount += 1
-            } else {
+            } else if !isComplete {
                 session.erroredRequestCount += 1
             }
             session.lastRequestDoneAt = completedAt
             sessions[entry.sessionID] = session
         }
         onTraffic?(nil)
-        if isComplete {
+        if isComplete && entry.activity.kind.storesDoneActivity {
             onRequestDone?()
         }
     }

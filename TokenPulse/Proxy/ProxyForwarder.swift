@@ -2,8 +2,8 @@ import Foundation
 
 /// Forwards incoming proxy requests to the configured upstream API and
 /// streams responses back to the local client. Attaches every
-/// fully-parsed request to the content tree before calling upstream;
-/// finalization marks the request as succeeded or errored on completion.
+/// fully-parsed generation request to the content tree before calling upstream;
+/// finalization marks tracked requests as succeeded or errored on completion.
 final class ProxyForwarder: Sendable {
     private static let maxLoggedStreamingResponseBytes = 4 * 1024 * 1024
     /// Size of the tail ring-buffer used for terminal-signal parsing.
@@ -81,10 +81,11 @@ final class ProxyForwarder: Sendable {
         sessionStore: ProxySessionStore,
         metrics: ProxyMetricsStore
     ) async {
+        let operation = apiHandler.operation(for: request.path)
         let upstreamPath = apiHandler.upstreamPath(for: request.path)
         let urlString = upstreamBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             + upstreamPath
-        let wantsStreaming = apiHandler.isStreamingRequest(body: request.body)
+        let wantsStreaming = operation.canStream && apiHandler.isStreamingRequest(body: request.body)
         let requestStartedAt = Date()
         let requestLog = ProxyEventLogger.LoggedRequest(
             method: request.method,
@@ -190,7 +191,8 @@ final class ProxyForwarder: Sendable {
         let sessionID = await sessionStore.beginRequest(
             identity: sessionIdentity,
             id: requestID,
-            model: model
+            model: model,
+            kind: operation.requestKind
         )
         let loggedRequestID = await eventLogger?.logRequestStarted(
             session: sessionID,
@@ -202,12 +204,10 @@ final class ProxyForwarder: Sendable {
         )
         await sessionStore.recordBytesSent(request.body.count)
 
-        // Attach to the content tree as soon as the request body has been
-        // parsed — every request that enters the proxy in its full form is
-        // represented in the tree, regardless of whether upstream later
-        // accepts or errors. The request starts in an in-flight state and
-        // transitions to succeeded / errored via `finishTrackedRequest`.
-        if let fingerprint {
+        // Attach generation requests to the content tree as soon as their
+        // body has been parsed. Utility requests such as token counting are
+        // forwarded and logged but do not become conversation nodes.
+        if operation.tracksLineage, let fingerprint {
             await sessionStore.attachToTree(
                 requestID: requestID,
                 sessionID: sessionID,
@@ -229,6 +229,7 @@ final class ProxyForwarder: Sendable {
                 fingerprint: fingerprint,
                 normalizedMessages: normalizedMessages,
                 previousResponseID: previousResponseID,
+                operation: operation,
                 requestLog: requestLog,
                 requestStartedAt: requestStartedAt,
                 loggedRequestID: loggedRequestID
@@ -245,6 +246,7 @@ final class ProxyForwarder: Sendable {
                 fingerprint: fingerprint,
                 normalizedMessages: normalizedMessages,
                 previousResponseID: previousResponseID,
+                operation: operation,
                 requestLog: requestLog,
                 requestStartedAt: requestStartedAt,
                 loggedRequestID: loggedRequestID
@@ -270,6 +272,7 @@ final class ProxyForwarder: Sendable {
         fingerprint: LineageFingerprint?,
         normalizedMessages: [ContentTree.NormalizedMessage],
         previousResponseID: String?,
+        operation: ProxyRequestOperation,
         requestLog: ProxyEventLogger.LoggedRequest,
         requestStartedAt: Date,
         loggedRequestID: Int64?
@@ -381,19 +384,26 @@ final class ProxyForwarder: Sendable {
             let tokenUsage = Self.mergeUsage(head: headUsage, tail: tailUsage)
             let responseID = apiHandler.extractResponseID(from: capturedResponseBody, streaming: true)
                 ?? apiHandler.extractResponseID(from: parseTailBuffer, streaming: true)
-            await metrics.recordTokenUsage(tokenUsage)
-            await sessionStore.recordTokenUsage(
-                tokenUsage,
-                model: model,
-                for: sessionID,
-                apiFlavor: apiFlavor
-            )
-            let requestCost = tokenUsage.estimatedCost(
-                for: ModelPricingTable.pricing(for: model),
-                apiFlavor: apiFlavor
-            )
+            let requestCost: Double?
+            if operation.recordsUsageTotals {
+                await metrics.recordTokenUsage(tokenUsage)
+                await sessionStore.recordTokenUsage(
+                    tokenUsage,
+                    model: model,
+                    for: sessionID,
+                    apiFlavor: apiFlavor
+                )
+                requestCost = tokenUsage.estimatedCost(
+                    for: ModelPricingTable.pricing(for: model),
+                    apiFlavor: apiFlavor
+                )
+            } else {
+                requestCost = nil
+            }
             let isUpstreamError = upstreamStatusCode >= 400
-            let isIncomplete = !isUpstreamError && !apiHandler.isResponseComplete(tokenUsage)
+            let isIncomplete = !isUpstreamError
+                && operation.requiresTerminalSignal
+                && !apiHandler.isResponseComplete(tokenUsage)
             let errored = isUpstreamError || isIncomplete
             await sessionStore.finishTrackedRequest(
                 requestID: requestID,
@@ -529,6 +539,7 @@ final class ProxyForwarder: Sendable {
         fingerprint: LineageFingerprint?,
         normalizedMessages: [ContentTree.NormalizedMessage],
         previousResponseID: String?,
+        operation: ProxyRequestOperation,
         requestLog: ProxyEventLogger.LoggedRequest,
         requestStartedAt: Date,
         loggedRequestID: Int64?
@@ -581,19 +592,26 @@ final class ProxyForwarder: Sendable {
 
                 let tokenUsage = apiHandler.parseTokenUsage(from: responseData, streaming: false)
                 let responseID = apiHandler.extractResponseID(from: responseData, streaming: false)
-                await metrics.recordTokenUsage(tokenUsage)
-                await sessionStore.recordTokenUsage(
-                    tokenUsage,
-                    model: model,
-                    for: sessionID,
-                    apiFlavor: apiFlavor
-                )
-                let requestCost = tokenUsage.estimatedCost(
-                    for: ModelPricingTable.pricing(for: model),
-                    apiFlavor: apiFlavor
-                )
+                let requestCost: Double?
+                if operation.recordsUsageTotals {
+                    await metrics.recordTokenUsage(tokenUsage)
+                    await sessionStore.recordTokenUsage(
+                        tokenUsage,
+                        model: model,
+                        for: sessionID,
+                        apiFlavor: apiFlavor
+                    )
+                    requestCost = tokenUsage.estimatedCost(
+                        for: ModelPricingTable.pricing(for: model),
+                        apiFlavor: apiFlavor
+                    )
+                } else {
+                    requestCost = nil
+                }
                 let isUpstreamError = httpResponse.statusCode >= 400
-                let isIncomplete = !isUpstreamError && !apiHandler.isResponseComplete(tokenUsage)
+                let isIncomplete = !isUpstreamError
+                    && operation.requiresTerminalSignal
+                    && !apiHandler.isResponseComplete(tokenUsage)
                 let requestErrored = isUpstreamError || isIncomplete
                 errored = requestErrored
                 await sessionStore.finishTrackedRequest(
