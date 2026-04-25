@@ -238,15 +238,17 @@ Token parsing is route-specific and owned by the matched `ProxyAPIHandler`.
 - **Streaming SSE**: parse the final accumulated SSE payload after completion:
   - `message_start.message.usage` contributes input/cache tokens
   - `message_delta.usage` contributes output tokens
+- **Tool costs**: parse `usage.server_tool_use.web_search_requests` and `web_fetch_requests`; web search contributes provider-priced tool cost, while web fetch is tracked with a zero extra tool rate today.
 
 ## OpenAI Responses
 
 - **Non-streaming JSON**: parse `usage.input_tokens`, `usage.output_tokens`, and `usage.input_tokens_details.cached_tokens`.
 - **Streaming SSE**: scan the final accumulated SSE payload for `response.completed` / `response.incomplete` and parse `response.usage`.
+- **Tool costs**: count completed `web_search_call` output items / streaming events and add the provider-specific per-call Web Search price to the request estimate.
 
 ## Accumulation
 
-Token usage is recorded at three levels:
+Token usage and estimated cost are recorded at three levels:
 
 1. **Per-request**: `ProxyRequestActivity.tokenUsage` and `.estimatedCost`
 2. **Per-session**: `ProxySessionStore.Session` aggregates input/output/cache token totals and estimated cost

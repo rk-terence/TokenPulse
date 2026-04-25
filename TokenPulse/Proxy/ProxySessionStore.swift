@@ -304,8 +304,10 @@ actor ProxySessionStore {
         session.totalOutputTokens += usage.outputTokens ?? 0
         session.totalCacheReadInputTokens += usage.cacheReadInputTokens ?? 0
         session.totalCacheCreationInputTokens += usage.cacheCreationInputTokens ?? 0
-        if let pricing = ModelPricingTable.pricing(for: model) {
-            let cost = usage.cost(for: pricing)
+        if let cost = usage.estimatedCost(
+            for: ModelPricingTable.pricing(for: model),
+            apiFlavor: apiFlavor
+        ) {
             session.estimatedCostUSD += cost
             accumulateCost(cost, for: apiFlavor)
         }

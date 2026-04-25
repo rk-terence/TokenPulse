@@ -388,7 +388,10 @@ final class ProxyForwarder: Sendable {
                 for: sessionID,
                 apiFlavor: apiFlavor
             )
-            let requestCost = ModelPricingTable.pricing(for: model).map { tokenUsage.cost(for: $0) }
+            let requestCost = tokenUsage.estimatedCost(
+                for: ModelPricingTable.pricing(for: model),
+                apiFlavor: apiFlavor
+            )
             let isUpstreamError = upstreamStatusCode >= 400
             let isIncomplete = !isUpstreamError && !apiHandler.isResponseComplete(tokenUsage)
             let errored = isUpstreamError || isIncomplete
@@ -585,7 +588,10 @@ final class ProxyForwarder: Sendable {
                     for: sessionID,
                     apiFlavor: apiFlavor
                 )
-                let requestCost = ModelPricingTable.pricing(for: model).map { tokenUsage.cost(for: $0) }
+                let requestCost = tokenUsage.estimatedCost(
+                    for: ModelPricingTable.pricing(for: model),
+                    apiFlavor: apiFlavor
+                )
                 let isUpstreamError = httpResponse.statusCode >= 400
                 let isIncomplete = !isUpstreamError && !apiHandler.isResponseComplete(tokenUsage)
                 let requestErrored = isUpstreamError || isIncomplete
@@ -769,6 +775,8 @@ final class ProxyForwarder: Sendable {
             outputTokens: tail.outputTokens ?? head.outputTokens,
             cacheReadInputTokens: head.cacheReadInputTokens ?? tail.cacheReadInputTokens,
             cacheCreationInputTokens: head.cacheCreationInputTokens ?? tail.cacheCreationInputTokens,
+            webSearchCalls: max(head.webSearchCalls, tail.webSearchCalls),
+            webFetchCalls: max(head.webFetchCalls, tail.webFetchCalls),
             inputTokensIncludeCacheReads: head.inputTokensIncludeCacheReads || tail.inputTokensIncludeCacheReads,
             stopReason: tail.stopReason ?? head.stopReason
         )

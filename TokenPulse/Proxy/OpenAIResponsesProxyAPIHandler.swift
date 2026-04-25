@@ -105,13 +105,28 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
 
     private func parseTokenUsageFromJSON(_ data: Data) -> TokenUsage {
         guard let json = jsonObject(from: data) else { return .empty }
-        return parseUsage(from: json["usage"] as? [String: Any], stopReason: json["status"] as? String)
+        return parseUsage(
+            from: json["usage"] as? [String: Any],
+            stopReason: json["status"] as? String,
+            webSearchCalls: countCompletedWebSearchCalls(in: json)
+        )
     }
 
     private func parseTokenUsageFromStreaming(_ data: Data) -> TokenUsage {
         guard let text = String(data: data, encoding: .utf8) else { return .empty }
 
-        var finalUsage: TokenUsage = .empty
+        var finalUsage: TokenUsage?
+        var completedWebSearchCallIDs = Set<String>()
+        var anonymousCompletedWebSearchCalls = 0
+
+        func recordCompletedWebSearchCall(id: String?) {
+            guard let id, !id.isEmpty else {
+                anonymousCompletedWebSearchCalls += 1
+                return
+            }
+            completedWebSearchCallIDs.insert(id)
+        }
+
         text.enumerateLines { line, stop in
             guard line.hasPrefix("data: ") else { return }
             let payload = line.dropFirst(6)
@@ -122,19 +137,38 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
                 return
             }
 
+            if type == "response.web_search_call.completed" {
+                recordCompletedWebSearchCall(id: json["item_id"] as? String)
+                return
+            }
+
+            if type == "response.output_item.done",
+               let item = json["item"] as? [String: Any],
+               isCompletedWebSearchCall(item) {
+                recordCompletedWebSearchCall(id: item["id"] as? String)
+                return
+            }
+
             guard type == "response.completed" || type == "response.incomplete",
                   let response = json["response"] as? [String: Any] else {
                 return
             }
 
+            let finalWebSearchCalls = countCompletedWebSearchCalls(in: response)
+            let observedWebSearchCalls = completedWebSearchCallIDs.count + anonymousCompletedWebSearchCalls
             finalUsage = parseUsage(
                 from: response["usage"] as? [String: Any],
-                stopReason: response["status"] as? String
+                stopReason: response["status"] as? String,
+                webSearchCalls: max(observedWebSearchCalls, finalWebSearchCalls)
             )
             stop = true
         }
 
-        return finalUsage
+        return finalUsage ?? parseUsage(
+            from: nil,
+            stopReason: nil,
+            webSearchCalls: completedWebSearchCallIDs.count + anonymousCompletedWebSearchCalls
+        )
     }
 
     private func extractResponseIDFromStreaming(_ data: Data) -> String? {
@@ -158,8 +192,24 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
         return result
     }
 
-    private func parseUsage(from usage: [String: Any]?, stopReason: String?) -> TokenUsage {
-        guard let usage else { return .empty }
+    private func parseUsage(
+        from usage: [String: Any]?,
+        stopReason: String?,
+        webSearchCalls: Int
+    ) -> TokenUsage {
+        guard let usage else {
+            guard webSearchCalls > 0 else { return .empty }
+            return TokenUsage(
+                inputTokens: nil,
+                outputTokens: nil,
+                cacheReadInputTokens: nil,
+                cacheCreationInputTokens: nil,
+                webSearchCalls: webSearchCalls,
+                webFetchCalls: 0,
+                inputTokensIncludeCacheReads: true,
+                stopReason: stopReason
+            )
+        }
         let inputTokens = usage["input_tokens"] as? Int
         let outputTokens = usage["output_tokens"] as? Int
         let inputDetails = usage["input_tokens_details"] as? [String: Any]
@@ -170,8 +220,31 @@ struct OpenAIResponsesProxyAPIHandler: ProxyAPIHandler {
             outputTokens: outputTokens,
             cacheReadInputTokens: cachedTokens,
             cacheCreationInputTokens: nil,
+            webSearchCalls: webSearchCalls,
+            webFetchCalls: 0,
             inputTokensIncludeCacheReads: true,
             stopReason: stopReason
         )
+    }
+
+    private func countCompletedWebSearchCalls(in response: [String: Any]) -> Int {
+        guard let output = response["output"] as? [Any] else { return 0 }
+        return output.reduce(0) { total, item in
+            guard let item = item as? [String: Any],
+                  isCompletedWebSearchCall(item) else {
+                return total
+            }
+            return total + 1
+        }
+    }
+
+    private func isCompletedWebSearchCall(_ item: [String: Any]) -> Bool {
+        guard item["type"] as? String == "web_search_call" else {
+            return false
+        }
+        guard let status = item["status"] as? String else {
+            return true
+        }
+        return status == "completed"
     }
 }

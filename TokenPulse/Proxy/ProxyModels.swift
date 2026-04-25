@@ -711,6 +711,8 @@ struct TokenUsage: Sendable {
     let outputTokens: Int?
     let cacheReadInputTokens: Int?
     let cacheCreationInputTokens: Int?
+    let webSearchCalls: Int
+    let webFetchCalls: Int
     /// Whether `inputTokens` already includes cached input tokens.
     /// Anthropic reports uncached and cached input separately; OpenAI Responses
     /// reports cached tokens as a subset of total input tokens.
@@ -721,11 +723,13 @@ struct TokenUsage: Sendable {
 
     static let empty = TokenUsage(inputTokens: nil, outputTokens: nil,
                                   cacheReadInputTokens: nil, cacheCreationInputTokens: nil,
+                                  webSearchCalls: 0,
+                                  webFetchCalls: 0,
                                   inputTokensIncludeCacheReads: false,
                                   stopReason: nil)
 
     /// Compute the estimated cost (USD) using the given pricing rates.
-    func cost(for pricing: ModelPricing) -> Double {
+    func cost(for pricing: ModelPricing, apiFlavor: ProxyAPIFlavor) -> Double {
         let cachedInputTokens = max(0, cacheReadInputTokens ?? 0)
         let billableInputTokens: Int
         if inputTokensIncludeCacheReads {
@@ -738,7 +742,20 @@ struct TokenUsage: Sendable {
         let output   = Double(outputTokens ?? 0)           * pricing.outputPerMTok
         let cacheRd  = Double(cachedInputTokens)           * pricing.cacheReadPerMTok
         let cacheWr  = Double(cacheCreationInputTokens ?? 0) * pricing.cacheWritePerMTok
-        return (input + output + cacheRd + cacheWr) / 1_000_000
+        return ((input + output + cacheRd + cacheWr) / 1_000_000)
+            + ToolPricingTable.webSearchCost(callCount: webSearchCalls, apiFlavor: apiFlavor)
+            + ToolPricingTable.webFetchCost(callCount: webFetchCalls, apiFlavor: apiFlavor)
+    }
+
+    /// Compute cost when model-token pricing may be unknown.
+    /// Tool calls can still have a provider price even if text-token pricing is unavailable.
+    func estimatedCost(for pricing: ModelPricing?, apiFlavor: ProxyAPIFlavor) -> Double? {
+        let toolCost = ToolPricingTable.webSearchCost(callCount: webSearchCalls, apiFlavor: apiFlavor)
+            + ToolPricingTable.webFetchCost(callCount: webFetchCalls, apiFlavor: apiFlavor)
+        if let pricing {
+            return cost(for: pricing, apiFlavor: apiFlavor)
+        }
+        return toolCost > 0 ? toolCost : nil
     }
 }
 
@@ -750,6 +767,27 @@ struct ModelPricing: Sendable {
     let outputPerMTok: Double
     let cacheReadPerMTok: Double
     let cacheWritePerMTok: Double
+}
+
+/// Provider-priced tool calls that are not represented in token usage.
+enum ToolPricingTable {
+    static func webSearchCost(callCount: Int, apiFlavor: ProxyAPIFlavor) -> Double {
+        switch apiFlavor {
+        case .anthropicMessages, .openAIResponses:
+            return perThousandCallCost(callCount: callCount, rate: 10.0)
+        }
+    }
+
+    static func webFetchCost(callCount: Int, apiFlavor: ProxyAPIFlavor) -> Double {
+        switch apiFlavor {
+        case .anthropicMessages, .openAIResponses:
+            return perThousandCallCost(callCount: callCount, rate: 0)
+        }
+    }
+
+    private static func perThousandCallCost(callCount: Int, rate: Double) -> Double {
+        Double(max(0, callCount)) * rate / 1_000
+    }
 }
 
 /// Lookup pricing for supported Anthropic and OpenAI text model IDs.
@@ -847,6 +885,8 @@ enum ProxyHTTPUtils {
             outputTokens: usage["output_tokens"] as? Int,
             cacheReadInputTokens: usage["cache_read_input_tokens"] as? Int,
             cacheCreationInputTokens: usage["cache_creation_input_tokens"] as? Int,
+            webSearchCalls: serverToolUse(from: usage, key: "web_search_requests"),
+            webFetchCalls: serverToolUse(from: usage, key: "web_fetch_requests"),
             inputTokensIncludeCacheReads: false,
             stopReason: json["stop_reason"] as? String
         )
@@ -864,7 +904,14 @@ enum ProxyHTTPUtils {
         var outputTokens: Int?
         var cacheReadInputTokens: Int?
         var cacheCreationInputTokens: Int?
+        var webSearchCalls = 0
+        var webFetchCalls = 0
         var stopReason: String?
+
+        func mergeServerToolUse(from usage: [String: Any]) {
+            webSearchCalls = max(webSearchCalls, serverToolUse(from: usage, key: "web_search_requests"))
+            webFetchCalls = max(webFetchCalls, serverToolUse(from: usage, key: "web_fetch_requests"))
+        }
 
         text.enumerateLines { line, stop in
             guard line.hasPrefix("data: ") else { return }
@@ -884,6 +931,7 @@ enum ProxyHTTPUtils {
                 inputTokens = usage["input_tokens"] as? Int
                 cacheReadInputTokens = usage["cache_read_input_tokens"] as? Int
                 cacheCreationInputTokens = usage["cache_creation_input_tokens"] as? Int
+                mergeServerToolUse(from: usage)
 
             case "message_delta":
                 // stop_reason lives at delta.stop_reason
@@ -893,6 +941,7 @@ enum ProxyHTTPUtils {
                 // output_tokens lives at usage.output_tokens
                 if let usage = json["usage"] as? [String: Any] {
                     outputTokens = usage["output_tokens"] as? Int
+                    mergeServerToolUse(from: usage)
                 }
                 // Stop early — message_delta is the last event with usage data.
                 stop = true
@@ -907,9 +956,18 @@ enum ProxyHTTPUtils {
             outputTokens: outputTokens,
             cacheReadInputTokens: cacheReadInputTokens,
             cacheCreationInputTokens: cacheCreationInputTokens,
+            webSearchCalls: webSearchCalls,
+            webFetchCalls: webFetchCalls,
             inputTokensIncludeCacheReads: false,
             stopReason: stopReason
         )
+    }
+
+    private static func serverToolUse(from usage: [String: Any], key: String) -> Int {
+        guard let serverToolUse = usage["server_tool_use"] as? [String: Any] else {
+            return 0
+        }
+        return serverToolUse[key] as? Int ?? 0
     }
 
     /// Extract the Anthropic `message.id` from a captured response body.
