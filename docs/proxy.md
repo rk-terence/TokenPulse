@@ -22,7 +22,7 @@ Outbound forwarding from this local proxy follows TokenPulse's upstream proxy se
 
 The proxy provides visibility that upstream APIs do not surface directly in local tools: per-request token usage, per-session aggregation, model selection, byte counts, request timing, and estimated cost. It also assembles proxied requests into a **content tree** — a conversation-level structure where each tree node is a content checkpoint (a point in the conversation's message-prefix space) and each attached request is an attempt at that checkpoint. Nodes dedupe shared conversation prefixes across requests, so the event logger stores message content once per node instead of once per request.
 
-Keep-alive (cache-warming replay requests) is **not currently implemented**; the previous Claude-Code-specific manual keep-alive button and its supporting state were removed in favor of the universal tree. Keep-alive may return in a future iteration built on top of the tree.
+Keep-alive (cache-warming replay requests) ships as a manual MVP. The full design lives in [proxy-keepalive.md](proxy-keepalive.md): synthetic Anthropic warm requests derived from a selected lineage path, excluded from the content tree as real work, and logged/costed separately in `proxy_keepalives` (event-log schema v7).
 
 # Architecture
 
@@ -260,7 +260,16 @@ A cumulative cost counter in `ProxySessionStore` survives session expiration unt
 
 # Keep-alive
 
-Keep-alive (cache-warming replay requests) is **not currently implemented**. The universal content tree replaces the previous Claude-Code-specific manual keep-alive surface. A future iteration may use the tree's accepted-request nodes to synthesize replay requests across supported providers.
+Keep-alive (cache-warming replay requests) ships as a manual MVP. Full spec — eligibility, body synthesis cases, audit row, UI affordances — lives in [proxy-keepalive.md](proxy-keepalive.md).
+
+In summary:
+
+- The user activates keep-alive by right-clicking a recent successful Anthropic done request in the proxy popover. `ProxySessionStore.activateKeepalive(forRequestID:)` anchors the conversation's selection and pins the cached upstream exchange (request body + headers + raw response) so the warm forwarder can rebuild a body later.
+- Each "Send keep-alive" click runs `KeepaliveSynthesizer.synthesize(...)` to build a warm body that extends the source response's frontier with `cache_control` placed on the last assistant text or `tool_use` block, then calls `ProxyForwarder.sendKeepaliveWarmRequest(...)`. Warm requests bypass `attachToTree`, organic session totals, and the per-request UI activity row.
+- Outcomes are recorded on `KeepaliveSelection` (cumulative cost, age timer) and audited in the `proxy_keepalives` SQLite table.
+- Auto-deactivation drops the selection when the lineage path branches, when the source request/node/conversation is pruned, or when the source session expires; each fires `LocalProxyController.onKeepaliveDeactivated` which the AppDelegate forwards to `NotificationService.sendProxyKeepaliveDisabled`.
+
+Manual-only by design. Automatic timer-driven keep-alive is future work.
 
 # Error handling
 
@@ -471,8 +480,9 @@ Proxy settings live in `~/.tokenpulse/config.json` and are managed by `ConfigSer
 | `anthropicUpstreamURL` | String | `"https://zenmux.ai/api/anthropic"` | Base URL for Anthropic Messages forwarding |
 | `openAIUpstreamURL` | String | `"https://api.openai.com"` | Base URL for OpenAI Responses forwarding |
 | `saveProxyEventLog` | Bool | `true` | Master on/off for `ProxyEventLogger`. When enabled, the logger persists SQLite metadata, lineage-deduplicated request/response payloads, bounded raw exact request/response captures, and status snapshots. When disabled, no SQLite database is opened and no status snapshot is written. |
+| `keepaliveEnabled` | Bool | `false` | Manual keep-alive feature gate. When false the popover hides the **Activate keep-alive** affordance. Existing selections continue to function so a user toggling the flag off can wind down. Persisted only when true. |
 
-The legacy `keepaliveEnabled`, `keepaliveIntervalSeconds`, `proxyInactivityTimeoutSeconds`, and `saveProxyPayloads` fields are still tolerated by the config migration (they were fields in version 6) but are no longer written or read by the live code. The current config schema version is `7`.
+The legacy `keepaliveIntervalSeconds`, `proxyInactivityTimeoutSeconds`, and `saveProxyPayloads` fields are still tolerated by the config migration (they were fields in version 6) but are no longer written or read by the live code. `keepaliveEnabled` was previously in the same legacy bucket; it is now read and written again as part of the manual keep-alive MVP. The current config schema version is `7`.
 
 Legacy `proxyUpstreamURL` is still read during config migration and mapped to `anthropicUpstreamURL`.
 

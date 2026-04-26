@@ -30,6 +30,10 @@ final class LocalProxyController {
         let totalCacheReadInputTokens: Int
         let totalCacheCreationInputTokens: Int
         let estimatedCostUSD: Double
+        /// Keep-alive selections rooted in this session. Empty in the common
+        /// case; one entry when the user has activated keep-alive on a
+        /// request whose conversation is anchored in this session.
+        let keepaliveSelections: [ProxySessionStore.KeepaliveSelection]
 
         var id: String { sessionID }
         var apiFlavor: ProxyAPIFlavor? { ProxySessionID.flavor(for: sessionID) }
@@ -40,6 +44,22 @@ final class LocalProxyController {
             ProxySessionID.isOther(sessionID) ? displayID : shortID
         }
         var isOtherTraffic: Bool { ProxySessionID.isOther(sessionID) }
+        /// Sum of cumulative warm-request cost across this session's
+        /// selections. Zero when the session has no active selection.
+        var keepaliveCostUSD: Double {
+            keepaliveSelections.reduce(0) { $0 + $1.cumulativeCostUSD }
+        }
+        /// Most recent successful or failed warm-request timestamp across
+        /// this session's selections. Nil when no warm has been sent yet.
+        var lastKeepaliveAt: Date? {
+            keepaliveSelections.compactMap(\.lastWarmAt).max()
+        }
+        /// True when at least one selection in this session points at the
+        /// given request — used by the row UI to draw the orange leaf
+        /// indicator.
+        func isKeepaliveLeaf(requestID: UUID) -> Bool {
+            keepaliveSelections.contains { $0.requestID == requestID }
+        }
     }
 
     // MARK: - Aggregate metrics snapshot for UI
@@ -83,6 +103,10 @@ final class LocalProxyController {
     var onTrafficEvent: ((TrafficDirection?) -> Void)?
     var onRequestDone: (() -> Void)?
     var onRunningChanged: ((Bool) -> Void)?
+    /// Fired when a keep-alive selection is dropped automatically by the
+    /// session store (path branched, pruned, session expired). Wired up by
+    /// phase 6 to surface a notification; left nil otherwise.
+    var onKeepaliveDeactivated: ((UUID, ProxySessionStore.KeepaliveDeactivationReason) -> Void)?
 
     private var server: ProxyHTTPServer?
     private var serverGeneration: UInt64 = 0
@@ -153,6 +177,12 @@ final class LocalProxyController {
             await store.setRequestDoneCallback { [weak self] in
                 Task { @MainActor [weak self] in
                     self?.onRequestDone?()
+                }
+            }
+            await store.setKeepaliveDeactivatedCallback { [weak self] conversationID, reason in
+                Task { @MainActor [weak self] in
+                    self?.onKeepaliveDeactivated?(conversationID, reason)
+                    self?.scheduleTrafficRefresh()
                 }
             }
         }
@@ -672,7 +702,8 @@ final class LocalProxyController {
                 totalOutputTokens: snap.totalOutputTokens,
                 totalCacheReadInputTokens: snap.totalCacheReadInputTokens,
                 totalCacheCreationInputTokens: snap.totalCacheCreationInputTokens,
-                estimatedCostUSD: snap.estimatedCostUSD
+                estimatedCostUSD: snap.estimatedCostUSD,
+                keepaliveSelections: snap.keepaliveSelections
             ))
         }
         result.sort { lhs, rhs in
@@ -686,5 +717,42 @@ final class LocalProxyController {
         }
 
         return (activities: result, activeSessionCount: activeSessionCount, stalledHideIDs: stalledHideIDs)
+    }
+
+    // MARK: - Keep-alive
+
+    /// Activate keep-alive on the lineage path leading to the given request.
+    /// Phase 5 (UI) calls this from the row context menu; phase 3 (forwarder
+    /// fork) is what actually sends warm requests.
+    func activateKeepalive(forRequestID requestID: UUID) async -> ProxySessionStore.KeepaliveActivationResult {
+        let result = await sessionStore.activateKeepalive(forRequestID: requestID)
+        scheduleTrafficRefresh()
+        return result
+    }
+
+    /// User-initiated deactivation. Auto-deactivation paths (path branched,
+    /// pruned, session expired) come through `onKeepaliveDeactivated`
+    /// instead.
+    func stopKeepalive(forConversationID conversationID: UUID) async {
+        await sessionStore.deactivateKeepalive(forConversationID: conversationID)
+        scheduleTrafficRefresh()
+    }
+
+    func keepaliveSelection(forConversationID conversationID: UUID) async -> ProxySessionStore.KeepaliveSelection? {
+        await sessionStore.keepaliveSelection(forConversationID: conversationID)
+    }
+
+    /// Send one manual warm request for the given conversation. Bypasses
+    /// the content tree and organic session totals — outcome is recorded
+    /// in the conversation's `KeepaliveSelection`. No-op when the proxy is
+    /// not running, the Anthropic forwarder is not available, or the
+    /// selection has been deactivated.
+    func triggerManualKeepalive(forConversationID conversationID: UUID) async {
+        guard let forwarder = anthropicForwarder else { return }
+        await forwarder.sendKeepaliveWarmRequest(
+            conversationID: conversationID,
+            sessionStore: sessionStore
+        )
+        scheduleTrafficRefresh()
     }
 }

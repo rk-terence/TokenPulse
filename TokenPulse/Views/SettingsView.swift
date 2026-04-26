@@ -520,6 +520,20 @@ private struct ProxyTab: View {
             }
 
             SettingsCard(
+                title: String(localized: "Keep-alive"),
+                description: String(localized: "Manually warm Anthropic Messages prompt cache for a selected Claude Code lineage path. Each warm request is synthesized, costed, and audited separately from organic traffic.")
+            ) {
+                Toggle(String(localized: "Enable keep-alive"), isOn: $config.keepaliveEnabled)
+
+                if config.keepaliveEnabled {
+                    Text(String(localized: "Right-click a recent Claude Code done request in the proxy popover to anchor keep-alive on its lineage path. Use the session menu's Send keep-alive entry to fire one warm request."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            SettingsCard(
                 title: String(localized: "Content Blocklist"),
                 description: String(localized: "Reject requests whose newly-added content contains any of these keywords. Prefix with re: for a regex pattern. Each keyword can list exception patterns — a keyword that matches is allowed when any of its exceptions also matches. Changes apply on the next proxy restart.")
             ) {

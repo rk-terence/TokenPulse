@@ -21,6 +21,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         proxyController = LocalProxyController()
         providerManager.proxyController = proxyController
 
+        // Surface auto-deactivation of keep-alive selections (path branched,
+        // pruned, source session expired) as a user-facing notification.
+        // Manual deactivation through the popover doesn't fire this.
+        proxyController?.onKeepaliveDeactivated = { conversationID, reason in
+            let reasonText: String
+            switch reason {
+            case .pathBranched:
+                reasonText = String(localized: "lineage path branched")
+            case .pruned:
+                reasonText = String(localized: "source request pruned")
+            case .sessionExpired:
+                reasonText = String(localized: "source session expired")
+            }
+            NotificationService.shared.sendProxyKeepaliveDisabled(
+                sessionID: conversationID.uuidString,
+                reason: reasonText
+            )
+        }
+
         // Set up status bar
         statusBarController = StatusBarController(providerManager: providerManager, proxyController: proxyController)
 

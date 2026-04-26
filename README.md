@@ -142,7 +142,7 @@ The proxy is a full HTTP/1.1 server built on Network.framework. Anthropic Messag
 
 ### Keepalive status
 
-Keep-alive (cache-warming replay requests) is not currently implemented. The previous Anthropic-specific manual keepalive surface was removed in favor of the universal lineage tree and shared observability model. A future iteration may reintroduce cache-warming on top of that tree, but it is not part of the live product today.
+Keep-alive (cache-warming replay requests) ships as a manual MVP for Anthropic / Claude Code traffic. Right-click a recent done request in the proxy popover to anchor warm requests on its lineage path, then trigger one warm via the row or session menu. Synthetic warm requests stay out of the content tree, get audited in a dedicated `proxy_keepalives` SQLite table (event-log schema v7), and are costed separately from organic traffic. Disabled by default behind the **Enable keep-alive** toggle in Settings. Full design lives in [docs/proxy-keepalive.md](docs/proxy-keepalive.md).
 
 ### Observability
 

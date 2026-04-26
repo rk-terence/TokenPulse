@@ -578,8 +578,14 @@ private struct SessionActivityRow: View {
 
             if !activity.activeRequests.isEmpty {
                 ForEach(activity.activeRequests) { request in
-                    RequestActivityRow(request: request, isActive: true)
-                        .padding(.leading, 10)
+                    RequestActivityRow(
+                        request: request,
+                        isActive: true,
+                        isKeepaliveLeaf: false,
+                        sessionAPIFlavor: activity.apiFlavor,
+                        proxyController: proxyController
+                    )
+                    .padding(.leading, 10)
                 }
             }
 
@@ -588,11 +594,23 @@ private struct SessionActivityRow: View {
                 // and `done=false`) is about to replace them get dimmed. Other
                 // done rows render normally.
                 ForEach(activity.doneRequests) { request in
-                    RequestActivityRow(request: request, isActive: false)
-                        .padding(.leading, 10)
-                        .opacity(request.isPendingReplacement ? 0.4 : 1.0)
+                    RequestActivityRow(
+                        request: request,
+                        isActive: false,
+                        isKeepaliveLeaf: activity.isKeepaliveLeaf(requestID: request.id),
+                        sessionAPIFlavor: activity.apiFlavor,
+                        proxyController: proxyController
+                    )
+                    .padding(.leading, 10)
+                    .opacity(request.isPendingReplacement ? 0.4 : 1.0)
                 }
                 .padding(.top, activity.activeRequests.isEmpty ? 0 : 4)
+            }
+
+            if !activity.keepaliveSelections.isEmpty {
+                keepaliveFooter
+                    .padding(.leading, 10)
+                    .padding(.top, 2)
             }
         }
     }
@@ -623,6 +641,32 @@ private struct SessionActivityRow: View {
     @ViewBuilder
     private var sessionMenu: some View {
         Menu {
+            // Keep-alive entries are conditional. They appear only for
+            // Anthropic-flavored sessions that already have a selection;
+            // activation itself is a per-row action (right-click a done
+            // request) since the menu would otherwise need to disambiguate
+            // which leaf the user wants.
+            if !activity.keepaliveSelections.isEmpty {
+                Button(
+                    NSLocalizedString(
+                        "proxy.session.sendKeepalive",
+                        value: "Send keep-alive",
+                        comment: "Menu item to send one warm request for the conversation's keep-alive selection"
+                    )
+                ) {
+                    sendKeepaliveForSelectedConversations()
+                }
+                Button(
+                    NSLocalizedString(
+                        "proxy.session.stopKeepalive",
+                        value: "Stop keep-alive",
+                        comment: "Menu item to deactivate keep-alive on the conversation's selection"
+                    )
+                ) {
+                    stopKeepaliveForSelectedConversations()
+                }
+                Divider()
+            }
             Button(
                 NSLocalizedString(
                     "proxy.session.hide",
@@ -641,6 +685,60 @@ private struct SessionActivityRow: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .padding(.leading, 6)
+    }
+
+    @ViewBuilder
+    private var keepaliveFooter: some View {
+        // The selection-derived stats live on `SessionActivity`. Show a
+        // single row summarizing the warm spend so far and the age of the
+        // last warm. When no warm has been sent yet, only the activation
+        // anchor exists — display a placeholder time.
+        let cost = activity.keepaliveCostUSD
+        HStack(spacing: 8) {
+            Text(String(localized: "keep-alive"))
+                .font(.callout.monospaced())
+                .foregroundStyle(.orange.opacity(0.85))
+            if cost > 0 {
+                ProxyMetricLabel(
+                    label: "$",
+                    value: formatCost(cost),
+                    font: .callout.monospaced()
+                )
+            }
+            Spacer()
+            if let lastWarmAt = activity.lastKeepaliveAt {
+                TimelineView(.periodic(from: lastWarmAt, by: 1)) { context in
+                    Text(verbatim: RequestActivityRow.compactElapsed(from: lastWarmAt, to: context.date))
+                        .font(.callout.monospaced())
+                        .foregroundStyle(.tertiary)
+                        .contentTransition(.numericText())
+                }
+            } else {
+                Text(verbatim: "--:--")
+                    .font(.callout.monospaced())
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private func sendKeepaliveForSelectedConversations() {
+        guard let proxyController else { return }
+        let conversationIDs = activity.keepaliveSelections.map(\.conversationID)
+        Task {
+            for conversationID in conversationIDs {
+                await proxyController.triggerManualKeepalive(forConversationID: conversationID)
+            }
+        }
+    }
+
+    private func stopKeepaliveForSelectedConversations() {
+        guard let proxyController else { return }
+        let conversationIDs = activity.keepaliveSelections.map(\.conversationID)
+        Task {
+            for conversationID in conversationIDs {
+                await proxyController.stopKeepalive(forConversationID: conversationID)
+            }
+        }
     }
 
     @ViewBuilder
@@ -689,6 +787,16 @@ private struct SessionActivityRow: View {
 private struct RequestActivityRow: View {
     let request: ProxyRequestActivity
     let isActive: Bool
+    /// True when this done row is the conversation's currently-selected
+    /// keep-alive leaf. Drives the orange overlay and adjusts the context
+    /// menu (Stop instead of Activate).
+    var isKeepaliveLeaf: Bool = false
+    /// API flavor of the owning session — used to gate keep-alive menu
+    /// entries to Anthropic only.
+    var sessionAPIFlavor: ProxyAPIFlavor? = nil
+    /// Owning controller for keep-alive activation/send/stop. Optional so
+    /// SwiftUI previews and tests can construct rows without one.
+    var proxyController: LocalProxyController? = nil
 
     private enum StatField {
         static let modelLabelWidth = 8
@@ -701,7 +809,34 @@ private struct RequestActivityRow: View {
 
     private var rowFont: Font { .callout.monospaced() }
 
+    /// Done rows of Anthropic conversations get the keep-alive context
+    /// menu; all other rows (in-flight, OpenAI, untracked) skip it. The
+    /// global flag suppresses the menu entirely unless this row is already
+    /// the selected leaf — in which case Send/Stop remain available so the
+    /// user can wind down a session they previously anchored.
+    private var supportsKeepaliveMenu: Bool {
+        guard sessionAPIFlavor == .anthropicMessages,
+              !isActive,
+              request.kind.storesDoneActivity,
+              request.conversationID != nil else {
+            return false
+        }
+        if isKeepaliveLeaf {
+            return true
+        }
+        return ConfigService.shared.keepaliveEnabled
+    }
+
+    @ViewBuilder
     var body: some View {
+        if supportsKeepaliveMenu {
+            rowContent.contextMenu { keepaliveMenuItems }
+        } else {
+            rowContent
+        }
+    }
+
+    private var rowContent: some View {
         HStack(spacing: 5) {
             if let modelName = compactModelName {
                 Text(verbatim: paddedLabel(modelName, width: StatField.modelLabelWidth))
@@ -730,6 +865,54 @@ private struct RequestActivityRow: View {
                     .frame(width: 2)
                     .offset(x: -6)
                     .allowsHitTesting(false)
+            } else if isKeepaliveLeaf {
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(Color.orange)
+                    .frame(width: 2)
+                    .offset(x: -6)
+                    .allowsHitTesting(false)
+            }
+        }
+        .contentShape(Rectangle())
+    }
+
+    @ViewBuilder
+    private var keepaliveMenuItems: some View {
+        if isKeepaliveLeaf, let conversationID = request.conversationID {
+            Button(
+                NSLocalizedString(
+                    "proxy.row.sendKeepalive",
+                    value: "Send keep-alive",
+                    comment: "Context menu item to fire one warm request now"
+                )
+            ) {
+                Task { await proxyController?.triggerManualKeepalive(forConversationID: conversationID) }
+            }
+            Button(
+                NSLocalizedString(
+                    "proxy.row.stopKeepalive",
+                    value: "Stop keep-alive",
+                    comment: "Context menu item to deactivate keep-alive on the conversation"
+                )
+            ) {
+                Task { await proxyController?.stopKeepalive(forConversationID: conversationID) }
+            }
+        } else {
+            Button(
+                NSLocalizedString(
+                    "proxy.row.activateKeepalive",
+                    value: "Activate keep-alive",
+                    comment: "Context menu item to anchor keep-alive on this done request"
+                )
+            ) {
+                let requestID = request.id
+                Task {
+                    let result = await proxyController?.activateKeepalive(forRequestID: requestID)
+                    if case .activated = result { return }
+                    if let result {
+                        ProxyLogger.log("Keep-alive activation refused: \(result)")
+                    }
+                }
             }
         }
     }

@@ -46,6 +46,72 @@ actor ProxySessionStore {
         let totalCacheReadInputTokens: Int
         let totalCacheCreationInputTokens: Int
         let estimatedCostUSD: Double
+        /// Keep-alive selections whose source request belongs to this
+        /// session. Most often empty or a single entry; one session can hold
+        /// multiple selections only if it spans multiple conversations.
+        let keepaliveSelections: [KeepaliveSelection]
+    }
+
+    /// One conversation's manual keep-alive selection. The selection points
+    /// at a specific successful done request whose lineage path the user
+    /// asked to keep cache-warm. Per `docs/proxy-keepalive.md` we hold at
+    /// most one selection per conversation; a new activation replaces the
+    /// previous one.
+    struct KeepaliveSelection: Sendable {
+        let conversationID: UUID
+        let nodeID: UUID
+        let requestID: UUID
+        let sessionID: String
+        let activatedAt: Date
+        var lastWarmAt: Date?
+        var lastWarmSucceeded: Bool?
+        var lastFailureReason: String?
+        var cumulativeCostUSD: Double
+        var cumulativeWarmCount: Int
+    }
+
+    /// Outcome of `activateKeepalive(forRequestID:)`. Selection-level
+    /// eligibility (covered here) is upstream of body-synthesis eligibility
+    /// (covered by `KeepaliveSynthesizer.RefusalReason`). The two refusal
+    /// surfaces are intentionally separate so the UI can distinguish "you
+    /// can't even pick this row" from "we tried to warm and the body wasn't
+    /// reconstructible."
+    enum KeepaliveActivationResult: Sendable {
+        case activated(KeepaliveSelection)
+        /// Request ID is not in the in-memory tree. Either it never attached
+        /// or it was pruned.
+        case unknownRequest
+        /// Request hasn't reached a terminal state yet.
+        case requestStillInFlight
+        /// Request finished but didn't succeed.
+        case requestErrored
+        /// Conversation is not Anthropic Messages flavored — the manual MVP
+        /// only supports Claude Code traffic.
+        case unsupportedFlavor
+        /// The raw request/response capture for this leaf has rolled out of
+        /// the recent-exchange ring. The user must pick a fresher request.
+        case sourceBodyUnavailable
+    }
+
+    /// Why a previously-active selection was dropped without a user request.
+    /// Surfaced through `setKeepaliveDeactivatedCallback` for diagnostics
+    /// and (phase 6) user notifications.
+    enum KeepaliveDeactivationReason: Sendable, Equatable {
+        case pathBranched
+        case pruned
+        case sessionExpired
+    }
+
+    /// One captured upstream exchange — the source request body and the
+    /// observed response — kept around so a synthesized warm request can
+    /// reuse the same headers and response frontier. Cached only for
+    /// successful Anthropic Messages generations; not for OpenAI traffic.
+    struct KeepaliveExchange: Sendable {
+        let requestHeaders: [(name: String, value: String)]
+        let requestBody: Data
+        let responseStreaming: Bool
+        let responseBody: Data
+        let recordedAt: Date
     }
 
     private var sessions: [String: Session] = [:]
@@ -76,6 +142,26 @@ actor ProxySessionStore {
     private var cumulativeEstimatedCostUSD: Double = 0
     private var cumulativeEstimatedCostUSDByAPI: [ProxyAPIFlavor: Double] = [:]
 
+    /// Active keep-alive selections, keyed by conversation. At most one per
+    /// conversation; activating a request whose conversation already has a
+    /// selection replaces the previous one.
+    private var keepaliveSelections: [UUID: KeepaliveSelection] = [:]
+
+    /// Bounded ring buffer of recent successful Anthropic Messages
+    /// exchanges. Activation pulls from this ring — entries that have
+    /// rolled out are no longer eligible. Sized to cover normal Claude
+    /// Code interaction patterns; larger buffers cost a few MB of body
+    /// data with no concrete user benefit.
+    private static let recentKeepaliveExchangeCapacity = 64
+    private var recentKeepaliveExchanges: [(requestID: UUID, exchange: KeepaliveExchange)] = []
+
+    /// Anchored exchange per active selection. Activation copies the
+    /// candidate from `recentKeepaliveExchanges` into here so the body
+    /// survives ring-buffer eviction for as long as the user is keeping
+    /// the path warm. Body data lives only inside the actor — never
+    /// crosses out via the snapshot path.
+    private var anchoredKeepaliveExchanges: [UUID: KeepaliveExchange] = [:]
+
     /// Callback fired on every state change that should refresh the UI.
     /// The `TrafficDirection?` argument is non-nil when the event corresponds
     /// to actual bytes flowing (for driving the menu bar arrow animations);
@@ -87,6 +173,10 @@ actor ProxySessionStore {
     /// menu bar icon to spawn a cost-transformation particle, independent of
     /// the byte-level traffic animation.
     private var onRequestDone: (@Sendable () -> Void)?
+    /// Fired when a previously-active selection is dropped automatically
+    /// (path branched, pruned, session expired). Manual deactivation via
+    /// `deactivateKeepalive(forConversationID:)` does not fire this.
+    private var onKeepaliveDeactivated: (@Sendable (UUID, KeepaliveDeactivationReason) -> Void)?
 
     /// Set the traffic callback. Called from outside the actor isolation.
     func setTrafficCallback(_ callback: @escaping @Sendable (TrafficDirection?) -> Void) {
@@ -96,6 +186,13 @@ actor ProxySessionStore {
     /// Set the request-done callback. Called from outside the actor isolation.
     func setRequestDoneCallback(_ callback: @escaping @Sendable () -> Void) {
         onRequestDone = callback
+    }
+
+    /// Set the auto-deactivation callback. Called from outside the actor isolation.
+    func setKeepaliveDeactivatedCallback(
+        _ callback: @escaping @Sendable (UUID, KeepaliveDeactivationReason) -> Void
+    ) {
+        onKeepaliveDeactivated = callback
     }
 
     // MARK: - Session identity
@@ -210,6 +307,11 @@ actor ProxySessionStore {
             activeRequests[requestID] = entry
         }
         onTraffic?(nil)
+        // Auto-deactivate keep-alive when the selected leaf grows >1 in-flight
+        // descendants. One descendant is the natural continuation; two or
+        // more means the path has branched and warming a single frontier no
+        // longer matches the next organic request reliably.
+        autoDeactivateKeepaliveIfBranched(in: result.conversationID)
     }
 
     /// Preview what attaching this request would add to the content tree,
@@ -253,6 +355,21 @@ actor ProxySessionStore {
         for removed in result.removedRequestIDs {
             treeDoneActivities.removeValue(forKey: removed)
         }
+        // A keep-alive selection cannot survive pruning of the conversation,
+        // node, or source request it points at — drop it and notify.
+        for (conversationID, selection) in keepaliveSelections {
+            let droppedByPrune = result.removedConversationIDs.contains(conversationID)
+                || result.removedNodeIDs.contains(selection.nodeID)
+                || result.removedRequestIDs.contains(selection.requestID)
+            if droppedByPrune {
+                keepaliveSelections.removeValue(forKey: conversationID)
+                anchoredKeepaliveExchanges.removeValue(forKey: conversationID)
+                onKeepaliveDeactivated?(conversationID, .pruned)
+            }
+        }
+        // Drop ring-buffer candidates whose underlying request was pruned.
+        // Bounded ring size means this is a tiny scan.
+        recentKeepaliveExchanges.removeAll { result.removedRequestIDs.contains($0.requestID) }
         return result
     }
 
@@ -517,6 +634,11 @@ actor ProxySessionStore {
             leafActivityBySession[sessionID, default: []].append(contentsOf: requests)
         }
 
+        var selectionsBySession: [String: [KeepaliveSelection]] = [:]
+        for selection in keepaliveSelections.values {
+            selectionsBySession[selection.sessionID, default: []].append(selection)
+        }
+
         return sessions.values.map { session in
             SessionSnapshot(
                 sessionID: session.sessionID,
@@ -532,7 +654,8 @@ actor ProxySessionStore {
                 totalOutputTokens: session.totalOutputTokens,
                 totalCacheReadInputTokens: session.totalCacheReadInputTokens,
                 totalCacheCreationInputTokens: session.totalCacheCreationInputTokens,
-                estimatedCostUSD: session.estimatedCostUSD
+                estimatedCostUSD: session.estimatedCostUSD,
+                keepaliveSelections: selectionsBySession[session.sessionID] ?? []
             )
         }.sorted {
             if $0.startedAt != $1.startedAt {
@@ -574,6 +697,15 @@ actor ProxySessionStore {
             guard let request = contentTree.requests[requestID] else { return false }
             return !expiredSet.contains(request.sessionID)
         }
+        // Drop selections whose source session has expired. The conversation
+        // can outlive any single session bucket but the user's anchor is
+        // tied to the original session, so we deactivate rather than
+        // re-anchor silently.
+        for (conversationID, selection) in keepaliveSelections where expiredSet.contains(selection.sessionID) {
+            keepaliveSelections.removeValue(forKey: conversationID)
+            anchoredKeepaliveExchanges.removeValue(forKey: conversationID)
+            onKeepaliveDeactivated?(conversationID, .sessionExpired)
+        }
         return expired
     }
 
@@ -593,7 +725,151 @@ actor ProxySessionStore {
         }
     }
 
+    // MARK: - Keep-alive selection
+
+    /// Activate keep-alive on the lineage path leading to the given done
+    /// request. The selection is stored against the request's conversation;
+    /// any prior selection for the same conversation is replaced. Refuses
+    /// when the request's exchange has already rolled out of the recent
+    /// ring — the warm forwarder needs the source body and headers.
+    func activateKeepalive(forRequestID requestID: UUID) -> KeepaliveActivationResult {
+        guard let request = contentTree.requests[requestID] else {
+            return .unknownRequest
+        }
+        guard request.finishedAt != nil else {
+            return .requestStillInFlight
+        }
+        guard request.succeeded else {
+            return .requestErrored
+        }
+        guard let node = contentTree.nodes[request.nodeID],
+              let conversation = contentTree.conversation(withID: node.conversationID) else {
+            return .unknownRequest
+        }
+        guard conversation.fingerprint.flavor == .anthropicMessages else {
+            return .unsupportedFlavor
+        }
+        guard let recent = recentKeepaliveExchanges.first(where: { $0.requestID == requestID }) else {
+            return .sourceBodyUnavailable
+        }
+        // If a previous selection on this conversation existed, drop its
+        // anchored exchange before installing the new one.
+        anchoredKeepaliveExchanges.removeValue(forKey: conversation.id)
+        anchoredKeepaliveExchanges[conversation.id] = recent.exchange
+        let selection = KeepaliveSelection(
+            conversationID: conversation.id,
+            nodeID: node.id,
+            requestID: requestID,
+            sessionID: request.sessionID,
+            activatedAt: Date(),
+            lastWarmAt: nil,
+            lastWarmSucceeded: nil,
+            lastFailureReason: nil,
+            cumulativeCostUSD: 0,
+            cumulativeWarmCount: 0
+        )
+        keepaliveSelections[conversation.id] = selection
+        onTraffic?(nil)
+        return .activated(selection)
+    }
+
+    /// Manual deactivation. Distinct from auto-deactivation: this path does
+    /// not fire the deactivation callback because the user took the action
+    /// themselves.
+    func deactivateKeepalive(forConversationID conversationID: UUID) {
+        let removedSelection = keepaliveSelections.removeValue(forKey: conversationID)
+        anchoredKeepaliveExchanges.removeValue(forKey: conversationID)
+        if removedSelection != nil {
+            onTraffic?(nil)
+        }
+    }
+
+    /// Cache one upstream exchange as a future keep-alive activation
+    /// candidate. Called by the forwarder for every successful Anthropic
+    /// Messages generation. Older entries fall off when the ring is full.
+    func recordKeepaliveCandidate(forRequestID requestID: UUID, exchange: KeepaliveExchange) {
+        recentKeepaliveExchanges.removeAll { $0.requestID == requestID }
+        recentKeepaliveExchanges.append((requestID, exchange))
+        while recentKeepaliveExchanges.count > Self.recentKeepaliveExchangeCapacity {
+            recentKeepaliveExchanges.removeFirst()
+        }
+    }
+
+    /// Look up the anchored exchange for an active selection. Used by the
+    /// warm forwarder to assemble the synthesized request. Nil when the
+    /// selection has been cleared or auto-deactivated.
+    func anchoredKeepaliveExchange(forConversationID conversationID: UUID) -> KeepaliveExchange? {
+        anchoredKeepaliveExchanges[conversationID]
+    }
+
+    func keepaliveSelection(forConversationID conversationID: UUID) -> KeepaliveSelection? {
+        keepaliveSelections[conversationID]
+    }
+
+    func allKeepaliveSelections() -> [KeepaliveSelection] {
+        Array(keepaliveSelections.values)
+    }
+
+    /// Record the outcome of a synthesized warm request. Updates the
+    /// conversation's selection in-place; no-op when the selection has been
+    /// dropped (e.g. the user deactivated mid-request).
+    func recordKeepaliveResult(
+        conversationID: UUID,
+        succeeded: Bool,
+        estimatedCostUSD: Double,
+        failureReason: String?
+    ) {
+        guard var selection = keepaliveSelections[conversationID] else { return }
+        selection.lastWarmAt = Date()
+        selection.lastWarmSucceeded = succeeded
+        selection.lastFailureReason = succeeded ? nil : failureReason
+        selection.cumulativeCostUSD += max(0, estimatedCostUSD)
+        selection.cumulativeWarmCount += 1
+        keepaliveSelections[conversationID] = selection
+        onTraffic?(nil)
+    }
+
+    /// Look up the source request body fields needed to synthesize a warm
+    /// request: target node ID for prefix reconstruction, the lineage
+    /// fingerprint (cache-identity fields), and the conversation root for
+    /// the audit row. Returns nil when the selection has been pruned.
+    func keepaliveSourceContext(
+        forConversationID conversationID: UUID
+    ) -> (selection: KeepaliveSelection, fingerprint: LineageFingerprint, sourceNodeID: UUID)? {
+        guard let selection = keepaliveSelections[conversationID],
+              let request = contentTree.requests[selection.requestID],
+              let node = contentTree.nodes[request.nodeID],
+              let conversation = contentTree.conversation(withID: node.conversationID) else {
+            return nil
+        }
+        return (selection, conversation.fingerprint, node.id)
+    }
+
     // MARK: - Private helpers
+
+    private func autoDeactivateKeepaliveIfBranched(in conversationID: UUID) {
+        guard let selection = keepaliveSelections[conversationID] else { return }
+        let inFlightDescendants = countInFlightDescendants(of: selection.nodeID)
+        if inFlightDescendants > 1 {
+            keepaliveSelections.removeValue(forKey: conversationID)
+            anchoredKeepaliveExchanges.removeValue(forKey: conversationID)
+            onKeepaliveDeactivated?(conversationID, .pathBranched)
+        }
+    }
+
+    private func countInFlightDescendants(of nodeID: UUID) -> Int {
+        var count = 0
+        var stack = contentTree.childrenByNode[nodeID] ?? []
+        while let current = stack.popLast() {
+            for requestID in contentTree.requestsByNode[current] ?? [] {
+                if let request = contentTree.requests[requestID], request.finishedAt == nil {
+                    count += 1
+                }
+            }
+            stack.append(contentsOf: contentTree.childrenByNode[current] ?? [])
+        }
+        return count
+    }
 
     private func insertUntrackedDoneRequest(_ activity: ProxyRequestActivity, for sessionID: String) {
         var doneRequests = doneRequestsBySession[sessionID] ?? []

@@ -19,7 +19,9 @@ actor ProxyEventLogger {
     /// `root_node_id`.
     /// v6: added `proxy_raw_request_response`, a bounded source-of-truth table
     /// that stores exact request/response captures without lineage stripping.
-    private static let currentSchemaVersion: Int = 6
+    /// v7: added `proxy_keepalives` for synthesized warm-request audits.
+    /// Retained for 24h alongside the other proxy tables.
+    private static let currentSchemaVersion: Int = 7
     private static let maxRawRequestResponseRows: Int = 1000
 
     struct LoggedRequest: Sendable {
@@ -61,6 +63,32 @@ actor ProxyEventLogger {
             let parentNodeID: UUID?
             let deltaMessagesJSON: String
         }
+    }
+
+    /// One synthesized keep-alive warm request. Distinct from organic
+    /// requests on every dimension: not in the content tree, not on the UI
+    /// activity row list, not added to organic session token totals. The
+    /// only place a warm request shows up in storage is its own row in
+    /// `proxy_keepalives`; this struct collects every audit field the spec
+    /// requires before insertion.
+    struct KeepaliveAttempt: Sendable {
+        let id: UUID
+        let startedAt: Date
+        let completedAt: Date
+        let conversationID: UUID
+        let sourceRequestID: UUID
+        let sourceNodeID: UUID
+        let sourceSession: String
+        let frontierKind: String
+        let frontierDescriptor: String?
+        let placeholderInserted: Bool
+        let placeholderToolUseIDs: [String]
+        let upstreamStatus: Int?
+        let upstreamRequestID: String?
+        let tokenUsage: TokenUsage?
+        let estimatedCostUSD: Double
+        let succeeded: Bool
+        let failureReason: String?
     }
 
     struct LoggedResponse: Sendable {
@@ -559,6 +587,70 @@ actor ProxyEventLogger {
         }
     }
 
+    // MARK: - Keep-alive audit
+
+    /// Persist one synthesized warm request's audit row. The structure of
+    /// `proxy_keepalives` is intentionally flat — there's no FK back to
+    /// `proxy_requests` because warm requests never get a `proxy_requests`
+    /// row in the first place (they bypass the organic forwarder log path).
+    func logKeepaliveAttempt(_ attempt: KeepaliveAttempt) {
+        guard enabled else { return }
+        do {
+            let database = try openDatabaseIfNeeded()
+            let sql = """
+                INSERT INTO proxy_keepalives (
+                    id, started_at, completed_at, conversation_id,
+                    source_request_id, source_node_id, source_session,
+                    frontier_kind, frontier_descriptor,
+                    placeholder_inserted, placeholder_tool_use_ids,
+                    upstream_status, upstream_request_id,
+                    input_tokens, output_tokens,
+                    cache_read_tokens, cache_creation_tokens,
+                    estimated_cost_usd, succeeded, failure_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw LoggerStorageError.prepareFailed(message: errorMessage(from: database))
+            }
+            defer { sqlite3_finalize(statement) }
+            let placeholderIDsJSON: String?
+            if attempt.placeholderToolUseIDs.isEmpty {
+                placeholderIDsJSON = nil
+            } else if let data = try? JSONSerialization.data(withJSONObject: attempt.placeholderToolUseIDs, options: [.sortedKeys]),
+                      let text = String(data: data, encoding: .utf8) {
+                placeholderIDsJSON = text
+            } else {
+                placeholderIDsJSON = nil
+            }
+            bind(attempt.id.uuidString, to: 1, in: statement)
+            bind(isoFormatter.string(from: attempt.startedAt), to: 2, in: statement)
+            bind(isoFormatter.string(from: attempt.completedAt), to: 3, in: statement)
+            bind(attempt.conversationID.uuidString, to: 4, in: statement)
+            bind(attempt.sourceRequestID.uuidString, to: 5, in: statement)
+            bind(attempt.sourceNodeID.uuidString, to: 6, in: statement)
+            bind(attempt.sourceSession, to: 7, in: statement)
+            bind(attempt.frontierKind, to: 8, in: statement)
+            bind(attempt.frontierDescriptor, to: 9, in: statement)
+            bind(attempt.placeholderInserted, to: 10, in: statement)
+            bind(placeholderIDsJSON, to: 11, in: statement)
+            bind(attempt.upstreamStatus, to: 12, in: statement)
+            bind(attempt.upstreamRequestID, to: 13, in: statement)
+            bind(attempt.tokenUsage?.inputTokens, to: 14, in: statement)
+            bind(attempt.tokenUsage?.outputTokens, to: 15, in: statement)
+            bind(attempt.tokenUsage?.cacheReadInputTokens, to: 16, in: statement)
+            bind(attempt.tokenUsage?.cacheCreationInputTokens, to: 17, in: statement)
+            bind(attempt.estimatedCostUSD, to: 18, in: statement)
+            bind(attempt.succeeded, to: 19, in: statement)
+            bind(attempt.failureReason, to: 20, in: statement)
+            guard sqlite3_step(statement) == SQLITE_DONE else {
+                throw LoggerStorageError.stepFailed(message: errorMessage(from: database))
+            }
+        } catch {
+            ProxyLogger.log("ProxyEventLogger: failed to log keepalive attempt: \(error)")
+        }
+    }
+
     // MARK: - Lifecycle logging
 
     func logProxyStarted(port: Int) {
@@ -770,6 +862,34 @@ actor ProxyEventLogger {
                 in: database
             )
 
+            try execute(
+                """
+                CREATE TABLE IF NOT EXISTS proxy_keepalives (
+                    id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    source_request_id TEXT NOT NULL,
+                    source_node_id TEXT NOT NULL,
+                    source_session TEXT NOT NULL,
+                    frontier_kind TEXT NOT NULL,
+                    frontier_descriptor TEXT,
+                    placeholder_inserted INTEGER NOT NULL DEFAULT 0,
+                    placeholder_tool_use_ids TEXT,
+                    upstream_status INTEGER,
+                    upstream_request_id TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_creation_tokens INTEGER,
+                    estimated_cost_usd REAL,
+                    succeeded INTEGER NOT NULL,
+                    failure_reason TEXT
+                );
+                """,
+                in: database
+            )
+
             // Indexes
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_requests_started_at ON proxy_requests(started_at);", in: database)
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_requests_session ON proxy_requests(session, started_at);", in: database)
@@ -785,6 +905,8 @@ actor ProxyEventLogger {
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_nodes_conversation ON proxy_nodes(conversation_id);", in: database)
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_nodes_parent ON proxy_nodes(parent_node_id);", in: database)
             try execute("CREATE INDEX IF NOT EXISTS idx_proxy_raw_request_response_captured_at ON proxy_raw_request_response(captured_at);", in: database)
+            try execute("CREATE INDEX IF NOT EXISTS idx_proxy_keepalives_started_at ON proxy_keepalives(started_at);", in: database)
+            try execute("CREATE INDEX IF NOT EXISTS idx_proxy_keepalives_conversation ON proxy_keepalives(conversation_id);", in: database)
         } catch {
             sqlite3_close(database)
             throw error
@@ -817,6 +939,7 @@ actor ProxyEventLogger {
         // proxy_request_content is CASCADE-deleted via proxy_requests FK.
         try executePrune("DELETE FROM proxy_requests WHERE started_at < ?;", cutoff: cutoff, in: database)
         try executePrune("DELETE FROM proxy_lifecycle WHERE ts < ?;", cutoff: cutoff, in: database)
+        try executePrune("DELETE FROM proxy_keepalives WHERE started_at < ?;", cutoff: cutoff, in: database)
         // Lineage mirror: in-memory `LineageTree.prune(...)` drives `pruneLineageMirror`
         // while the app is running, but after a restart the tree starts empty and
         // can no longer emit pruning IDs for rows left over from prior runs. Sweep
@@ -1204,6 +1327,11 @@ actor ProxyEventLogger {
 
     private func bind(_ value: Bool?, to index: Int32, in statement: OpaquePointer?) {
         bind(value.map { $0 ? 1 : 0 }, to: index, in: statement)
+    }
+
+    private func bind(_ value: Double, to index: Int32, in statement: OpaquePointer?) {
+        guard let statement else { return }
+        sqlite3_bind_double(statement, index, value)
     }
 
     private func errorMessage(from database: OpaquePointer) -> String {

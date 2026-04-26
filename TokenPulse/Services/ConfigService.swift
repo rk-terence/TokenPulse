@@ -64,6 +64,14 @@ final class ConfigService {
         didSet { save() }
     }
 
+    /// Manual keep-alive feature gate. Off by default per
+    /// `docs/proxy-keepalive.md`; the user opts in before any "activate
+    /// keep-alive" UI surfaces. When false, the popover hides keep-alive
+    /// menu entries entirely.
+    var keepaliveEnabled: Bool {
+        didSet { save() }
+    }
+
     /// Entries for the content blocklist. Each entry is a blocking keyword
     /// (plain case-insensitive substring, or `re:`-prefixed regex) plus an
     /// optional list of exception patterns. A request that matches a blocking
@@ -153,6 +161,7 @@ final class ConfigService {
         self.upstreamHTTPSProxyURL = loaded.config.upstreamHTTPSProxyURL
         self.saveProxyEventLog = loaded.config.saveProxyEventLog
         self.contentBlocklistEntries = loaded.config.contentBlocklistEntries
+        self.keepaliveEnabled = loaded.config.keepaliveEnabled
 
         // Persist migrated config if the on-disk version was outdated.
         if loaded.migrated {
@@ -189,8 +198,11 @@ final class ConfigService {
         /// `[String]`. Decoded on load and folded into `contentBlocklistEntries`
         /// with empty whitelists; never written back.
         var contentBlocklistKeywords: [String]?
-        // Retained for migration only — no longer written.
+        /// Manual keep-alive feature gate. Persisted only when true so older
+        /// installs migrate to the off-by-default behavior cleanly.
         var keepaliveEnabled: Bool?
+        // Reserved for the future automatic-keepalive iteration; no longer
+        // written by the manual MVP.
         var keepaliveIntervalSeconds: Int?
         var proxyInactivityTimeoutSeconds: Int?
         var saveProxyPayloads: Bool?
@@ -215,6 +227,7 @@ final class ConfigService {
         var upstreamHTTPSProxyURL: String
         var saveProxyEventLog: Bool
         var contentBlocklistEntries: [ContentBlocklistEntry]
+        var keepaliveEnabled: Bool
     }
 
     private static func load() -> LoadResult {
@@ -235,7 +248,8 @@ final class ConfigService {
                     upstreamHTTPProxyURL: "",
                     upstreamHTTPSProxyURL: "",
                     saveProxyEventLog: true,
-                    contentBlocklistEntries: []
+                    contentBlocklistEntries: [],
+                    keepaliveEnabled: false
                 ),
                 migrated: true
             )
@@ -275,7 +289,8 @@ final class ConfigService {
                 upstreamHTTPProxyURL: file.upstreamHTTPProxyURL ?? "",
                 upstreamHTTPSProxyURL: file.upstreamHTTPSProxyURL ?? "",
                 saveProxyEventLog: file.saveProxyEventLog ?? true,
-                contentBlocklistEntries: migratedBlocklistEntries
+                contentBlocklistEntries: migratedBlocklistEntries,
+                keepaliveEnabled: file.keepaliveEnabled ?? false
             ),
             migrated: needsMigration
         )
@@ -310,7 +325,7 @@ final class ConfigService {
             saveProxyEventLog: saveProxyEventLog,
             contentBlocklistEntries: contentBlocklistEntries.isEmpty ? nil : contentBlocklistEntries,
             contentBlocklistKeywords: nil,
-            keepaliveEnabled: nil,
+            keepaliveEnabled: keepaliveEnabled ? true : nil,
             keepaliveIntervalSeconds: nil,
             proxyInactivityTimeoutSeconds: nil,
             saveProxyPayloads: nil
