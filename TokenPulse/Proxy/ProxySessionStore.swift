@@ -56,8 +56,9 @@ actor ProxySessionStore {
     /// Final `ProxyRequestActivity` snapshot for every completed request that
     /// landed in the content tree. Keyed by request UUID, this preserves
     /// model name, byte counts, timing, cost, etc. so the UI can render a
-    /// full row for any tree node's requests. Entries are removed when the
-    /// corresponding request is pruned from the tree.
+    /// full row for any tree node's requests. Entries are removed when their
+    /// corresponding request ages out or its whole conversation tree is
+    /// evicted.
     private var treeDoneActivities: [UUID: ProxyRequestActivity] = [:]
 
     /// The in-memory content tree. Requests attach the moment their body is
@@ -242,8 +243,8 @@ actor ProxySessionStore {
         )
     }
 
-    /// Prune terminal requests and empty nodes from the content tree and
-    /// return the IDs removed so callers can mirror deletions to SQLite.
+    /// Prune terminal requests and inactive conversation trees, returning
+    /// the IDs removed so callers can mirror deletions to SQLite.
     func pruneContentTree(retention: TimeInterval) -> ContentTree.PruneResult {
         let result = contentTree.prune(retention: retention)
         for removed in result.removedRequestIDs {

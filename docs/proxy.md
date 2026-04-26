@@ -94,14 +94,14 @@ Attach is O(N) in the request's message count:
 3. If `k == N`, attach the request to the matched node (no new content).
 4. Otherwise, create a new child node whose `parentNodeID` is the match and whose `deltaMessages` is the suffix `messages[k..<N]`, and record the request on it.
 
-For OpenAI `previous_response_id` bodies with no messages, the tree force-links to the node whose request produced that response (via the `responseID → nodeID` index). Unknown `previous_response_id` falls through to the root node.
+For OpenAI `previous_response_id` bodies with no messages, the tree force-links to the node whose request produced that response (via the `responseID → nodeID` index). That index is tied to the conversation tree, not the short-lived request row, so lineage links keep working while the conversation remains active. Unknown `previous_response_id` falls through to the root node.
 
 ## Pruning
 
 - **Requests** prune 24 hours after `finishedAt`. In-flight requests (`finishedAt == nil`) never age out on their own — they finalize via the pipeline.
-- **Nodes** prune once they have no requests *and* no descendant nodes. Root nodes drop only when the conversation is being evicted.
-- **Conversations** evict once their root has no requests, no descendants, and no activity within the retention window.
-- Pruning is destructive in both memory and SQLite. A descendant that later reappears after its ancestor was pruned becomes a new root.
+- **Nodes** do not prune individually. They remain available for prefix matching and payload reconstruction while their conversation is active, even after the request rows attached to them age out.
+- **Conversations** evict as a whole once the conversation has no activity within the retention window and no in-flight requests.
+- Pruning is destructive in both memory and SQLite. After a whole conversation tree is evicted, a descendant that later reappears becomes a new root.
 
 ## Session retention and UI visibility
 
@@ -488,6 +488,7 @@ Legacy `proxyUpstreamURL` is still read during config migration and mapped to `a
 | `other` session retention | 5 minutes since last activity | `LocalProxyController.otherTrafficRetentionSeconds` |
 | Tracked session UI visibility | 10 minutes since last completion, or any in-flight request | `LocalProxyController.visibleSessionActivities(...)` |
 | Content-tree request retention | 24 hours since terminal finish time | `LocalProxyController.contentTreePruneRetention` + `ContentTree.prune(...)` |
+| Content-tree node retention | Whole active conversation tree; evicted after 24 hours without activity and no in-flight requests | `LocalProxyController.contentTreePruneRetention` + `ContentTree.prune(...)` |
 | Untracked / `other` done request retention | 5 minutes | `LocalProxyController.otherTrafficRetentionSeconds` + `ProxySessionStore.pruneStaleDoneRequests(...)` |
 | Event retention | 24 hours | `ProxyEventLogger.maxEventAge` |
 | Event prune pass | Opportunistic on write after 5 minutes have elapsed since the last prune | `ProxyEventLogger.pruneInterval` |

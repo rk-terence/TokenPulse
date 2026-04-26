@@ -467,21 +467,24 @@ struct ContentTree: Sendable {
         var removedRequestIDs: Set<UUID>
     }
 
-    /// Drop terminal requests older than `retention`, then cascade-remove
-    /// empty leaf nodes and conversations whose last activity predates the
-    /// cutoff. In-flight requests are never pruned regardless of age — they
-    /// finalize on their own schedule via `finishRequest`.
+    /// Drop terminal requests older than `retention`, then remove whole
+    /// conversation trees whose last activity predates the cutoff. Content
+    /// nodes are retained while their conversation is active so prefix
+    /// matching and `previous_response_id` lineage stay stable even after
+    /// individual request rows age out. In-flight requests are never pruned
+    /// regardless of age — they finalize on their own schedule via
+    /// `finishRequest`.
     mutating func prune(retention: TimeInterval, now: Date = Date()) -> PruneResult {
         var result = PruneResult(removedConversationIDs: [], removedNodeIDs: [], removedRequestIDs: [])
         let cutoff = now.addingTimeInterval(-retention)
-        let rootSet: Set<UUID> = Set(conversations.values.map { $0.rootNodeID })
 
-        for (id, request) in requests {
-            guard let finishedAt = request.finishedAt, finishedAt < cutoff else { continue }
-            requests.removeValue(forKey: id)
-            if let responseID = request.responseID {
-                responseIDIndex.removeValue(forKey: responseID)
-            }
+        let expiredRequestIDs = requests.compactMap { id, request -> UUID? in
+            guard let finishedAt = request.finishedAt, finishedAt < cutoff else { return nil }
+            return id
+        }
+
+        for id in expiredRequestIDs {
+            guard let request = requests.removeValue(forKey: id) else { continue }
             if var list = requestsByNode[request.nodeID] {
                 list.removeAll(where: { $0 == id })
                 if list.isEmpty {
@@ -493,49 +496,24 @@ struct ContentTree: Sendable {
             result.removedRequestIDs.insert(id)
         }
 
-        var changed = true
-        while changed {
-            changed = false
-            for (nodeID, node) in nodes {
-                if rootSet.contains(nodeID) { continue }
-                let hasRequests = !(requestsByNode[nodeID]?.isEmpty ?? true)
-                let hasChildren = !(childrenByNode[nodeID]?.isEmpty ?? true)
-                if hasRequests || hasChildren { continue }
-                if let parentID = node.parentNodeID,
-                   var siblings = childrenByNode[parentID] {
-                    siblings.removeAll(where: { $0 == nodeID })
-                    if siblings.isEmpty {
-                        childrenByNode.removeValue(forKey: parentID)
-                    } else {
-                        childrenByNode[parentID] = siblings
-                    }
-                }
-                childrenByNode.removeValue(forKey: nodeID)
-                if let convKey = conversationKey(forConversationID: node.conversationID) {
-                    nodesByHash[convKey]?.removeValue(forKey: node.cumulativeHash)
-                }
-                nodes.removeValue(forKey: nodeID)
-                result.removedNodeIDs.insert(nodeID)
-                changed = true
-            }
-        }
-
-        for (key, conversation) in conversations {
+        for (key, conversation) in Array(conversations) {
             guard let root = nodes[conversation.rootNodeID] else {
                 conversations.removeValue(forKey: key)
                 nodesByHash.removeValue(forKey: key)
                 result.removedConversationIDs.insert(conversation.id)
                 continue
             }
-            let rootRequests = requestsByNode[conversation.rootNodeID] ?? []
-            let rootChildren = childrenByNode[conversation.rootNodeID] ?? []
-            if rootRequests.isEmpty && rootChildren.isEmpty && conversation.lastActivityAt < cutoff {
-                nodes.removeValue(forKey: root.id)
-                result.removedNodeIDs.insert(root.id)
-                nodesByHash.removeValue(forKey: key)
-                conversations.removeValue(forKey: key)
-                result.removedConversationIDs.insert(conversation.id)
-            }
+            guard conversation.lastActivityAt < cutoff else { continue }
+
+            let nodeIDs = subtreeNodeIDs(rootedAt: root.id)
+            guard !subtreeContainsInFlightRequest(nodeIDs: nodeIDs) else { continue }
+
+            removeConversationTree(
+                key: key,
+                conversationID: conversation.id,
+                nodeIDs: nodeIDs,
+                result: &result
+            )
         }
 
         return result
@@ -641,8 +619,50 @@ struct ContentTree: Sendable {
         }
     }
 
-    private func conversationKey(forConversationID id: UUID) -> ConversationKey? {
-        conversations.values.first(where: { $0.id == id })?.key
+    private func subtreeNodeIDs(rootedAt rootID: UUID) -> Set<UUID> {
+        var result: Set<UUID> = []
+        var stack = [rootID]
+        while let current = stack.popLast() {
+            guard result.insert(current).inserted else { continue }
+            stack.append(contentsOf: childrenByNode[current] ?? [])
+        }
+        return result
+    }
+
+    private func subtreeContainsInFlightRequest(nodeIDs: Set<UUID>) -> Bool {
+        for nodeID in nodeIDs {
+            for requestID in requestsByNode[nodeID] ?? [] {
+                guard let request = requests[requestID] else { continue }
+                if request.finishedAt == nil {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    private mutating func removeConversationTree(
+        key: ConversationKey,
+        conversationID: UUID,
+        nodeIDs: Set<UUID>,
+        result: inout PruneResult
+    ) {
+        for nodeID in nodeIDs {
+            for requestID in requestsByNode[nodeID] ?? [] {
+                requests.removeValue(forKey: requestID)
+                result.removedRequestIDs.insert(requestID)
+            }
+            requestsByNode.removeValue(forKey: nodeID)
+            childrenByNode.removeValue(forKey: nodeID)
+            if nodes.removeValue(forKey: nodeID) != nil {
+                result.removedNodeIDs.insert(nodeID)
+            }
+        }
+
+        responseIDIndex = responseIDIndex.filter { !nodeIDs.contains($0.value) }
+        nodesByHash.removeValue(forKey: key)
+        conversations.removeValue(forKey: key)
+        result.removedConversationIDs.insert(conversationID)
     }
 
     private static func encodeDeltaMessagesJSON(_ messages: [NormalizedMessage]) -> String {
