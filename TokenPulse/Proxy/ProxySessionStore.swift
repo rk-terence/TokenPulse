@@ -18,6 +18,7 @@ actor ProxySessionStore {
 
     struct Session: Sendable {
         var sessionID: String
+        var startedAt: Date
         var lastSeenAt: Date
         var lastRequestDoneAt: Date?
         var inFlightRequestCount: Int
@@ -33,6 +34,7 @@ actor ProxySessionStore {
     /// A snapshot of a session's stats and its currently active requests, for UI display.
     struct SessionSnapshot: Sendable {
         let sessionID: String
+        let startedAt: Date
         let lastSeenAt: Date
         let lastRequestDoneAt: Date?
         let completedRequestCount: Int
@@ -143,6 +145,7 @@ actor ProxySessionStore {
         } else {
             let session = Session(
                 sessionID: sessionID,
+                startedAt: now,
                 lastSeenAt: now,
                 lastRequestDoneAt: nil,
                 inFlightRequestCount: 0,
@@ -459,8 +462,7 @@ actor ProxySessionStore {
 
     // MARK: - Snapshot
 
-    /// Return a snapshot of all sessions with their stats and in-flight requests,
-    /// sorted by most-recently-seen first.
+    /// Return a snapshot of all sessions with their stats and in-flight requests.
     func snapshotSessionActivities() -> [SessionSnapshot] {
         var activeRequestsBySession: [String: [ProxyRequestActivity]] = [:]
         for (_, entry) in activeRequests {
@@ -518,6 +520,7 @@ actor ProxySessionStore {
         return sessions.values.map { session in
             SessionSnapshot(
                 sessionID: session.sessionID,
+                startedAt: session.startedAt,
                 lastSeenAt: session.lastSeenAt,
                 lastRequestDoneAt: session.lastRequestDoneAt,
                 completedRequestCount: session.completedRequestCount,
@@ -532,7 +535,10 @@ actor ProxySessionStore {
                 estimatedCostUSD: session.estimatedCostUSD
             )
         }.sorted {
-            $0.lastSeenAt > $1.lastSeenAt
+            if $0.startedAt != $1.startedAt {
+                return $0.startedAt < $1.startedAt
+            }
+            return $0.sessionID < $1.sessionID
         }
     }
 

@@ -20,6 +20,7 @@ final class LocalProxyController {
 
     struct SessionActivity: Sendable, Identifiable {
         let sessionID: String
+        let startedAt: Date
         let completedRequests: Int
         let erroredRequests: Int
         let activeRequests: [ProxyRequestActivity]
@@ -662,6 +663,7 @@ final class LocalProxyController {
 
             result.append(SessionActivity(
                 sessionID: snap.sessionID,
+                startedAt: snap.startedAt,
                 completedRequests: snap.completedRequestCount,
                 erroredRequests: snap.erroredRequestCount,
                 activeRequests: visibleActive,
@@ -673,6 +675,16 @@ final class LocalProxyController {
                 estimatedCostUSD: snap.estimatedCostUSD
             ))
         }
+        result.sort { lhs, rhs in
+            if lhs.isOtherTraffic != rhs.isOtherTraffic {
+                return lhs.isOtherTraffic
+            }
+            if lhs.startedAt != rhs.startedAt {
+                return lhs.startedAt < rhs.startedAt
+            }
+            return lhs.sessionID < rhs.sessionID
+        }
+
         return (activities: result, activeSessionCount: activeSessionCount, stalledHideIDs: stalledHideIDs)
     }
 }
