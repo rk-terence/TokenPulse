@@ -94,7 +94,6 @@ struct PopoverView: View {
         }
         .padding(12)
         .frame(width: Self.popoverWidth)
-        .background(.thinMaterial)
     }
 
 }
