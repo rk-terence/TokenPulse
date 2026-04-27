@@ -705,6 +705,11 @@ private struct SessionActivityRow: View {
                     font: .callout.monospaced()
                 )
             }
+            if let quality = latestKeepaliveCacheQuality {
+                Text(verbatim: localizedCacheQuality(quality))
+                    .font(.callout.monospaced())
+                    .foregroundStyle(.tertiary)
+            }
             Spacer()
             if let lastWarmAt = activity.lastKeepaliveAt {
                 TimelineView(.periodic(from: lastWarmAt, by: 1)) { context in
@@ -719,6 +724,37 @@ private struct SessionActivityRow: View {
                     .foregroundStyle(.tertiary)
             }
         }
+    }
+
+    private var latestKeepaliveCacheQuality: (read: Double, creation: Double)? {
+        activity.keepaliveSelections
+            .filter { $0.lastWarmCacheReadPercentage != nil || $0.lastWarmCacheCreationPercentage != nil }
+            .sorted { ($0.lastWarmAt ?? .distantPast) > ($1.lastWarmAt ?? .distantPast) }
+            .first
+            .map {
+                (
+                    read: $0.lastWarmCacheReadPercentage ?? 0,
+                    creation: $0.lastWarmCacheCreationPercentage ?? 0
+                )
+            }
+    }
+
+    private func localizedCacheQuality(_ quality: (read: Double, creation: Double)) -> String {
+        let format = NSLocalizedString(
+            "proxy.keepalive.cacheQuality",
+            value: "cache %@/%@",
+            comment: "Proxy keep-alive footer cache quality: cache-read percent / cache-creation percent"
+        )
+        return String(
+            format: format,
+            locale: Locale.current,
+            percentString(quality.read),
+            percentString(quality.creation)
+        )
+    }
+
+    private func percentString(_ value: Double) -> String {
+        String(format: "%.0f%%", max(0, value) * 100)
     }
 
     private func sendKeepaliveForSelectedConversations() {

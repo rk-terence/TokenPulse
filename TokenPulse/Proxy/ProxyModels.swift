@@ -788,6 +788,33 @@ struct TokenUsage: Sendable {
                                   inputTokensIncludeCacheReads: false,
                                   stopReason: nil)
 
+    var hasParseableUsage: Bool {
+        inputTokens != nil
+            || outputTokens != nil
+            || cacheReadInputTokens != nil
+            || cacheCreationInputTokens != nil
+            || webSearchCalls > 0
+            || webFetchCalls > 0
+    }
+
+    func cacheQualityPercentages(apiFlavor: ProxyAPIFlavor) -> (read: Double, creation: Double)? {
+        let cacheReadTokens = max(0, cacheReadInputTokens ?? 0)
+        let cacheCreationTokens = max(0, cacheCreationInputTokens ?? 0)
+        let denominator: Int
+        switch apiFlavor {
+        case .anthropicMessages:
+            denominator = max(0, inputTokens ?? 0) + cacheReadTokens + cacheCreationTokens
+        case .openAIResponses:
+            let readDenominator = inputTokensIncludeCacheReads ? 0 : cacheReadTokens
+            denominator = max(0, inputTokens ?? 0) + readDenominator + cacheCreationTokens
+        }
+        guard denominator > 0 else { return nil }
+        return (
+            read: Double(cacheReadTokens) / Double(denominator),
+            creation: Double(cacheCreationTokens) / Double(denominator)
+        )
+    }
+
     /// Compute the estimated cost (USD) using the given pricing rates.
     func cost(for pricing: ModelPricing, apiFlavor: ProxyAPIFlavor) -> Double {
         let cachedInputTokens = max(0, cacheReadInputTokens ?? 0)

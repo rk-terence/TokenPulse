@@ -39,7 +39,7 @@ ditto dist/TokenPulse.app ~/Applications/TokenPulse.app
 - Use conventional commits: `feat: short description`, `fix: short description`, `docs: short description`, and similar.
 
 > For Codex:
-> - When spawning subagents, set the model to `gpt-5.4`. Choose the reasoning effort level to fit the task.
+> - When spawning subagents, set the model to `gpt-5.5`. Choose the reasoning effort level to fit the task.
 
 ## Product invariants
 

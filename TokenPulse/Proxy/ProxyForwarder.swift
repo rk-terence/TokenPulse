@@ -208,12 +208,25 @@ final class ProxyForwarder: Sendable {
         // body has been parsed. Utility requests such as token counting are
         // forwarded and logged but do not become conversation nodes.
         if operation.tracksLineage, let fingerprint {
+            let keepaliveSource: ProxySessionStore.KeepaliveExchange?
+            if apiFlavor == .anthropicMessages {
+                keepaliveSource = ProxySessionStore.KeepaliveExchange(
+                    requestHeaders: requestLog.headers,
+                    requestBody: requestLog.body,
+                    responseStreaming: nil,
+                    responseBody: nil,
+                    recordedAt: Date()
+                )
+            } else {
+                keepaliveSource = nil
+            }
             await sessionStore.attachToTree(
                 requestID: requestID,
                 sessionID: sessionID,
                 fingerprint: fingerprint,
                 messages: normalizedMessages,
-                previousResponseID: previousResponseID
+                previousResponseID: previousResponseID,
+                keepaliveSource: keepaliveSource
             )
         }
 
@@ -280,6 +293,7 @@ final class ProxyForwarder: Sendable {
         var upstreamStatusCode = 0
         var capturedResponseHeaders: [(name: String, value: String)] = []
         let shouldCaptureResponseBody = eventLogger != nil
+        let shouldCaptureKeepaliveResponse = apiFlavor == .anthropicMessages && operation.tracksLineage
         var capturedResponseBody = Data()
         var capturedRawResponseBody = Data()
         var capturedResponseBytes = 0
@@ -348,6 +362,8 @@ final class ProxyForwarder: Sendable {
                             maxBytes: Self.maxLoggedStreamingResponseBytes
                         )
                         capturedRawResponseBody.append(chunk)
+                    } else if shouldCaptureKeepaliveResponse {
+                        capturedRawResponseBody.append(chunk)
                     }
                     // Tail ring buffer for terminal-signal parsing. Appended
                     // unconditionally and trimmed so the tail never exceeds
@@ -405,33 +421,29 @@ final class ProxyForwarder: Sendable {
                 && operation.requiresTerminalSignal
                 && !apiHandler.isResponseComplete(tokenUsage)
             let errored = isUpstreamError || isIncomplete
+            let completedKeepaliveExchange: ProxySessionStore.KeepaliveExchange?
+            if !errored,
+               shouldCaptureKeepaliveResponse,
+               !capturedRawResponseBody.isEmpty {
+                completedKeepaliveExchange = ProxySessionStore.KeepaliveExchange(
+                    requestHeaders: requestLog.headers,
+                    requestBody: requestLog.body,
+                    responseStreaming: true,
+                    responseBody: capturedRawResponseBody,
+                    recordedAt: Date()
+                )
+            } else {
+                completedKeepaliveExchange = nil
+            }
             await sessionStore.finishTrackedRequest(
                 requestID: requestID,
                 succeeded: !errored,
                 tokenUsage: tokenUsage,
-                responseID: responseID
+                responseID: responseID,
+                completedKeepaliveExchange: completedKeepaliveExchange
             )
             let lineageContext = await sessionStore.lineageContext(for: requestID)
             await sessionStore.markRequestDone(id: requestID, errored: errored, tokenUsage: tokenUsage, estimatedCost: requestCost)
-            // Cache successful Anthropic generations as keep-alive activation
-            // candidates. Phase 5 (UI activation) consults this ring; the
-            // raw response carries the assistant turn the synthesizer
-            // appends as the warm frontier.
-            if !errored,
-               apiFlavor == .anthropicMessages,
-               operation.tracksLineage,
-               !capturedRawResponseBody.isEmpty {
-                await sessionStore.recordKeepaliveCandidate(
-                    forRequestID: requestID,
-                    exchange: ProxySessionStore.KeepaliveExchange(
-                        requestHeaders: requestLog.headers,
-                        requestBody: requestLog.body,
-                        responseStreaming: true,
-                        responseBody: capturedRawResponseBody,
-                        recordedAt: Date()
-                    )
-                )
-            }
             let errorString: String?
             if isIncomplete {
                 errorString = "incomplete response (no terminal signal)"
@@ -633,32 +645,30 @@ final class ProxyForwarder: Sendable {
                     && !apiHandler.isResponseComplete(tokenUsage)
                 let requestErrored = isUpstreamError || isIncomplete
                 errored = requestErrored
-                await sessionStore.finishTrackedRequest(
-                    requestID: requestID,
-                    succeeded: !requestErrored,
-                    tokenUsage: tokenUsage,
-                    responseID: responseID
-                )
-                let lineageContext = await sessionStore.lineageContext(for: requestID)
-                await sessionStore.markRequestDone(id: requestID, errored: requestErrored, tokenUsage: tokenUsage, estimatedCost: requestCost)
-                // Cache successful Anthropic generations as keep-alive
-                // activation candidates (non-streaming variant). See the
-                // streaming hook for the rationale.
+                let completedKeepaliveExchange: ProxySessionStore.KeepaliveExchange?
                 if !requestErrored,
                    apiFlavor == .anthropicMessages,
                    operation.tracksLineage,
                    !responseData.isEmpty {
-                    await sessionStore.recordKeepaliveCandidate(
-                        forRequestID: requestID,
-                        exchange: ProxySessionStore.KeepaliveExchange(
-                            requestHeaders: requestLog.headers,
-                            requestBody: requestLog.body,
-                            responseStreaming: false,
-                            responseBody: responseData,
-                            recordedAt: Date()
-                        )
+                    completedKeepaliveExchange = ProxySessionStore.KeepaliveExchange(
+                        requestHeaders: requestLog.headers,
+                        requestBody: requestLog.body,
+                        responseStreaming: false,
+                        responseBody: responseData,
+                        recordedAt: Date()
                     )
+                } else {
+                    completedKeepaliveExchange = nil
                 }
+                await sessionStore.finishTrackedRequest(
+                    requestID: requestID,
+                    succeeded: !requestErrored,
+                    tokenUsage: tokenUsage,
+                    responseID: responseID,
+                    completedKeepaliveExchange: completedKeepaliveExchange
+                )
+                let lineageContext = await sessionStore.lineageContext(for: requestID)
+                await sessionStore.markRequestDone(id: requestID, errored: requestErrored, tokenUsage: tokenUsage, estimatedCost: requestCost)
                 let responseLog = ProxyEventLogger.LoggedResponse(
                     statusCode: httpResponse.statusCode,
                     headers: ProxyHTTPUtils.allHeaders(from: httpResponse),
@@ -854,12 +864,13 @@ final class ProxyForwarder: Sendable {
 
     // MARK: - Keep-alive warm request
 
-    /// Send one synthesized warm request for the given conversation. The
-    /// request is built from the anchored exchange (cached at activation
-    /// time) and goes upstream with the same headers as the source. Unlike
-    /// `forward(...)` it bypasses the content tree, the organic session
-    /// totals, and the per-request UI activity row — its outcome lives only
-    /// in the conversation's `KeepaliveSelection` stats.
+    /// Send one warm request for the given conversation. The body is built
+    /// from the latest source on the selected path: completed sources use
+    /// response-frontier synthesis, active sources use exact replay of the
+    /// observed request body. Unlike `forward(...)` it bypasses the content
+    /// tree, the organic session totals, and the per-request UI activity row
+    /// — its outcome lives only in the conversation's `KeepaliveSelection`
+    /// stats.
     ///
     /// No-op for non-Anthropic forwarders or when the selection has been
     /// dropped (e.g. auto-deactivated mid-click).
@@ -872,21 +883,31 @@ final class ProxyForwarder: Sendable {
         let attemptID = UUID()
         let startedAt = Date()
 
-        guard let selection = await sessionStore.keepaliveSelection(forConversationID: conversationID),
-              let exchange = await sessionStore.anchoredKeepaliveExchange(forConversationID: conversationID) else {
+        guard let source = await sessionStore.keepaliveWarmSource(forConversationID: conversationID) else {
             // Selection has been dropped (race with auto-deactivation or
             // user-deactivation). Nothing to attribute, nothing to audit.
             return
         }
+        let selection = source.selection
+        let exchange = source.exchange
 
         // Synthesize the warm body. On refusal, record outcome + audit row
         // with frontier_kind="refused" and the spec-defined reason.
         let plan: KeepaliveSynthesizer.Plan
-        switch KeepaliveSynthesizer.synthesize(
-            sourceRequestBody: exchange.requestBody,
-            sourceResponse: exchange.responseBody,
-            sourceWasStreaming: exchange.responseStreaming
-        ) {
+        let outcome: KeepaliveSynthesizer.Outcome
+        if selection.latestSourceIsActive {
+            outcome = KeepaliveSynthesizer.exactReplay(observedRequestBody: exchange.requestBody)
+        } else if let responseBody = exchange.responseBody,
+                  let responseStreaming = exchange.responseStreaming {
+            outcome = KeepaliveSynthesizer.synthesize(
+                sourceRequestBody: exchange.requestBody,
+                sourceResponse: responseBody,
+                sourceWasStreaming: responseStreaming
+            )
+        } else {
+            outcome = .refused(.sourceResponseUnparseable)
+        }
+        switch outcome {
         case .plan(let value):
             plan = value
         case .refused(let reason):
@@ -988,7 +1009,7 @@ final class ProxyForwarder: Sendable {
             let upstreamRequestID = ProxyHTTPUtils.allHeaders(from: httpResponse)
                 .first(where: { $0.name.caseInsensitiveCompare("request-id") == .orderedSame
                     || $0.name.caseInsensitiveCompare("x-request-id") == .orderedSame })?.value
-            if httpResponse.statusCode >= 400 {
+            if !(200..<300).contains(httpResponse.statusCode) {
                 await recordKeepaliveOutcome(
                     attemptID: attemptID, startedAt: startedAt, selection: selection,
                     frontierKind: plan.frontierKind.rawValue,
@@ -1005,6 +1026,22 @@ final class ProxyForwarder: Sendable {
                 return
             }
             let usage = apiHandler.parseTokenUsage(from: data, streaming: false)
+            guard usage.hasParseableUsage else {
+                await recordKeepaliveOutcome(
+                    attemptID: attemptID, startedAt: startedAt, selection: selection,
+                    frontierKind: plan.frontierKind.rawValue,
+                    frontierDescriptor: plan.frontierDescriptor,
+                    placeholderInserted: plan.placeholderToolResultsInserted,
+                    placeholderIDs: plan.placeholderToolUseIDs,
+                    upstreamStatus: httpResponse.statusCode,
+                    upstreamRequestID: upstreamRequestID,
+                    usage: nil, cost: 0,
+                    succeeded: false,
+                    reason: "usage_unparseable",
+                    sessionStore: sessionStore
+                )
+                return
+            }
             let cost = usage.estimatedCost(
                 for: ModelPricingTable.pricing(for: ProxyRequestBody.model(from: plan.body)),
                 apiFlavor: apiFlavor
@@ -1068,16 +1105,18 @@ final class ProxyForwarder: Sendable {
             conversationID: selection.conversationID,
             succeeded: succeeded,
             estimatedCostUSD: cost,
-            failureReason: reason
+            failureReason: reason,
+            cacheReadPercentage: usage?.cacheQualityPercentages(apiFlavor: apiFlavor)?.read,
+            cacheCreationPercentage: usage?.cacheQualityPercentages(apiFlavor: apiFlavor)?.creation
         )
         await eventLogger?.logKeepaliveAttempt(ProxyEventLogger.KeepaliveAttempt(
             id: attemptID,
             startedAt: startedAt,
             completedAt: Date(),
             conversationID: selection.conversationID,
-            sourceRequestID: selection.requestID,
-            sourceNodeID: selection.nodeID,
-            sourceSession: selection.sessionID,
+            sourceRequestID: selection.latestSourceRequestID,
+            sourceNodeID: selection.latestSourceNodeID,
+            sourceSession: selection.latestSourceSessionID,
             frontierKind: frontierKind,
             frontierDescriptor: frontierDescriptor,
             placeholderInserted: placeholderInserted,

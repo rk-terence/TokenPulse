@@ -138,12 +138,16 @@ enum KeepaliveSynthesizer {
     /// has already arrived — the body is the exact frontier and shouldn't
     /// be reconstructed.
     static func exactReplay(observedRequestBody: Data) -> Outcome {
-        guard jsonObject(observedRequestBody) != nil else {
+        guard var body = jsonObject(observedRequestBody) else {
+            return .refused(.sourceBodyUnparseable)
+        }
+        body["stream"] = false
+        guard let serialized = serialize(body) else {
             return .refused(.sourceBodyUnparseable)
         }
         return .plan(Plan(
             frontierKind: .exactReplay,
-            body: observedRequestBody,
+            body: serialized,
             frontierDescriptor: "exact_replay",
             placeholderToolResultsInserted: false,
             placeholderToolUseIDs: []

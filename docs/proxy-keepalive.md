@@ -15,7 +15,7 @@ The first iteration of keep-alive ships as a manual MVP:
 - Anthropic Messages only
 - Claude Code sessions only (Anthropic-flavored sessions in the proxy)
 - one selected lineage path per conversation; activating on a new request replaces the previous selection for that conversation
-- visible in the proxy UI as the **orange leaf indicator** on the selected done row, plus a per-session footer carrying the warm-cost subtotal and the time since the last warm request
+- visible in the proxy UI as the **orange leaf indicator** on the selected done row, plus a per-session footer carrying the warm-cost subtotal, last warm cache-read/cache-creation percentages, and the time since the last warm request
 - excluded from the content tree as real conversation work — synthetic warm requests never become tree nodes
 - logged and costed separately from organic requests via the `proxy_keepalives` SQLite table (event-log schema v7) and the conversation's `KeepaliveSelection.cumulativeCostUSD`
 
@@ -69,14 +69,22 @@ A request is eligible for manual keep-alive activation only when all of these ar
 
 `ProxySessionStore.activateKeepalive(forRequestID:)` enforces these and returns one of:
 
-- `.activated(KeepaliveSelection)` — the selection is anchored, the cached exchange is pinned, and the lineage path is now warmable.
+- `.activated(KeepaliveSelection)` — the selected path is activated at the chosen done request, the cached exchange is retained by request ID, and the lineage path is now warmable.
 - `.unknownRequest` — the request is not in the in-memory tree (never attached, or pruned).
 - `.requestStillInFlight` — the request hasn't finished.
 - `.requestErrored` — the request finished but didn't succeed.
 - `.unsupportedFlavor` — the conversation isn't Anthropic Messages.
 - `.sourceBodyUnavailable` — the request was successful but its raw exchange has rolled out of the recent-exchange ring.
 
-Once activated, every subsequent warm request goes through `KeepaliveSynthesizer.synthesize(...)` which can refuse to build a body for these reasons:
+After activation, the source follows the chosen lineage path:
+
+- While there is no active successor, the current selected done request is the latest source. Warm requests use its observed request body plus response body to synthesize the next frontier.
+- When exactly one active successor appears under the selected done request, the selection remains active and the warm source moves to that active request's observed request body and headers. There is no response frontier yet, so warm requests use exact replay of that body with `stream: false`.
+- When that active successor succeeds, the orange selected-row indicator advances to the new done request and future warm requests synthesize from the new request/response exchange.
+- When that active successor fails or is cancelled, the selection stays on the prior successful done request.
+- When more than one active successor appears under the selected done request, the path is considered branched and keep-alive is auto-deactivated for that conversation.
+
+Warm requests based on a completed source go through `KeepaliveSynthesizer.synthesize(...)` which can refuse to build a body for these reasons:
 
 - the source response was structurally unparseable
 - the source response carried a non-completing `stop_reason` (`max_tokens`, `stop_sequence`, `refusal`, or absent)
@@ -141,9 +149,9 @@ When Claude Code later sends the real organic request, that request should reuse
 
 ## Exact replay
 
-`KeepaliveSynthesizer.exactReplay(observedRequestBody:)` accepts a previously-observed organic request body and wraps it as a `Plan` with `frontierKind == .exactReplay`. The intended use is to replay a body that already resolves the prior `tool_use` (so reconstruction is unnecessary).
+`KeepaliveSynthesizer.exactReplay(observedRequestBody:)` accepts a previously-observed organic request body and wraps it as a `Plan` with `frontierKind == .exactReplay`, forcing `stream: false` so the warm response is parseable as JSON usage. The intended use is to replay a body that already resolves the prior `tool_use` (so reconstruction is unnecessary), or to warm from the latest active request body before a response frontier exists.
 
-The MVP does not yet auto-route to this path — every manual warm request goes through `synthesize(...)`. Wiring exact replay to follow-up organic requests is future work and lives behind issue #4's "automatic keep-alive" track.
+Manual warm requests route to exact replay only while the latest keep-alive path source is active. Completed sources still use frontier synthesis.
 
 # Timing
 
@@ -151,7 +159,7 @@ The MVP fires warm requests synchronously in response to the user's "Send keep-a
 
 Auto-deactivation is automatic, however, and runs in the session store:
 
-- **Path branched** — when a node has more than one in-flight successor in the lineage tree, the conversation's selection is dropped. Detected during `attachToTree`.
+- **Path branched** — when the selected done request has more than one in-flight descendant in the lineage tree, the conversation's selection is dropped. Detected during `attachToTree`.
 - **Pruned** — when the source request, node, or conversation is removed by the 24-hour content-tree prune cycle, the selection is dropped.
 - **Source session expired** — when the source session bucket expires, the selection is dropped.
 
@@ -180,9 +188,10 @@ The session keep-alive footer renders below the row list when the session has at
 
 - the literal label `keep-alive` in orange
 - the cumulative warm-cost subtotal (only when > 0)
+- the most recent successful warm request's cache quality as compact cache-read/cache-creation percentages. For Anthropic, the denominator is `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` because cached input tokens are reported separately.
 - the time since the most recent successful or failed warm, formatted with `compactElapsed` (the same 4-character format the per-request age timer uses); `--:--` placeholder when no warm has been sent yet
 
-Right-click context menus on done request rows expose **Activate keep-alive** (when no selection is anchored on this leaf) or **Send keep-alive** / **Stop keep-alive** (when this row is the selected leaf). The session header menu adds matching **Send keep-alive** / **Stop keep-alive** entries beside **Hide session** when at least one selection exists in the session. The **Activate** entry is gated on `ConfigService.keepaliveEnabled`; **Send** / **Stop** stay visible for already-anchored selections so a user who toggles the global flag off can still wind down.
+Right-click context menus on done request rows expose **Activate keep-alive** (when no selection is active on this leaf) or **Send keep-alive** / **Stop keep-alive** (when this row is the selected leaf). The session header menu adds matching **Send keep-alive** / **Stop keep-alive** entries beside **Hide session** when at least one selection exists in the session. The **Activate** entry is gated on `ConfigService.keepaliveEnabled`; **Send** / **Stop** stay visible for already-active selections so a user who toggles the global flag off can still wind down.
 
 # Logging
 

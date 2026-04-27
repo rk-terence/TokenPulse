@@ -264,10 +264,10 @@ Keep-alive (cache-warming replay requests) ships as a manual MVP. Full spec — 
 
 In summary:
 
-- The user activates keep-alive by right-clicking a recent successful Anthropic done request in the proxy popover. `ProxySessionStore.activateKeepalive(forRequestID:)` anchors the conversation's selection and pins the cached upstream exchange (request body + headers + raw response) so the warm forwarder can rebuild a body later.
-- Each "Send keep-alive" click runs `KeepaliveSynthesizer.synthesize(...)` to build a warm body that extends the source response's frontier with `cache_control` placed on the last assistant text or `tool_use` block, then calls `ProxyForwarder.sendKeepaliveWarmRequest(...)`. Warm requests bypass `attachToTree`, organic session totals, and the per-request UI activity row.
-- Outcomes are recorded on `KeepaliveSelection` (cumulative cost, age timer) and audited in the `proxy_keepalives` SQLite table.
-- Auto-deactivation drops the selection when the lineage path branches, when the source request/node/conversation is pruned, or when the source session expires; each fires `LocalProxyController.onKeepaliveDeactivated` which the AppDelegate forwards to `NotificationService.sendProxyKeepaliveDisabled`.
+- The user activates keep-alive by right-clicking a recent successful Anthropic done request in the proxy popover. `ProxySessionStore.activateKeepalive(forRequestID:)` activates the conversation's selected path at that request and retains source exchanges by request ID.
+- Each "Send keep-alive" click uses the latest source on the selected path. Done sources run `KeepaliveSynthesizer.synthesize(...)` to extend the source response frontier with `cache_control` on the last assistant text or `tool_use` block. Active sources run exact replay of the latest observed request body with `stream: false`, because no response frontier exists yet. Warm requests bypass `attachToTree`, organic session totals, and the per-request UI activity row.
+- Outcomes are recorded on `KeepaliveSelection` (cumulative cost, age timer, last cache-read/cache-creation percentages) and audited in the `proxy_keepalives` SQLite table.
+- Auto-deactivation drops the selection when the selected path branches with more than one active successor, when the source request/node/conversation is pruned, or when the source session expires; each fires `LocalProxyController.onKeepaliveDeactivated` which the AppDelegate forwards to `NotificationService.sendProxyKeepaliveDisabled`.
 
 Manual-only by design. Automatic timer-driven keep-alive is future work.
 
