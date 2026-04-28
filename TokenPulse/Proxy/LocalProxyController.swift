@@ -34,6 +34,11 @@ final class LocalProxyController {
         /// case; one entry when the user has activated keep-alive on a
         /// request whose conversation is anchored in this session.
         let keepaliveSelections: [ProxySessionStore.KeepaliveSelection]
+        /// Cumulative warm-request cost from the per-session history bucket.
+        /// Persists across stop/restart cycles.
+        let keepaliveCostUSD: Double
+        /// Total completed warm attempts from the per-session history bucket.
+        let keepaliveDoneCount: Int
 
         var id: String { sessionID }
         var apiFlavor: ProxyAPIFlavor? { ProxySessionID.flavor(for: sessionID) }
@@ -44,21 +49,23 @@ final class LocalProxyController {
             ProxySessionID.isOther(sessionID) ? displayID : shortID
         }
         var isOtherTraffic: Bool { ProxySessionID.isOther(sessionID) }
-        /// Sum of cumulative warm-request cost across this session's
-        /// selections. Zero when the session has no active selection.
-        var keepaliveCostUSD: Double {
-            keepaliveSelections.reduce(0) { $0 + $1.cumulativeCostUSD }
-        }
-        /// Most recent successful or failed warm-request timestamp across
-        /// this session's selections. Nil when no warm has been sent yet.
-        var lastKeepaliveAt: Date? {
-            keepaliveSelections.compactMap(\.lastWarmAt).max()
+        /// True while any selection in this session has a warm mid-dispatch.
+        /// Drives menu disable + the SwiftUI animation hooks on the warm row.
+        var hasKeepaliveInFlight: Bool {
+            keepaliveSelections.contains { $0.inFlightWarmRequestID != nil }
         }
         /// True when at least one selection in this session points at the
         /// given request — used by the row UI to draw the orange leaf
         /// indicator.
         func isKeepaliveLeaf(requestID: UUID) -> Bool {
             keepaliveSelections.contains { $0.requestID == requestID }
+        }
+        /// True when this conversation already has a warm in flight, so the
+        /// row context menu can disable Send keep-alive on a per-row basis.
+        func isKeepaliveInFlight(forConversationID conversationID: UUID) -> Bool {
+            keepaliveSelections.contains {
+                $0.conversationID == conversationID && $0.inFlightWarmRequestID != nil
+            }
         }
     }
 
@@ -652,8 +659,16 @@ final class LocalProxyController {
 
         for snap in snapshots {
             let sortedActive = snap.activeRequests.sorted { $0.startedAt > $1.startedAt }
-            let sortedDone = snap.doneRequests.sorted {
-                ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt)
+            // Organic done rows sort newest-first; the latest done warm is
+            // pinned to the very bottom of the list so it doesn't intermix
+            // with organic regardless of which finished more recently.
+            let sortedDone = snap.doneRequests.sorted { lhs, rhs in
+                let lhsIsWarm = lhs.kind == .keepalive
+                let rhsIsWarm = rhs.kind == .keepalive
+                if lhsIsWarm != rhsIsWarm {
+                    return rhsIsWarm
+                }
+                return (lhs.completedAt ?? lhs.startedAt) > (rhs.completedAt ?? rhs.startedAt)
             }
 
             // Check if this session is hidden, and if so whether new activity resurfaces it.
@@ -703,7 +718,9 @@ final class LocalProxyController {
                 totalCacheReadInputTokens: snap.totalCacheReadInputTokens,
                 totalCacheCreationInputTokens: snap.totalCacheCreationInputTokens,
                 estimatedCostUSD: snap.estimatedCostUSD,
-                keepaliveSelections: snap.keepaliveSelections
+                keepaliveSelections: snap.keepaliveSelections,
+                keepaliveCostUSD: snap.keepaliveCostUSD,
+                keepaliveDoneCount: snap.keepaliveDoneCount
             ))
         }
         result.sort { lhs, rhs in

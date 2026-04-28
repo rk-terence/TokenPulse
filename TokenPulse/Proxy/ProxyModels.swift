@@ -642,10 +642,30 @@ struct ProxyHTTPRequest: Sendable {
 enum ProxyRequestKind: Sendable {
     case request
     case tokenCount
+    /// A synthetic warm request fired by the keep-alive forwarder. Its activity
+    /// row renders alongside organic rows but with a ⚡ overlay; final stats live
+    /// in the session's `KeepaliveSessionHistory.lastWarmActivity` rather than
+    /// in the tree-done bucket.
+    case keepalive
 
+    /// Whether this kind feeds the session's organic done bucket and the
+    /// `completedRequestCount` aggregate. Warm requests render their done row
+    /// from the selection instead, so they do not contribute here.
     var storesDoneActivity: Bool {
         switch self {
         case .request:
+            return true
+        case .tokenCount, .keepalive:
+            return false
+        }
+    }
+
+    /// Whether a successful completion of this kind should fire the menu-bar
+    /// cost-transformation particle. Token-count utility ops do not; warm
+    /// requests do (they generate real billing).
+    var firesCostParticle: Bool {
+        switch self {
+        case .request, .keepalive:
             return true
         case .tokenCount:
             return false

@@ -50,6 +50,20 @@ actor ProxySessionStore {
         /// session. Most often empty or a single entry; one session can hold
         /// multiple selections only if it spans multiple conversations.
         let keepaliveSelections: [KeepaliveSelection]
+        /// Cumulative warm-request cost from the per-session history bucket.
+        /// Persists across stop/restart cycles.
+        let keepaliveCostUSD: Double
+        /// Total completed warm attempts from the per-session history bucket.
+        let keepaliveDoneCount: Int
+    }
+
+    /// Session-scoped keep-alive history. Survives selection removal so the popup
+    /// can keep showing the session's cumulative warm cost / count and the most
+    /// recent done-warm row even after the user clicks Stop.
+    struct KeepaliveSessionHistory: Sendable {
+        var cumulativeCostUSD: Double = 0
+        var cumulativeWarmCount: Int = 0
+        var lastWarmActivity: ProxyRequestActivity?
     }
 
     /// One conversation's manual keep-alive selection. The visible selection
@@ -67,13 +81,19 @@ actor ProxySessionStore {
         var latestSourceSessionID: String
         var latestSourceIsActive: Bool
         let activatedAt: Date
-        var lastWarmAt: Date?
-        var lastWarmSucceeded: Bool?
-        var lastFailureReason: String?
-        var lastWarmCacheReadPercentage: Double?
-        var lastWarmCacheCreationPercentage: Double?
-        var cumulativeCostUSD: Double
-        var cumulativeWarmCount: Int
+        /// UUID of the warm request currently in flight for this conversation,
+        /// or nil when no warm is mid-flight. The UI gates the "Send keep-alive"
+        /// menu off this; the actor uses it as a defensive backstop so a stale
+        /// click cannot start a second warm before the first lands.
+        var inFlightWarmRequestID: UUID?
+    }
+
+    /// Result of `beginManualKeepaliveDispatch` — the atomic check-and-set
+    /// that ensures at most one warm is in flight per conversation.
+    enum KeepaliveDispatchOutcome: Sendable {
+        case dispatched(KeepaliveWarmSource, warmID: UUID)
+        case alreadyInFlight
+        case notSelected
     }
 
     /// Outcome of `activateKeepalive(forRequestID:)`. Selection-level
@@ -158,6 +178,11 @@ actor ProxySessionStore {
     /// conversation; activating a request whose conversation already has a
     /// selection replaces the previous one.
     private var keepaliveSelections: [UUID: KeepaliveSelection] = [:]
+
+    /// Per-session keep-alive history. Keyed by session ID. Survives selection
+    /// removal so the session header `ka $xx (n_ka)` cluster and the bottom
+    /// gray ⚡ done row remain visible after Stop or auto-deactivation.
+    private var keepaliveHistoryBySession: [String: KeepaliveSessionHistory] = [:]
 
     /// Bounded ring buffer of recent successful Anthropic Messages
     /// exchanges. Activation pulls from this ring — entries that have
@@ -476,12 +501,22 @@ actor ProxySessionStore {
     // MARK: - Request activity tracking
 
     /// Register a new in-flight request. Call immediately before starting the upstream fetch.
+    /// Warm (`.keepalive`) requests bypass the normal `beginRequest` entry point
+    /// because they're triggered by user action rather than incoming HTTP. To
+    /// keep the session alive while the warm runs and prevent `expireSessions`
+    /// from sweeping out from under us, this method also touches the session
+    /// and increments inFlight when the kind is `.keepalive`. Organic kinds
+    /// rely on `beginRequest` for that bookkeeping.
     func startRequest(
         id: UUID,
         sessionID: String,
         model: String?,
         kind: ProxyRequestKind = .request
     ) {
+        if kind == .keepalive {
+            touch(sessionID)
+            incrementInFlight(sessionID)
+        }
         let activity = ProxyRequestActivity(
             id: id,
             kind: kind,
@@ -565,8 +600,12 @@ actor ProxySessionStore {
     /// tree (unknown flavor or missing fingerprint) land in the short-lived
     /// `doneRequestsBySession` bucket for UI display. Utility completions are
     /// finalized for logging/traffic state but do not affect visible done counts.
-    func markRequestDone(id: UUID, errored: Bool, tokenUsage: TokenUsage?, estimatedCost: Double?) {
-        guard var entry = activeRequests.removeValue(forKey: id) else { return }
+    /// Returns the final activity snapshot — callers (like the keep-alive
+    /// forwarder, whose kind doesn't store a done activity) can persist the
+    /// snapshot elsewhere before the entry is discarded.
+    @discardableResult
+    func markRequestDone(id: UUID, errored: Bool, tokenUsage: TokenUsage?, estimatedCost: Double?) -> ProxyRequestActivity? {
+        guard var entry = activeRequests.removeValue(forKey: id) else { return nil }
         let completedAt = Date()
         entry.activity.state = .done
         entry.activity.completedAt = completedAt
@@ -589,16 +628,23 @@ actor ProxySessionStore {
         if var session = sessions[entry.sessionID] {
             if isComplete && entry.activity.kind.storesDoneActivity {
                 session.completedRequestCount += 1
-            } else if !isComplete {
+            } else if !isComplete && entry.activity.kind.storesDoneActivity {
                 session.erroredRequestCount += 1
             }
             session.lastRequestDoneAt = completedAt
+            // Warm requests increment inFlight in `startRequest` so the session
+            // stays alive across `expireSessions` sweeps; mirror the decrement
+            // here so the counter returns to zero on every exit path.
+            if entry.activity.kind == .keepalive {
+                session.inFlightRequestCount = max(0, session.inFlightRequestCount - 1)
+            }
             sessions[entry.sessionID] = session
         }
         onTraffic?(nil)
-        if isComplete && entry.activity.kind.storesDoneActivity {
+        if isComplete && entry.activity.kind.firesCostParticle {
             onRequestDone?()
         }
+        return entry.activity
     }
 
     // MARK: - Snapshot
@@ -664,7 +710,17 @@ actor ProxySessionStore {
         }
 
         return sessions.values.map { session in
-            SessionSnapshot(
+            // Organic done leaves first, sorted by completion time. Then pin the
+            // most recent warm done from the session history bucket at the very
+            // end — per docs/proxy-keepalive.md, warm done rows live outside the
+            // lineage tree and only the latest survives per session.
+            var doneRequests = (leafActivityBySession[session.sessionID] ?? [])
+                .sorted { ($0.completedAt ?? $0.startedAt) < ($1.completedAt ?? $1.startedAt) }
+            let history = keepaliveHistoryBySession[session.sessionID]
+            if let warm = history?.lastWarmActivity {
+                doneRequests.append(warm)
+            }
+            return SessionSnapshot(
                 sessionID: session.sessionID,
                 startedAt: session.startedAt,
                 lastSeenAt: session.lastSeenAt,
@@ -672,14 +728,15 @@ actor ProxySessionStore {
                 completedRequestCount: session.completedRequestCount,
                 erroredRequestCount: session.erroredRequestCount,
                 activeRequests: activeRequestsBySession[session.sessionID] ?? [],
-                doneRequests: (leafActivityBySession[session.sessionID] ?? [])
-                    .sorted { ($0.completedAt ?? $0.startedAt) < ($1.completedAt ?? $1.startedAt) },
+                doneRequests: doneRequests,
                 totalInputTokens: session.totalInputTokens,
                 totalOutputTokens: session.totalOutputTokens,
                 totalCacheReadInputTokens: session.totalCacheReadInputTokens,
                 totalCacheCreationInputTokens: session.totalCacheCreationInputTokens,
                 estimatedCostUSD: session.estimatedCostUSD,
-                keepaliveSelections: selectionsBySession[session.sessionID] ?? []
+                keepaliveSelections: selectionsBySession[session.sessionID] ?? [],
+                keepaliveCostUSD: history?.cumulativeCostUSD ?? 0,
+                keepaliveDoneCount: history?.cumulativeWarmCount ?? 0
             )
         }.sorted {
             if $0.startedAt != $1.startedAt {
@@ -713,6 +770,7 @@ actor ProxySessionStore {
         for id in expired {
             sessions.removeValue(forKey: id)
             doneRequestsBySession.removeValue(forKey: id)
+            keepaliveHistoryBySession.removeValue(forKey: id)
         }
         // Drop cached done-leaf activities whose tree-side request belonged
         // to an expired session. Rare (the content tree usually outlives
@@ -753,10 +811,15 @@ actor ProxySessionStore {
     // MARK: - Keep-alive selection
 
     /// Activate keep-alive on the lineage path leading to the given done
-    /// request. The selection is stored against the request's conversation;
-    /// any prior selection for the same conversation is replaced. Refuses
-    /// when the request's exchange has already rolled out of the recent
-    /// ring — the warm forwarder needs the source body and headers.
+    /// request. The selection is stored against the request's conversation.
+    ///
+    /// Always creates a fresh selection; there is no resume path.
+    /// Activating on any request replaces the prior selection for that
+    /// conversation. Historical stats remain in `keepaliveHistoryBySession`
+    /// and are unaffected by selection replacement.
+    ///
+    /// Refuses when the request's exchange has already rolled out of the
+    /// recent ring — the warm forwarder needs the source body and headers.
     func activateKeepalive(forRequestID requestID: UUID) -> KeepaliveActivationResult {
         guard let request = contentTree.requests[requestID] else {
             return .unknownRequest
@@ -788,22 +851,17 @@ actor ProxySessionStore {
             latestSourceSessionID: request.sessionID,
             latestSourceIsActive: false,
             activatedAt: Date(),
-            lastWarmAt: nil,
-            lastWarmSucceeded: nil,
-            lastFailureReason: nil,
-            lastWarmCacheReadPercentage: nil,
-            lastWarmCacheCreationPercentage: nil,
-            cumulativeCostUSD: 0,
-            cumulativeWarmCount: 0
+            inFlightWarmRequestID: nil
         )
         keepaliveSelections[conversation.id] = selection
         onTraffic?(nil)
         return .activated(selection)
     }
 
-    /// Manual deactivation. Distinct from auto-deactivation: this path does
-    /// not fire the deactivation callback because the user took the action
-    /// themselves.
+    /// Manual deactivation. Removes the selection entirely — the orange leaf
+    /// accent disappears and path tracking stops. Historical KA stats survive
+    /// in the per-session `keepaliveHistoryBySession` bucket. Does not fire
+    /// the auto-deactivate callback because the user took the action.
     func deactivateKeepalive(forConversationID conversationID: UUID) {
         let removedSelection = keepaliveSelections.removeValue(forKey: conversationID)
         if removedSelection != nil {
@@ -839,6 +897,31 @@ actor ProxySessionStore {
         return KeepaliveWarmSource(selection: selection, exchange: exchange)
     }
 
+    /// Atomically begin a manual warm dispatch. Returns `.dispatched` with the
+    /// warm source and a fresh warm UUID when no warm is currently in flight
+    /// for the conversation, marking the selection as in-flight. Returns
+    /// `.alreadyInFlight` when a previous warm is still mid-dispatch, or
+    /// `.notSelected` when the conversation has no active selection or its
+    /// source exchange has been pruned.
+    func beginManualKeepaliveDispatch(
+        forConversationID conversationID: UUID
+    ) -> KeepaliveDispatchOutcome {
+        guard var selection = keepaliveSelections[conversationID],
+              let exchange = keepaliveExchangesByRequestID[selection.latestSourceRequestID] else {
+            return .notSelected
+        }
+        if selection.inFlightWarmRequestID != nil {
+            return .alreadyInFlight
+        }
+        let warmID = UUID()
+        selection.inFlightWarmRequestID = warmID
+        keepaliveSelections[conversationID] = selection
+        return .dispatched(
+            KeepaliveWarmSource(selection: selection, exchange: exchange),
+            warmID: warmID
+        )
+    }
+
     func keepaliveSelection(forConversationID conversationID: UUID) -> KeepaliveSelection? {
         keepaliveSelections[conversationID]
     }
@@ -847,26 +930,54 @@ actor ProxySessionStore {
         Array(keepaliveSelections.values)
     }
 
-    /// Record the outcome of a synthesized warm request. Updates the
-    /// conversation's selection in-place; no-op when the selection has been
-    /// dropped (e.g. the user deactivated mid-request).
+    /// Record the outcome of a synthesized warm request.
+    ///
+    /// Cost rollup is unconditional — the warm cost lands in the session's
+    /// `estimatedCostUSD` and the proxy's per-API breakdown even if the
+    /// selection has been removed (user clicked Stop, or auto-deactivation
+    /// fired) before the upstream response landed. Otherwise the user is
+    /// billed for warm dollars that never appear in any aggregate.
+    ///
+    /// History bucket update is unconditional — `keepaliveHistoryBySession`
+    /// persists across stop/restart cycles so the session header and the
+    /// bottom gray ⚡ done row remain visible after deactivation.
+    ///
+    /// Selection-specific state (only `inFlightWarmRequestID`) is cleared
+    /// when the selection still exists.
     func recordKeepaliveResult(
         conversationID: UUID,
-        succeeded: Bool,
+        sessionID: String,
+        warmID: UUID?,
         estimatedCostUSD: Double,
-        failureReason: String?,
-        cacheReadPercentage: Double?,
-        cacheCreationPercentage: Double?
+        warmActivity: ProxyRequestActivity?
     ) {
-        guard var selection = keepaliveSelections[conversationID] else { return }
-        selection.lastWarmAt = Date()
-        selection.lastWarmSucceeded = succeeded
-        selection.lastFailureReason = succeeded ? nil : failureReason
-        selection.lastWarmCacheReadPercentage = succeeded ? cacheReadPercentage : nil
-        selection.lastWarmCacheCreationPercentage = succeeded ? cacheCreationPercentage : nil
-        selection.cumulativeCostUSD += max(0, estimatedCostUSD)
-        selection.cumulativeWarmCount += 1
-        keepaliveSelections[conversationID] = selection
+        let addedCost = max(0, estimatedCostUSD)
+
+        // Cost rollup into session + proxy-wide totals — unconditional.
+        if addedCost > 0 {
+            if var session = sessions[sessionID] {
+                session.estimatedCostUSD += addedCost
+                sessions[sessionID] = session
+            }
+            accumulateCost(addedCost, for: .anthropicMessages)
+        }
+
+        // History bucket — unconditional. Survives selection removal.
+        var history = keepaliveHistoryBySession[sessionID] ?? KeepaliveSessionHistory()
+        history.cumulativeCostUSD += addedCost
+        history.cumulativeWarmCount += 1
+        if let warmActivity {
+            history.lastWarmActivity = warmActivity
+        }
+        keepaliveHistoryBySession[sessionID] = history
+
+        // Selection-specific updates only when the selection still exists.
+        if var selection = keepaliveSelections[conversationID] {
+            if let warmID, selection.inFlightWarmRequestID == warmID {
+                selection.inFlightWarmRequestID = nil
+            }
+            keepaliveSelections[conversationID] = selection
+        }
         onTraffic?(nil)
     }
 
@@ -891,6 +1002,7 @@ actor ProxySessionStore {
 
         let activeDescendants = activeDescendantRequests(of: selection.nodeID)
         if activeDescendants.count > 1 {
+            // Path branched — remove the selection entirely and notify.
             keepaliveSelections.removeValue(forKey: conversationID)
             pruneUnreferencedKeepaliveExchanges()
             onKeepaliveDeactivated?(conversationID, .pathBranched)

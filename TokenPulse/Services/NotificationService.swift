@@ -45,7 +45,7 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    /// Notify the user that keepalive has been disabled for a proxy session.
+    /// Notify the user that keepalive has been auto-stopped for a proxy session.
     /// When `reason` is provided (e.g. lineage divergence), it replaces the default failure message.
     func sendProxyKeepaliveDisabled(sessionID: String, reason: String? = nil) {
         let message: String
@@ -53,7 +53,7 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
             message = String(
                 format: NSLocalizedString(
                     "notification.proxy.keepaliveDisabledReason.body",
-                    value: "Keepalive stopped for session %@: %@",
+                    value: "Keep-alive stopped for session %@: %@",
                     comment: ""
                 ),
                 sessionID,
@@ -63,7 +63,7 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
             message = String(
                 format: NSLocalizedString(
                     "notification.proxy.keepaliveDisabled.body",
-                    value: "Keepalive stopped for session %@ after repeated failures.",
+                    value: "Keep-alive stopped for session %@ after repeated failures.",
                     comment: ""
                 ),
                 sessionID
@@ -71,7 +71,7 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
         }
         send(
             id: "proxy-keepalive-disabled-\(sessionID)",
-            title: String(localized: "Proxy keepalive disabled"),
+            title: String(localized: "Proxy keep-alive stopped"),
             body: message
         )
     }

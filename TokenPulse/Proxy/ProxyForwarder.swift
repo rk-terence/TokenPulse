@@ -868,9 +868,13 @@ final class ProxyForwarder: Sendable {
     /// from the latest source on the selected path: completed sources use
     /// response-frontier synthesis, active sources use exact replay of the
     /// observed request body. Unlike `forward(...)` it bypasses the content
-    /// tree, the organic session totals, and the per-request UI activity row
-    /// — its outcome lives only in the conversation's `KeepaliveSelection`
-    /// stats.
+    /// tree, but the warm IS registered as an in-flight `ProxyRequestActivity`
+    /// (kind `.keepalive`) so the popup renders a live row with model name,
+    /// upload/download bytes, and TTFT, accented with a yellow ⚡ overlay.
+    ///
+    /// At most one warm runs per conversation at a time — `beginManualKeepaliveDispatch`
+    /// is the actor-level check-and-set; the popup also disables the menu while
+    /// `inFlightWarmRequestID` is set.
     ///
     /// No-op for non-Anthropic forwarders or when the selection has been
     /// dropped (e.g. auto-deactivated mid-click).
@@ -883,16 +887,28 @@ final class ProxyForwarder: Sendable {
         let attemptID = UUID()
         let startedAt = Date()
 
-        guard let source = await sessionStore.keepaliveWarmSource(forConversationID: conversationID) else {
-            // Selection has been dropped (race with auto-deactivation or
-            // user-deactivation). Nothing to attribute, nothing to audit.
+        let dispatch = await sessionStore.beginManualKeepaliveDispatch(
+            forConversationID: conversationID
+        )
+        let warmID: UUID
+        let selection: ProxySessionStore.KeepaliveSelection
+        let exchange: ProxySessionStore.KeepaliveExchange
+        switch dispatch {
+        case .alreadyInFlight:
+            ProxyLogger.log("Keep-alive: refusing manual warm — already in flight for conversation \(conversationID)")
             return
+        case .notSelected:
+            // Selection dropped (race with deactivation) or source pruned.
+            return
+        case .dispatched(let source, let id):
+            warmID = id
+            selection = source.selection
+            exchange = source.exchange
         }
-        let selection = source.selection
-        let exchange = source.exchange
 
-        // Synthesize the warm body. On refusal, record outcome + audit row
-        // with frontier_kind="refused" and the spec-defined reason.
+        // Synthesize the warm body. Refusal short-circuits before any activity
+        // row is registered, but `recordKeepaliveOutcome` still runs so the
+        // selection's in-flight flag is cleared and the audit row is written.
         let plan: KeepaliveSynthesizer.Plan
         let outcome: KeepaliveSynthesizer.Outcome
         if selection.latestSourceIsActive {
@@ -913,6 +929,7 @@ final class ProxyForwarder: Sendable {
         case .refused(let reason):
             await recordKeepaliveOutcome(
                 attemptID: attemptID,
+                warmID: warmID,
                 startedAt: startedAt,
                 selection: selection,
                 frontierKind: "refused",
@@ -923,6 +940,7 @@ final class ProxyForwarder: Sendable {
                 upstreamRequestID: nil,
                 usage: nil,
                 cost: 0,
+                warmActivity: nil,
                 succeeded: false,
                 reason: "synthesis_refused: \(reason)",
                 sessionStore: sessionStore
@@ -934,13 +952,14 @@ final class ProxyForwarder: Sendable {
         // carries the chosen frontier info even though no request was sent.
         if case .invalid(let message) = upstreamHTTPSProxySetting {
             await recordKeepaliveOutcome(
-                attemptID: attemptID, startedAt: startedAt, selection: selection,
+                attemptID: attemptID, warmID: warmID, startedAt: startedAt, selection: selection,
                 frontierKind: plan.frontierKind.rawValue,
                 frontierDescriptor: plan.frontierDescriptor,
                 placeholderInserted: plan.placeholderToolResultsInserted,
                 placeholderIDs: plan.placeholderToolUseIDs,
                 upstreamStatus: nil, upstreamRequestID: nil,
                 usage: nil, cost: 0,
+                warmActivity: nil,
                 succeeded: false,
                 reason: "invalid_upstream_proxy: \(message)",
                 sessionStore: sessionStore
@@ -952,13 +971,14 @@ final class ProxyForwarder: Sendable {
         let urlString = upstreamBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + upstreamPath
         guard let url = URL(string: urlString) else {
             await recordKeepaliveOutcome(
-                attemptID: attemptID, startedAt: startedAt, selection: selection,
+                attemptID: attemptID, warmID: warmID, startedAt: startedAt, selection: selection,
                 frontierKind: plan.frontierKind.rawValue,
                 frontierDescriptor: plan.frontierDescriptor,
                 placeholderInserted: plan.placeholderToolResultsInserted,
                 placeholderIDs: plan.placeholderToolUseIDs,
                 upstreamStatus: nil, upstreamRequestID: nil,
                 usage: nil, cost: 0,
+                warmActivity: nil,
                 succeeded: false, reason: "invalid_upstream_url",
                 sessionStore: sessionStore
             )
@@ -982,111 +1002,163 @@ final class ProxyForwarder: Sendable {
         // for a JSON response in case Accept negotiation cares.
         urlRequest.setValue("application/json", forHTTPHeaderField: "Accept")
 
-        let config = UpstreamNetworking.makeSessionConfiguration(
+        // Register the live row before dispatching upstream. From here on,
+        // every exit path must call `markRequestDone(...)` to keep the
+        // active-row entry from leaking, and `recordKeepaliveOutcome(...)` to
+        // clear the in-flight flag and update the selection.
+        let warmModel = ProxyRequestBody.model(from: plan.body)
+        await sessionStore.startRequest(
+            id: warmID,
+            sessionID: selection.sessionID,
+            model: warmModel,
+            kind: .keepalive
+        )
+
+        let streamingDelegate = StreamingDelegate()
+        streamingDelegate.onUploadProgress = { totalBytesSent in
+            Task {
+                await sessionStore.updateRequestBytesSent(
+                    id: warmID,
+                    totalBytesSent: Int(totalBytesSent)
+                )
+            }
+        }
+        streamingDelegate.onUploadComplete = {
+            Task {
+                await sessionStore.markRequestWaiting(id: warmID)
+            }
+        }
+        let delegateConfig = UpstreamNetworking.makeSessionConfiguration(
             proxyConfiguration: upstreamHTTPSProxySetting.proxyConfiguration,
             timeoutIntervalForRequest: 120,
             timeoutIntervalForResource: 120
         )
-        let session = URLSession(configuration: config)
-        defer { session.invalidateAndCancel() }
+        let delegateSession = URLSession(
+            configuration: delegateConfig,
+            delegate: streamingDelegate,
+            delegateQueue: nil
+        )
+        defer { delegateSession.invalidateAndCancel() }
+
+        let bodyData = urlRequest.httpBody ?? Data()
+        var uploadRequest = urlRequest
+        uploadRequest.httpBody = nil
+        let dataTask = delegateSession.uploadTask(with: uploadRequest, from: bodyData)
+        let chunks = streamingDelegate.chunkStream
+        dataTask.resume()
+
+        var responseBody = Data()
+        var upstreamStatusCode: Int = 0
+        var upstreamHeaderRequestID: String? = nil
+        var streamError: Error? = nil
 
         do {
-            let (data, urlResponse) = try await session.data(for: urlRequest)
-            guard let httpResponse = urlResponse as? HTTPURLResponse else {
-                await recordKeepaliveOutcome(
-                    attemptID: attemptID, startedAt: startedAt, selection: selection,
-                    frontierKind: plan.frontierKind.rawValue,
-                    frontierDescriptor: plan.frontierDescriptor,
-                    placeholderInserted: plan.placeholderToolResultsInserted,
-                    placeholderIDs: plan.placeholderToolUseIDs,
-                    upstreamStatus: nil, upstreamRequestID: nil,
-                    usage: nil, cost: 0,
-                    succeeded: false, reason: "non_http_response",
-                    sessionStore: sessionStore
-                )
-                return
-            }
-            let upstreamRequestID = ProxyHTTPUtils.allHeaders(from: httpResponse)
+            let httpResponse = try await streamingDelegate.awaitResponse()
+            upstreamStatusCode = httpResponse.statusCode
+            upstreamHeaderRequestID = ProxyHTTPUtils.allHeaders(from: httpResponse)
                 .first(where: { $0.name.caseInsensitiveCompare("request-id") == .orderedSame
                     || $0.name.caseInsensitiveCompare("x-request-id") == .orderedSame })?.value
-            if !(200..<300).contains(httpResponse.statusCode) {
-                await recordKeepaliveOutcome(
-                    attemptID: attemptID, startedAt: startedAt, selection: selection,
-                    frontierKind: plan.frontierKind.rawValue,
-                    frontierDescriptor: plan.frontierDescriptor,
-                    placeholderInserted: plan.placeholderToolResultsInserted,
-                    placeholderIDs: plan.placeholderToolUseIDs,
-                    upstreamStatus: httpResponse.statusCode,
-                    upstreamRequestID: upstreamRequestID,
-                    usage: nil, cost: 0,
-                    succeeded: false,
-                    reason: "upstream_status_\(httpResponse.statusCode)",
-                    sessionStore: sessionStore
-                )
-                return
+            await sessionStore.markRequestReceiving(id: warmID)
+
+            for try await chunk in chunks {
+                try Task.checkCancellation()
+                await sessionStore.markFirstDataReceived(id: warmID)
+                await sessionStore.updateRequestBytes(id: warmID, additionalBytes: chunk.count)
+                responseBody.append(chunk)
             }
-            let usage = apiHandler.parseTokenUsage(from: data, streaming: false)
-            guard usage.hasParseableUsage else {
-                await recordKeepaliveOutcome(
-                    attemptID: attemptID, startedAt: startedAt, selection: selection,
-                    frontierKind: plan.frontierKind.rawValue,
-                    frontierDescriptor: plan.frontierDescriptor,
-                    placeholderInserted: plan.placeholderToolResultsInserted,
-                    placeholderIDs: plan.placeholderToolUseIDs,
-                    upstreamStatus: httpResponse.statusCode,
-                    upstreamRequestID: upstreamRequestID,
-                    usage: nil, cost: 0,
-                    succeeded: false,
-                    reason: "usage_unparseable",
-                    sessionStore: sessionStore
-                )
-                return
-            }
-            let cost = usage.estimatedCost(
-                for: ModelPricingTable.pricing(for: ProxyRequestBody.model(from: plan.body)),
-                apiFlavor: apiFlavor
-            ) ?? 0
-            await recordKeepaliveOutcome(
-                attemptID: attemptID, startedAt: startedAt, selection: selection,
-                frontierKind: plan.frontierKind.rawValue,
-                frontierDescriptor: plan.frontierDescriptor,
-                placeholderInserted: plan.placeholderToolResultsInserted,
-                placeholderIDs: plan.placeholderToolUseIDs,
-                upstreamStatus: httpResponse.statusCode,
-                upstreamRequestID: upstreamRequestID,
-                usage: usage, cost: cost,
-                succeeded: true, reason: nil,
-                sessionStore: sessionStore
-            )
-        } catch is CancellationError {
-            await recordKeepaliveOutcome(
-                attemptID: attemptID, startedAt: startedAt, selection: selection,
-                frontierKind: plan.frontierKind.rawValue,
-                frontierDescriptor: plan.frontierDescriptor,
-                placeholderInserted: plan.placeholderToolResultsInserted,
-                placeholderIDs: plan.placeholderToolUseIDs,
-                upstreamStatus: nil, upstreamRequestID: nil,
-                usage: nil, cost: 0,
-                succeeded: false, reason: "cancelled",
-                sessionStore: sessionStore
-            )
         } catch {
+            streamError = error
+        }
+
+        if let streamError {
+            let warmActivity = await sessionStore.markRequestDone(
+                id: warmID, errored: true, tokenUsage: nil, estimatedCost: nil
+            )
+            let isCancelled = streamError is CancellationError
             await recordKeepaliveOutcome(
-                attemptID: attemptID, startedAt: startedAt, selection: selection,
+                attemptID: attemptID, warmID: warmID, startedAt: startedAt, selection: selection,
                 frontierKind: plan.frontierKind.rawValue,
                 frontierDescriptor: plan.frontierDescriptor,
                 placeholderInserted: plan.placeholderToolResultsInserted,
                 placeholderIDs: plan.placeholderToolUseIDs,
-                upstreamStatus: nil, upstreamRequestID: nil,
+                upstreamStatus: nil, upstreamRequestID: upstreamHeaderRequestID,
                 usage: nil, cost: 0,
-                succeeded: false, reason: error.localizedDescription,
+                warmActivity: warmActivity,
+                succeeded: false,
+                reason: isCancelled ? "cancelled" : streamError.localizedDescription,
                 sessionStore: sessionStore
             )
+            return
         }
+
+        if !(200..<300).contains(upstreamStatusCode) {
+            let warmActivity = await sessionStore.markRequestDone(
+                id: warmID, errored: true, tokenUsage: nil, estimatedCost: nil
+            )
+            await recordKeepaliveOutcome(
+                attemptID: attemptID, warmID: warmID, startedAt: startedAt, selection: selection,
+                frontierKind: plan.frontierKind.rawValue,
+                frontierDescriptor: plan.frontierDescriptor,
+                placeholderInserted: plan.placeholderToolResultsInserted,
+                placeholderIDs: plan.placeholderToolUseIDs,
+                upstreamStatus: upstreamStatusCode,
+                upstreamRequestID: upstreamHeaderRequestID,
+                usage: nil, cost: 0,
+                warmActivity: warmActivity,
+                succeeded: false,
+                reason: "upstream_status_\(upstreamStatusCode)",
+                sessionStore: sessionStore
+            )
+            return
+        }
+
+        let usage = apiHandler.parseTokenUsage(from: responseBody, streaming: false)
+        guard usage.hasParseableUsage else {
+            let warmActivity = await sessionStore.markRequestDone(
+                id: warmID, errored: true, tokenUsage: nil, estimatedCost: nil
+            )
+            await recordKeepaliveOutcome(
+                attemptID: attemptID, warmID: warmID, startedAt: startedAt, selection: selection,
+                frontierKind: plan.frontierKind.rawValue,
+                frontierDescriptor: plan.frontierDescriptor,
+                placeholderInserted: plan.placeholderToolResultsInserted,
+                placeholderIDs: plan.placeholderToolUseIDs,
+                upstreamStatus: upstreamStatusCode,
+                upstreamRequestID: upstreamHeaderRequestID,
+                usage: nil, cost: 0,
+                warmActivity: warmActivity,
+                succeeded: false,
+                reason: "usage_unparseable",
+                sessionStore: sessionStore
+            )
+            return
+        }
+
+        let cost = usage.estimatedCost(
+            for: ModelPricingTable.pricing(for: warmModel),
+            apiFlavor: apiFlavor
+        ) ?? 0
+        let warmActivity = await sessionStore.markRequestDone(
+            id: warmID, errored: false, tokenUsage: usage, estimatedCost: cost
+        )
+        await recordKeepaliveOutcome(
+            attemptID: attemptID, warmID: warmID, startedAt: startedAt, selection: selection,
+            frontierKind: plan.frontierKind.rawValue,
+            frontierDescriptor: plan.frontierDescriptor,
+            placeholderInserted: plan.placeholderToolResultsInserted,
+            placeholderIDs: plan.placeholderToolUseIDs,
+            upstreamStatus: upstreamStatusCode,
+            upstreamRequestID: upstreamHeaderRequestID,
+            usage: usage, cost: cost,
+            warmActivity: warmActivity,
+            succeeded: true, reason: nil,
+            sessionStore: sessionStore
+        )
     }
 
     private func recordKeepaliveOutcome(
         attemptID: UUID,
+        warmID: UUID,
         startedAt: Date,
         selection: ProxySessionStore.KeepaliveSelection,
         frontierKind: String,
@@ -1097,17 +1169,17 @@ final class ProxyForwarder: Sendable {
         upstreamRequestID: String?,
         usage: TokenUsage?,
         cost: Double,
+        warmActivity: ProxyRequestActivity?,
         succeeded: Bool,
         reason: String?,
         sessionStore: ProxySessionStore
     ) async {
         await sessionStore.recordKeepaliveResult(
             conversationID: selection.conversationID,
-            succeeded: succeeded,
+            sessionID: selection.sessionID,
+            warmID: warmID,
             estimatedCostUSD: cost,
-            failureReason: reason,
-            cacheReadPercentage: usage?.cacheQualityPercentages(apiFlavor: apiFlavor)?.read,
-            cacheCreationPercentage: usage?.cacheQualityPercentages(apiFlavor: apiFlavor)?.creation
+            warmActivity: warmActivity
         )
         await eventLogger?.logKeepaliveAttempt(ProxyEventLogger.KeepaliveAttempt(
             id: attemptID,

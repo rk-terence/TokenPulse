@@ -569,11 +569,20 @@ private struct SessionActivityRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
+            // Header row: cli + session id on the left, sub-popup chevron on
+            // the right. Stats live on a separate right-aligned row below so
+            // the title never gets cramped by the cost cluster.
             HStack(spacing: 0) {
                 sessionTitle
                 Spacer()
-                sessionStats
                 sessionMenu
+            }
+
+            if hasSessionStats {
+                HStack(spacing: 0) {
+                    Spacer()
+                    sessionStats
+                }
             }
 
             if !activity.activeRequests.isEmpty {
@@ -598,6 +607,8 @@ private struct SessionActivityRow: View {
                         request: request,
                         isActive: false,
                         isKeepaliveLeaf: activity.isKeepaliveLeaf(requestID: request.id),
+                        isKeepaliveInFlight: request.conversationID
+                            .map(activity.isKeepaliveInFlight(forConversationID:)) ?? false,
                         sessionAPIFlavor: activity.apiFlavor,
                         proxyController: proxyController
                     )
@@ -607,11 +618,6 @@ private struct SessionActivityRow: View {
                 .padding(.top, activity.activeRequests.isEmpty ? 0 : 4)
             }
 
-            if !activity.keepaliveSelections.isEmpty {
-                keepaliveFooter
-                    .padding(.leading, 10)
-                    .padding(.top, 2)
-            }
         }
     }
 
@@ -656,11 +662,12 @@ private struct SessionActivityRow: View {
                 ) {
                     sendKeepaliveForSelectedConversations()
                 }
+                .disabled(activity.hasKeepaliveInFlight)
                 Button(
                     NSLocalizedString(
                         "proxy.session.stopKeepalive",
                         value: "Stop keep-alive",
-                        comment: "Menu item to deactivate keep-alive on the conversation's selection"
+                        comment: "Menu item to stop keep-alive on the conversation's selection; stats persist in session history"
                     )
                 ) {
                     stopKeepaliveForSelectedConversations()
@@ -687,76 +694,6 @@ private struct SessionActivityRow: View {
         .padding(.leading, 6)
     }
 
-    @ViewBuilder
-    private var keepaliveFooter: some View {
-        // The selection-derived stats live on `SessionActivity`. Show a
-        // single row summarizing the warm spend so far and the age of the
-        // last warm. When no warm has been sent yet, only the activation
-        // anchor exists — display a placeholder time.
-        let cost = activity.keepaliveCostUSD
-        HStack(spacing: 8) {
-            Text(String(localized: "keep-alive"))
-                .font(.callout.monospaced())
-                .foregroundStyle(.orange.opacity(0.85))
-            if cost > 0 {
-                ProxyMetricLabel(
-                    label: "$",
-                    value: formatCost(cost),
-                    font: .callout.monospaced()
-                )
-            }
-            if let quality = latestKeepaliveCacheQuality {
-                Text(verbatim: localizedCacheQuality(quality))
-                    .font(.callout.monospaced())
-                    .foregroundStyle(.tertiary)
-            }
-            Spacer()
-            if let lastWarmAt = activity.lastKeepaliveAt {
-                TimelineView(.periodic(from: lastWarmAt, by: 1)) { context in
-                    Text(verbatim: RequestActivityRow.compactElapsed(from: lastWarmAt, to: context.date))
-                        .font(.callout.monospaced())
-                        .foregroundStyle(.tertiary)
-                        .contentTransition(.numericText())
-                }
-            } else {
-                Text(verbatim: "--:--")
-                    .font(.callout.monospaced())
-                    .foregroundStyle(.tertiary)
-            }
-        }
-    }
-
-    private var latestKeepaliveCacheQuality: (read: Double, creation: Double)? {
-        activity.keepaliveSelections
-            .filter { $0.lastWarmCacheReadPercentage != nil || $0.lastWarmCacheCreationPercentage != nil }
-            .sorted { ($0.lastWarmAt ?? .distantPast) > ($1.lastWarmAt ?? .distantPast) }
-            .first
-            .map {
-                (
-                    read: $0.lastWarmCacheReadPercentage ?? 0,
-                    creation: $0.lastWarmCacheCreationPercentage ?? 0
-                )
-            }
-    }
-
-    private func localizedCacheQuality(_ quality: (read: Double, creation: Double)) -> String {
-        let format = NSLocalizedString(
-            "proxy.keepalive.cacheQuality",
-            value: "cache %@/%@",
-            comment: "Proxy keep-alive footer cache quality: cache-read percent / cache-creation percent"
-        )
-        return String(
-            format: format,
-            locale: Locale.current,
-            percentString(quality.read),
-            percentString(quality.creation)
-        )
-    }
-
-    private func percentString(_ value: Double) -> String {
-        String(format: "%.0f%%", max(0, value) * 100)
-    }
-
     private func sendKeepaliveForSelectedConversations() {
         guard let proxyController else { return }
         let conversationIDs = activity.keepaliveSelections.map(\.conversationID)
@@ -777,6 +714,13 @@ private struct SessionActivityRow: View {
         }
     }
 
+    private var hasSessionStats: Bool {
+        activity.completedRequests > 0
+            || activity.erroredRequests > 0
+            || activity.keepaliveDoneCount > 0
+            || activity.estimatedCostUSD > 0
+    }
+
     @ViewBuilder
     private var sessionStats: some View {
         HStack(spacing: 8) {
@@ -795,6 +739,22 @@ private struct SessionActivityRow: View {
                     Text("\(activity.erroredRequests)")
                         .font(.body.monospacedDigit())
                         .foregroundStyle(.red)
+                }
+            }
+            // KA cluster: cumulative warm cost + warm-attempt count. Renders
+            // only after at least one warm has completed; the trailing $ below
+            // already reflects the total (organic + KA).
+            if activity.keepaliveDoneCount > 0 {
+                HStack(spacing: 3) {
+                    Text(verbatim: "ka $")
+                        .font(.body)
+                        .foregroundStyle(.tertiary)
+                    Text(verbatim: formatCost(activity.keepaliveCostUSD))
+                        .font(.body.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Text(verbatim: "(\(activity.keepaliveDoneCount))")
+                        .font(.body.monospacedDigit())
+                        .foregroundStyle(.tertiary)
                 }
             }
             if activity.estimatedCostUSD > 0 {
@@ -827,12 +787,21 @@ private struct RequestActivityRow: View {
     /// keep-alive leaf. Drives the orange overlay and adjusts the context
     /// menu (Stop instead of Activate).
     var isKeepaliveLeaf: Bool = false
+    /// True when the conversation backing this row already has a warm in
+    /// flight, so the row-level "Send keep-alive" can be disabled. Affects
+    /// only the keep-alive-anchor row (the one that owns the menu).
+    var isKeepaliveInFlight: Bool = false
     /// API flavor of the owning session — used to gate keep-alive menu
     /// entries to Anthropic only.
     var sessionAPIFlavor: ProxyAPIFlavor? = nil
     /// Owning controller for keep-alive activation/send/stop. Optional so
     /// SwiftUI previews and tests can construct rows without one.
     var proxyController: LocalProxyController? = nil
+
+    /// True for warm rows synthesized by the keep-alive forwarder. Drives the
+    /// ⚡ overlay (yellow active / gray done) and the alternate done stats
+    /// (cache R%/W% + cost + e2e instead of bytes/output).
+    private var isKeepaliveRequest: Bool { request.kind == .keepalive }
 
     private enum StatField {
         static let modelLabelWidth = 8
@@ -895,7 +864,16 @@ private struct RequestActivityRow: View {
             }
         }
         .overlay(alignment: .leading) {
-            if isActive {
+            if isKeepaliveRequest {
+                // Warm rows take the same left-edge slot as organic rows but
+                // show ⚡ instead of a bar — yellow while in flight, gray once
+                // done. Offset matches the rectangle so layout doesn't shift.
+                Image(systemName: "bolt.fill")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(isActive ? Color.yellow : Color.secondary)
+                    .offset(x: -8)
+                    .allowsHitTesting(false)
+            } else if isActive {
                 RoundedRectangle(cornerRadius: 1)
                     .fill(Color.accentColor)
                     .frame(width: 2)
@@ -924,11 +902,12 @@ private struct RequestActivityRow: View {
             ) {
                 Task { await proxyController?.triggerManualKeepalive(forConversationID: conversationID) }
             }
+            .disabled(isKeepaliveInFlight)
             Button(
                 NSLocalizedString(
                     "proxy.row.stopKeepalive",
                     value: "Stop keep-alive",
-                    comment: "Context menu item to deactivate keep-alive on the conversation"
+                    comment: "Context menu item to stop keep-alive on the conversation; stats persist in session history"
                 )
             ) {
                 Task { await proxyController?.stopKeepalive(forConversationID: conversationID) }
@@ -1032,39 +1011,84 @@ private struct RequestActivityRow: View {
             }
 
         case .done:
-            if let promptK = request.promptTokens {
-                Text("\u{2191}")
-                    .font(rowFont)
-                    .foregroundStyle(.tertiary)
-                Text(formattedTokenCount(promptK))
-                    .font(rowFont)
-                    .foregroundStyle(.secondary)
-            }
-            if let outputK = request.tokenUsage?.outputTokens, outputK > 0 {
-                Text("\u{2193}")
-                    .font(rowFont)
-                    .foregroundStyle(.tertiary)
-                Text(formattedTokenCount(outputK, width: StatField.outputValueWidth))
-                    .font(rowFont)
-                    .foregroundStyle(.secondary)
-            }
-            if let e2e = endToEndDuration {
-                Text(paddedLabel("e2e", width: StatField.timingLabelWidth))
-                    .font(rowFont)
-                    .foregroundStyle(.tertiary)
-                Text(formattedDuration(e2e))
-                    .font(rowFont)
-                    .foregroundStyle(.secondary)
-            }
-            if let cost = request.estimatedCost {
-                Text("$")
-                    .font(rowFont)
-                    .foregroundStyle(.tertiary)
-                Text(formatCost(cost))
-                    .font(rowFont)
-                    .foregroundStyle(.secondary)
+            if isKeepaliveRequest {
+                keepaliveDoneStats
+            } else {
+                if let promptK = request.promptTokens {
+                    Text("\u{2191}")
+                        .font(rowFont)
+                        .foregroundStyle(.tertiary)
+                    Text(formattedTokenCount(promptK))
+                        .font(rowFont)
+                        .foregroundStyle(.secondary)
+                }
+                if let outputK = request.tokenUsage?.outputTokens, outputK > 0 {
+                    Text("\u{2193}")
+                        .font(rowFont)
+                        .foregroundStyle(.tertiary)
+                    Text(formattedTokenCount(outputK, width: StatField.outputValueWidth))
+                        .font(rowFont)
+                        .foregroundStyle(.secondary)
+                }
+                if let e2e = endToEndDuration {
+                    Text(paddedLabel("e2e", width: StatField.timingLabelWidth))
+                        .font(rowFont)
+                        .foregroundStyle(.tertiary)
+                    Text(formattedDuration(e2e))
+                        .font(rowFont)
+                        .foregroundStyle(.secondary)
+                }
+                if let cost = request.estimatedCost {
+                    Text("$")
+                        .font(rowFont)
+                        .foregroundStyle(.tertiary)
+                    Text(formatCost(cost))
+                        .font(rowFont)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
+    }
+
+    /// Done-KA stats: cache read% / cache creation% (the two fields that
+    /// tell the user whether the warm actually warmed the prefix), then
+    /// per-warm cost and e2e. Replaces the standard ↑/↓/e2e/$ block.
+    @ViewBuilder
+    private var keepaliveDoneStats: some View {
+        let cachePct = request.tokenUsage?.cacheQualityPercentages(apiFlavor: .anthropicMessages)
+        Text(verbatim: "R")
+            .font(rowFont)
+            .foregroundStyle(.tertiary)
+        Text(verbatim: percentString(cachePct?.read))
+            .font(rowFont)
+            .foregroundStyle(.secondary)
+        Text(verbatim: "W")
+            .font(rowFont)
+            .foregroundStyle(.tertiary)
+        Text(verbatim: percentString(cachePct?.creation))
+            .font(rowFont)
+            .foregroundStyle(.secondary)
+        if let e2e = endToEndDuration {
+            Text(paddedLabel("e2e", width: StatField.timingLabelWidth))
+                .font(rowFont)
+                .foregroundStyle(.tertiary)
+            Text(formattedDuration(e2e))
+                .font(rowFont)
+                .foregroundStyle(.secondary)
+        }
+        if let cost = request.estimatedCost {
+            Text("$")
+                .font(rowFont)
+                .foregroundStyle(.tertiary)
+            Text(formatCost(cost))
+                .font(rowFont)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func percentString(_ value: Double?) -> String {
+        guard let value else { return " --%" }
+        return String(format: "%3.0f%%", max(0, value) * 100)
     }
 
     // MARK: - Computed timing
