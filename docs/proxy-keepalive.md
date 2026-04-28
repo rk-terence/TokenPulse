@@ -95,7 +95,7 @@ Warm requests based on a completed source go through `KeepaliveSynthesizer.synth
 
 Warm requests preserve the upstream body as much as possible. The synthesizer copies the source request body verbatim and only edits the `messages` array; cache-identity fields (`model`, `system`, `tools`, `tool_choice`, `thinking`, `output_config.effort`) and other body extras pass through untouched. Headers come from the cached exchange and go upstream as-is, modulo the standard hop-by-hop filter (`Host` / `Content-Length` / `Transfer-Encoding`).
 
-Synthesized bodies force `stream: false` so the warm response is a single JSON document — `stream` is not a cache-identity field and the response shape only matters to the local handler. The synthetic suffix sent after the moving breakpoint is the literal text `"say hi"`.
+Synthesized bodies force `stream: false` so the warm response is a single JSON document — `stream` is not a cache-identity field and the response shape only matters to the local handler. The synthetic suffix sent after the moving breakpoint is the literal text `"Do not think; reply with exactly this text: hi"`.
 
 Existing system-level cache anchors are preserved. Existing message bytes, including message-level `cache_control` markers, are preserved verbatim; the warmer only appends the new frontier messages and installs the new moving breakpoint in those appended bytes.
 

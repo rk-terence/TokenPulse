@@ -40,7 +40,7 @@ enum KeepaliveSynthesizer {
     /// Synthetic user suffix appended after the moving breakpoint. The text
     /// is intentionally trivial so Anthropic returns a small response —
     /// `max_tokens` and `thinking` are not mutated by design (see spec).
-    static let syntheticSuffixText = "say hi"
+    static let syntheticSuffixText = "Do not think; reply with exactly this text: hi"
 
     enum FrontierKind: String, Sendable {
         case assistantText = "assistant_text"
