@@ -97,7 +97,7 @@ Warm requests preserve the upstream body as much as possible. The synthesizer co
 
 Synthesized bodies force `stream: false` so the warm response is a single JSON document — `stream` is not a cache-identity field and the response shape only matters to the local handler. The synthetic suffix sent after the moving breakpoint is the literal text `"say hi"`.
 
-Existing system-level cache anchors are preserved. Existing message-level `cache_control` markers are stripped from every message and every `content` block before the new moving breakpoint is installed; this keeps the total `cache_control` count within Anthropic's per-request limit.
+Existing system-level cache anchors are preserved. Existing message bytes, including message-level `cache_control` markers, are preserved verbatim; the warmer only appends the new frontier messages and installs the new moving breakpoint in those appended bytes.
 
 Do not synthesize cache breakpoints inside Claude Code `user` messages. User messages can contain harness reminders, task notifications, diagnostics, interruption markers, and user prompt text in provider-specific order. Unless TokenPulse is replaying an exact observed request, user-message interiors are not safe rewrite targets.
 
