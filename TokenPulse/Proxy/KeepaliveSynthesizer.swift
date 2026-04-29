@@ -20,15 +20,21 @@ import Foundation
 ///   then the synthetic suffix. Placeholders are protocol shims only and
 ///   live outside the cached prefix.
 ///
-/// `exactReplay(observedRequestBody:)` covers the third case from the spec:
-/// when a real follow-up request resolving the prior `tool_use` has already
-/// been observed, we send it byte-for-byte instead of reconstructing.
-///
 /// Cache-identity fields (`model`, `system`, `tools`, `tool_choice`,
-/// `thinking`, `output_config.effort`, beta headers) are preserved by
-/// touching only the `messages` array and the top-level `stream` boolean.
+/// `thinking`, `output_config`, beta headers) are preserved by touching
+/// only the `messages` array and the top-level `stream` boolean.
 /// Existing message bytes are preserved verbatim so cache-relevant request
 /// shape is not disturbed while installing the new moving breakpoint.
+///
+/// We previously forced `output_config.effort` to `"low"` on warm requests
+/// to cap thinking-token output, on the basis that Anthropic's docs only
+/// list `thinking.type` switches and `budget_tokens` changes as
+/// cache-invalidating. Empirically that wasn't safe — warms with a
+/// rewritten `output_config` produced cache-misses (`R 0% / W 100%` on
+/// the next response), strongly suggesting the request body is hashed
+/// more broadly than the docs imply. So `output_config` is now treated
+/// as cache-identity: pass it through untouched, accept the higher warm
+/// cost, and look for other levers later.
 enum KeepaliveSynthesizer {
 
     /// Placeholder text Claude Code itself uses when filling in a missing
@@ -38,14 +44,17 @@ enum KeepaliveSynthesizer {
     static let placeholderToolResultText = "[Tool result missing due to internal error]"
 
     /// Synthetic user suffix appended after the moving breakpoint. The text
-    /// is intentionally trivial so Anthropic returns a small response —
-    /// `max_tokens` and `thinking` are not mutated by design (see spec).
-    static let syntheticSuffixText = "Do not think; reply with exactly this text: hi"
+    /// is intentionally trivial so Anthropic returns a small response.
+    /// `max_tokens`, `thinking`, and `output_config` are not mutated by
+    /// design (treated as cache identity). The wording avoids the literal
+    /// token "think" because mentioning it (even in a negation) tends to
+    /// nudge adaptive thinking models into producing thinking output
+    /// anyway.
+    static let syntheticSuffixText = "Reply with exactly: hi"
 
     enum FrontierKind: String, Sendable {
         case assistantText = "assistant_text"
         case assistantToolUse = "assistant_tool_use"
-        case exactReplay = "exact_replay"
     }
 
     /// Reasons synthesis can refuse. Mirrors the eligibility/refusal table in
@@ -134,24 +143,6 @@ enum KeepaliveSynthesizer {
             existingMessageCount: messagesAny.count,
             contentBlocks: extracted.contentBlocks
         )
-    }
-
-    /// Wrap an observed organic request body as an exact-replay warm plan.
-    /// Use this when an organic follow-up resolving the prior `tool_use`
-    /// has already arrived — the body is the exact frontier and shouldn't
-    /// be reconstructed.
-    static func exactReplay(observedRequestBody: Data) -> Outcome {
-        guard jsonObject(observedRequestBody) != nil,
-              let body = forcingTopLevelStreamFalse(in: observedRequestBody) else {
-            return .refused(.sourceBodyUnparseable)
-        }
-        return .plan(Plan(
-            frontierKind: .exactReplay,
-            body: body,
-            frontierDescriptor: "exact_replay",
-            placeholderToolResultsInserted: false,
-            placeholderToolUseIDs: []
-        ))
     }
 
     // MARK: - Frontier construction
@@ -439,6 +430,7 @@ enum KeepaliveSynthesizer {
         body.append(sourceRequestBody.subdata(in: messagesCloseIndex..<sourceRequestBody.count))
         return body
     }
+
 
     private static func forcingTopLevelStreamFalse(in data: Data) -> Data? {
         guard let scan = scanTopLevelObject(data) else {

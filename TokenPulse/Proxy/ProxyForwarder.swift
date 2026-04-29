@@ -865,10 +865,9 @@ final class ProxyForwarder: Sendable {
     // MARK: - Keep-alive warm request
 
     /// Send one warm request for the given conversation. The body is built
-    /// from the latest source on the selected path: completed sources use
-    /// response-frontier synthesis, active sources use exact replay of the
-    /// observed request body. Unlike `forward(...)` it bypasses the content
-    /// tree, but the warm IS registered as an in-flight `ProxyRequestActivity`
+    /// from the selected anchor's observed request/response exchange. Unlike
+    /// `forward(...)` it bypasses the content tree, but the warm IS registered
+    /// as an in-flight `ProxyRequestActivity`
     /// (kind `.keepalive`) so the popup renders a live row with model name,
     /// upload/download bytes, and TTFT, accented with a yellow ⚡ overlay.
     ///
@@ -917,10 +916,8 @@ final class ProxyForwarder: Sendable {
         // selection's in-flight flag is cleared and the audit row is written.
         let plan: KeepaliveSynthesizer.Plan
         let outcome: KeepaliveSynthesizer.Outcome
-        if selection.latestSourceIsActive {
-            outcome = KeepaliveSynthesizer.exactReplay(observedRequestBody: exchange.requestBody)
-        } else if let responseBody = exchange.responseBody,
-                  let responseStreaming = exchange.responseStreaming {
+        if let responseBody = exchange.responseBody,
+           let responseStreaming = exchange.responseStreaming {
             outcome = KeepaliveSynthesizer.synthesize(
                 sourceRequestBody: exchange.requestBody,
                 sourceResponse: responseBody,
@@ -1192,9 +1189,9 @@ final class ProxyForwarder: Sendable {
             startedAt: startedAt,
             completedAt: Date(),
             conversationID: selection.conversationID,
-            sourceRequestID: selection.latestSourceRequestID,
-            sourceNodeID: selection.latestSourceNodeID,
-            sourceSession: selection.latestSourceSessionID,
+            sourceRequestID: selection.requestID,
+            sourceNodeID: selection.nodeID,
+            sourceSession: selection.sessionID,
             frontierKind: frontierKind,
             frontierDescriptor: frontierDescriptor,
             placeholderInserted: placeholderInserted,

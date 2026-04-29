@@ -897,13 +897,12 @@ actor ProxySessionStore {
         }
     }
 
-    /// Look up the latest source exchange for an active selection. Used by
-    /// the warm forwarder to assemble either a synthesized done-source body
-    /// or an active-source exact replay. Nil when the selection has been
-    /// cleared or auto-deactivated.
+    /// Look up the anchor exchange for an active selection. Used by
+    /// the warm forwarder to assemble a synthesized warm body. Nil when
+    /// the selection has been cleared or auto-deactivated.
     func keepaliveWarmSource(forConversationID conversationID: UUID) -> KeepaliveWarmSource? {
         guard let selection = keepaliveSelections[conversationID],
-              let exchange = keepaliveExchangesByRequestID[selection.latestSourceRequestID] else {
+              let exchange = keepaliveExchangesByRequestID[selection.requestID] else {
             return nil
         }
         return KeepaliveWarmSource(selection: selection, exchange: exchange)
@@ -919,7 +918,7 @@ actor ProxySessionStore {
         forConversationID conversationID: UUID
     ) -> KeepaliveDispatchOutcome {
         guard var selection = keepaliveSelections[conversationID],
-              let exchange = keepaliveExchangesByRequestID[selection.latestSourceRequestID] else {
+              let exchange = keepaliveExchangesByRequestID[selection.requestID] else {
             return .notSelected
         }
         if selection.inFlightWarmRequestID != nil {
@@ -949,14 +948,14 @@ actor ProxySessionStore {
             return .notSelected
         }
         guard var selection = keepaliveSelections[reminder.conversationID],
-              let exchange = keepaliveExchangesByRequestID[selection.latestSourceRequestID] else {
+              let exchange = keepaliveExchangesByRequestID[selection.requestID] else {
             ProxyLogger.log("Keep-alive: stale reminder action has no active selection for conversation \(reminder.conversationID)")
             return .notSelected
         }
         guard selection.conversationID == reminder.conversationID,
-              selection.latestSourceNodeID == reminder.sourceNodeID,
-              selection.latestSourceRequestID == reminder.sourceRequestID,
-              selection.latestSourceSessionID == reminder.sourceSessionID else {
+              selection.nodeID == reminder.sourceNodeID,
+              selection.requestID == reminder.sourceRequestID,
+              selection.sessionID == reminder.sourceSessionID else {
             ProxyLogger.log("Keep-alive: stale reminder action source changed for conversation \(reminder.conversationID)")
             return .notSelected
         }
@@ -1009,21 +1008,21 @@ actor ProxySessionStore {
             let expiresAt = dueAt.addingTimeInterval(Self.keepaliveReminderActionWindowSeconds)
             guard now <= expiresAt else { continue }
 
-            let alreadyReminded = selection.lastReminderSourceNodeID == selection.latestSourceNodeID
-                && selection.lastReminderSourceRequestID == selection.latestSourceRequestID
+            let alreadyReminded = selection.lastReminderSourceNodeID == selection.nodeID
+                && selection.lastReminderSourceRequestID == selection.requestID
                 && selection.lastReminderQuietReferenceAt == quietReferenceAt
             guard !alreadyReminded else { continue }
 
-            selection.lastReminderSourceNodeID = selection.latestSourceNodeID
-            selection.lastReminderSourceRequestID = selection.latestSourceRequestID
+            selection.lastReminderSourceNodeID = selection.nodeID
+            selection.lastReminderSourceRequestID = selection.requestID
             selection.lastReminderQuietReferenceAt = quietReferenceAt
             keepaliveSelections[conversationID] = selection
 
             reminders.append(KeepaliveReminder(
                 conversationID: conversationID,
-                sourceNodeID: selection.latestSourceNodeID,
-                sourceRequestID: selection.latestSourceRequestID,
-                sourceSessionID: selection.latestSourceSessionID,
+                sourceNodeID: selection.nodeID,
+                sourceRequestID: selection.requestID,
+                sourceSessionID: selection.sessionID,
                 quietReferenceAt: quietReferenceAt,
                 issuedAt: now
             ))
@@ -1182,17 +1181,17 @@ actor ProxySessionStore {
     }
 
     private func keepaliveQuietReference(for selection: KeepaliveSelection) -> Date? {
+        // Quiet reference is anchored to the most recent cache-write event:
+        // either the anchor done's terminal finish time, or the last warm we
+        // dispatched (whichever is later). An active descendant reading the
+        // cached prefix mid-generation does not extend the cache TTL in a way
+        // that helps the warming purpose, so we deliberately ignore
+        // `latestSource*.lastDataAt` here.
         let sourceReference: Date?
-        if selection.latestSourceIsActive {
-            if let active = activeRequests[selection.latestSourceRequestID]?.activity {
-                sourceReference = active.lastDataAt ?? active.startedAt
-            } else {
-                sourceReference = nil
-            }
-        } else if let request = contentTree.requests[selection.latestSourceRequestID] {
+        if let request = contentTree.requests[selection.requestID] {
             sourceReference = request.finishedAt
         } else {
-            sourceReference = treeDoneActivities[selection.latestSourceRequestID]?.completedAt
+            sourceReference = treeDoneActivities[selection.requestID]?.completedAt
         }
 
         guard let sourceReference else { return nil }

@@ -226,13 +226,20 @@ enum ProxyRequestBody {
         } else {
             thinkingStr = nil
         }
+        let outputConfigStr: String?
+        if flavor == .anthropicMessages, json.keys.contains("output_config") {
+            outputConfigStr = canonicalString(for: json["output_config"] ?? NSNull())
+        } else {
+            outputConfigStr = nil
+        }
         return LineageFingerprint(
             flavor: flavor,
             model: model,
             systemCanonical: systemStr,
             toolsCanonical: toolsStr,
             toolChoiceCanonical: toolChoiceStr,
-            thinkingCanonical: thinkingStr
+            thinkingCanonical: thinkingStr,
+            outputConfigCanonical: outputConfigStr
         )
     }
 
@@ -614,16 +621,22 @@ struct LineageFingerprint: Sendable, Equatable, Codable {
     let toolChoiceCanonical: String?
     /// Canonical string of the full `thinking` / `reasoning` object (nil when absent).
     let thinkingCanonical: String?
+    /// Canonical string of Anthropic `output_config` (nil when absent or unsupported).
+    let outputConfigCanonical: String?
 
     /// Derive the tree `ConversationKey` for this fingerprint.
     var conversationKey: ContentTree.ConversationKey {
-        let canonical = [
+        var parts = [
             "model:\(model)",
             "system:\(systemCanonical ?? "")",
             "tools:\(toolsCanonical ?? "")",
             "tool_choice:\(toolChoiceCanonical ?? "")",
             "thinking:\(thinkingCanonical ?? "")",
-        ].joined(separator: "\n")
+        ]
+        if let outputConfigCanonical {
+            parts.append("output_config:\(outputConfigCanonical)")
+        }
+        let canonical = parts.joined(separator: "\n")
         return ContentTree.ConversationKey(
             flavor: flavor,
             fingerprintHash: LineageHash.sha256Hex(canonical)

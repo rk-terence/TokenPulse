@@ -36,7 +36,7 @@ Relevant Anthropic documentation:
 - **Warm request**: a synthetic request sent by TokenPulse to refresh prompt-cache state.
 - **Selected path**: the single root-to-leaf lineage path chosen by the user for keep-alive.
 - **KA anchor**: the selected successful done request on that path, shown as the orange selected row in the proxy UI.
-- **KA source request**: the request whose observed body/headers would currently be used by the warm request (`latestSourceRequestID`). This is usually the KA anchor, but can temporarily be the single active successor while that successor is in flight.
+- **KA source request**: the anchor done request whose observed request body and response body are used to synthesize every warm request. The anchor advances when the single active successor completes.
 - **Frontier**: the latest content block TokenPulse wants the next real Claude Code request to reuse from cache.
 - **Breakpoint**: the block carrying Anthropic `cache_control`.
 - **Synthetic suffix**: the minimal user-side tail appended after the breakpoint so Anthropic returns a tiny response.
@@ -52,12 +52,14 @@ Do not mutate cache-identity fields in a warm request:
 - `system`
 - `tools`
 - `tool_choice`
-- `thinking`
-- `output_config.effort`
+- `thinking` — switching `thinking.type` (`adaptive` ↔ `enabled` ↔ `disabled`) breaks the message cache; in manual mode, changing `budget_tokens` also breaks it
+- `output_config` — see empirical note below
 - context-management fields
 - beta headers and other Anthropic cache-affecting headers
 
-Changing effort, thinking, tools, or `tool_choice` to make the synthetic response cheaper can defeat the cache-warming purpose.
+Empirical note on `output_config`. Anthropic's published docs do not list `output_config` (or its `effort` field) as cache-affecting: the prompt-caching doc only enumerates `thinking` enable/disable/budget changes; the adaptive-thinking doc only calls out `thinking.type` mode switches; the effort doc describes effort as "a behavioral signal, not a strict token budget" applied at generation time. We tried forcing `output_config.effort` to `"low"` on warm requests on that basis, expecting cache reads to remain unaffected. The next warm against an organic anchor came back with `R 0% / W 100%` — a complete cache miss, paying the cache-creation premium across the entire prefix. The conclusion we draw is that the request-body identity Anthropic hashes for cache lookup includes more than the docs enumerate; rewriting `output_config` (adding it where it wasn't, or mutating its contents) breaks the match. The synthesizer therefore treats `output_config` as cache-identity and passes it through untouched. Warm output cost is consequently bounded by the source request's effort and `thinking` settings, not by anything we control.
+
+Changing thinking, tools, or `tool_choice` to make the synthetic response cheaper would defeat the cache-warming purpose.
 
 Anthropic tool-use protocol also matters. When an assistant message contains `tool_use` blocks, the next user message must begin with matching `tool_result` blocks. A warm request that appends ordinary user text after an unresolved `tool_use` must therefore insert matching placeholder `tool_result` blocks first.
 
@@ -80,11 +82,11 @@ A request is eligible for manual keep-alive activation only when all of these ar
 
 After activation, the source follows the chosen lineage path:
 
-- While there is no active successor, the current selected done request is the latest source. Warm requests use its observed request body plus response body to synthesize the next frontier.
-- When exactly one active successor appears under the selected done request, the selection remains active and the warm source moves to that active request's observed request body and headers. There is no response frontier yet, so warm requests use exact replay of that body with `stream: false`.
-- When that active successor succeeds, the orange selected-row indicator advances to the new done request and future warm requests synthesize from the new request/response exchange.
-- When that active successor fails or is cancelled, the selection stays on the prior successful done request.
-- When more than one active successor appears under the selected done request, the path is considered branched and keep-alive is auto-deactivated for that conversation.
+- Warm requests always synthesize from the anchor (the most recent successful done request on the selected lineage path) using its observed request body and response body.
+- When exactly one active descendant of the anchor appears, the selection stays valid and the active descendant is observed for advancement signals only — warms continue to synthesize from the anchor.
+- When that active descendant succeeds, the anchor advances to it (the orange selected-row indicator moves) and future warms synthesize from the new anchor's request/response exchange.
+- When that active descendant fails or is canceled, the anchor stays put.
+- When more than one active descendant appears under the anchor, the path is considered branched and keep-alive is auto-deactivated for that conversation.
 
 Warm requests based on a completed source go through `KeepaliveSynthesizer.synthesize(...)` which can refuse to build a body for these reasons:
 
@@ -95,9 +97,9 @@ Warm requests based on a completed source go through `KeepaliveSynthesizer.synth
 
 # Body synthesis
 
-Warm requests preserve the upstream body as much as possible. The synthesizer copies the source request body verbatim and only edits the `messages` array; cache-identity fields (`model`, `system`, `tools`, `tool_choice`, `thinking`, `output_config.effort`) and other body extras pass through untouched. Headers come from the cached exchange and go upstream as-is, modulo the standard hop-by-hop filter (`Host` / `Content-Length` / `Transfer-Encoding`).
+Warm requests preserve the upstream body as much as possible. The synthesizer copies the source request body verbatim and edits only the `messages` array and the top-level `stream` boolean. Cache-identity fields (`model`, `system`, `tools`, `tool_choice`, `thinking`, `output_config`) and all other body extras pass through untouched. Headers come from the cached exchange and go upstream as-is, modulo the standard hop-by-hop filter (`Host` / `Content-Length` / `Transfer-Encoding`).
 
-Synthesized bodies force `stream: false` so the warm response is a single JSON document — `stream` is not a cache-identity field and the response shape only matters to the local handler. The synthetic suffix sent after the moving breakpoint is the literal text `"Do not think; reply with exactly this text: hi"`.
+Synthesized bodies force `stream: false` so the warm response is a single JSON document — `stream` is not a cache-identity field and the response shape only matters to the local handler. The synthetic user suffix sent after the moving breakpoint is the literal text `"Reply with exactly: hi"` — the wording deliberately avoids the token "think" because mentioning it (even in a negation) tends to push adaptive-thinking models into producing thinking output anyway. Warm output cost is therefore bounded by the source request's `thinking` and effort settings, not by the suffix text.
 
 Existing system-level cache anchors are preserved. Existing message bytes, including message-level `cache_control` markers, are preserved verbatim; the warmer only appends the new frontier messages and installs the new moving breakpoint in those appended bytes.
 
@@ -149,25 +151,19 @@ TokenPulse may use the same placeholder text with `is_error: true`, but the plac
 
 When Claude Code later sends the real organic request, that request should reuse the cached prefix through `assistant.tool_use` and then provide the real success or error `tool_result`.
 
-## Exact replay
-
-`KeepaliveSynthesizer.exactReplay(observedRequestBody:)` accepts a previously-observed organic request body and wraps it as a `Plan` with `frontierKind == .exactReplay`, forcing `stream: false` so the warm response is parseable as JSON usage. The intended use is to replay a body that already resolves the prior `tool_use` (so reconstruction is unnecessary), or to warm from the latest active request body before a response frontier exists.
-
-Manual warm requests route to exact replay only while the latest keep-alive path source is active. Completed sources still use frontier synthesis.
-
 # Timing
 
 The MVP fires warm requests only in response to the user's "Send keep-alive" click or the `Send keep-alive request` notification action. The timer may issue reminder notifications, but it must not send warm requests by itself.
 
-Reminder notifications are evaluated from the current KA source request's quiet reference:
+The quiet reference is `max(anchorDone.finishedAt, lastWarmStartedAt)`:
 
-- active KA source request: latest meaningful activity (`lastDataAt`) when present, otherwise its start/waiting timestamp
-- completed KA source request: terminal finish time
-- after a warm attempt: the warm attempt start time, until newer organic KA source activity supersedes it
+- The anchor done's terminal finish time is the baseline cache-write event.
+- After a warm attempt, `lastWarmStartedAt` supersedes it until the anchor advances.
+- Active descendants reading the cached prefix mid-generation are deliberately NOT used to advance the quiet reference. Mid-generation reads do not extend the prompt-cache TTL in a way that helps the warming purpose; only an actual cache-write event (the anchor's completion or a successful warm) refreshes the timer.
 
-A reminder is due at `quietReferenceAt + 270s` (4m30s). TokenPulse skips issuing it if that due time is already more than 20 seconds old. Each source request/node/quiet-reference tuple emits at most one reminder unless source activity changes or a new warm attempt resets the reference.
+A reminder is due at `quietReferenceAt + 270s` (4m30s). TokenPulse skips issuing it if that due time is already more than 20 seconds old. Each anchor node/request/quiet-reference tuple emits at most one reminder unless the anchor advances or a new warm attempt resets the reference.
 
-The reminder action is intentionally short-lived. Clicking `Send keep-alive request` validates atomically in `ProxySessionStore.beginReminderKeepaliveDispatch(...)` before the forwarder sends: the click must arrive within 20 seconds of issue time; the selection must still exist; the KA source request, source node, source session, and quiet reference must still match; no warm can already be in flight; and no KA attempt may have started after the notification was issued. Failed validation no-ops and logs only.
+The reminder action is intentionally short-lived. Clicking `Send keep-alive request` validates atomically in `ProxySessionStore.beginReminderKeepaliveDispatch(...)` before the forwarder sends: the click must arrive within 20 seconds of issue time; the selection must still exist; the anchor node, anchor request, anchor session, and quiet reference must still match; no warm can already be in flight; and no KA attempt may have started after the notification was issued. Failed validation no-ops and logs only.
 
 Stale reminders are removed from Notification Center as soon as their backing selection changes or ends. `NotificationService.sendProxyKeepaliveReminder` drops the previously delivered reminder for a conversation when issuing a new one (e.g. after the KA source flips), and `NotificationService.clearProxyKeepaliveReminder(forConversationID:)` drops it on every selection end. `LocalProxyController.onKeepaliveSelectionEnded` fires that cleanup for both manual `Stop keep-alive` clicks and the auto-deactivation paths described below; the auto paths additionally fire `onKeepaliveDeactivated` so the user-facing "keep-alive stopped" banner surfaces.
 
@@ -205,7 +201,7 @@ Right-click context menus on done request rows expose **Activate keep-alive** (w
 
 # Concurrency
 
-At most one warm runs per conversation at any given time. The manual actor-level check-and-set is `ProxySessionStore.beginManualKeepaliveDispatch(forConversationID:)`, which atomically returns `.dispatched(KeepaliveWarmSource, warmID:)` (and stamps `inFlightWarmRequestID = warmID` on the selection) only when no warm is currently in flight; otherwise it returns `.alreadyInFlight`. Reminder actions use `ProxySessionStore.beginReminderKeepaliveDispatch(reminder:)`, which performs stale-click validation and marks the warm in-flight in the same actor turn. `recordKeepaliveResult` clears `inFlightWarmRequestID` matching the warm UUID on every exit path (success, failure, refused, cancelled).
+At most one warm runs per conversation at any given time. The manual actor-level check-and-set is `ProxySessionStore.beginManualKeepaliveDispatch(forConversationID:)`, which atomically returns `.dispatched(KeepaliveWarmSource, warmID:)` (and stamps `inFlightWarmRequestID = warmID` on the selection) only when no warm is currently in flight; otherwise it returns `.alreadyInFlight`. Reminder actions use `ProxySessionStore.beginReminderKeepaliveDispatch(reminder:)`, which validates that the anchor node/request/session (`selection.nodeID/requestID/sessionID`) and quiet reference still match the reminder, then marks the warm in-flight in the same actor turn. `recordKeepaliveResult` clears `inFlightWarmRequestID` matching the warm UUID on every exit path (success, failure, refused, cancelled).
 
 The popup gates the menu off the same flag: `SessionActivity.hasKeepaliveInFlight` disables the session-menu **Send keep-alive**, and `SessionActivity.isKeepaliveInFlight(forConversationID:)` disables the row-level **Send keep-alive**. The actor-level refusal remains as a defensive backstop in case a click slips through between render and dispatch.
 
@@ -219,7 +215,7 @@ Every warm request emits one row to the `proxy_keepalives` table (added in event
 | started / completed timestamps | `started_at`, `completed_at` |
 | source conversation / node / request | `conversation_id`, `source_node_id`, `source_request_id` |
 | source session id | `source_session` |
-| frontier kind (`assistant_text`, `assistant_tool_use`, `exact_replay`, or `refused`) | `frontier_kind` |
+| frontier kind (`assistant_text`, `assistant_tool_use`, or `refused`) | `frontier_kind` |
 | frontier block descriptor (e.g. `messages[7].content[2] (text)`) | `frontier_descriptor` |
 | placeholder inserted | `placeholder_inserted` |
 | placeholder tool_use IDs (JSON array) | `placeholder_tool_use_ids` |
@@ -255,4 +251,4 @@ Manual smoke testing remains the verification path; no automated tests cover kee
 - Do not generalize this behavior to non-Anthropic providers without separate evidence.
 - Do not rewrite ordinary user traffic to improve cache placement.
 - Do not invent real tool results. Placeholder results are protocol shims only.
-- Do not change effort, thinking, or tool choice to reduce warm-request output.
+- Do not change `thinking`, `tool_choice`, or `output_config` to reduce warm-request output — all empirically behave as cache-identity fields and mutating them defeats the warming purpose. See the "API constraints" section for the empirical note on `output_config`.

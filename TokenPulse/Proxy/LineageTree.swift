@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 
 /// In-memory content tree. Each tree represents the conversation space for a
-/// single cache-identity fingerprint (same model / system / tools / thinking).
+/// single cache-identity fingerprint (same model / system / tools / thinking / output config).
 /// Nodes are content checkpoints — a node stores only the messages it appends
 /// to its parent's cumulative prefix. Requests are separate records attached
 /// to a node; a node may own multiple requests (retries, repeats, or two

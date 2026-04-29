@@ -73,7 +73,7 @@ Every proxied generation request whose body carries a messages-style stack (Anth
 
 Tree granularity is **content**, not requests:
 
-- A **conversation** is a single tree rooted at a synthetic empty-messages node and keyed by `(flavor, fingerprint_hash)`. The fingerprint is a stable hash of the cache-identity fields: `model`, `system`/`instructions`, `tools`, `tool_choice`, `thinking`/`reasoning`.
+- A **conversation** is a single tree rooted at a synthetic empty-messages node and keyed by `(flavor, fingerprint_hash)`. The fingerprint is a stable hash of the cache-identity fields: `model`, `system`/`instructions`, `tools`, `tool_choice`, `thinking`/`reasoning`, and Anthropic `output_config`.
 - A **node** is a content checkpoint — a point in the conversation's message-prefix space. Each non-root node stores only its **delta messages** (the messages it appends to its parent's cumulative prefix) and its `cumulative_hash` (the fold-hash of the full prefix at that node). Deltas are immutable after creation.
 - A **request** is one attempt attached to a node. It carries `session_id`, `previous_response_id`, `response_id`, `created_at`, `finished_at`, `succeeded`, and `token_usage`. States match the existing request pipeline: `uploading` → `waiting` → `receiving` → terminal (`succeeded` / errored / cancelled). A node may own **multiple** requests; we do not restrict to one.
 
@@ -333,7 +333,7 @@ One row per conversation (cache-identity bucket).
 |--------|------|-------------|
 | `id` | TEXT PK | Conversation UUID |
 | `flavor` | TEXT NOT NULL | `anthropicMessages` \| `openAIResponses` |
-| `fingerprint_hash` | TEXT NOT NULL | SHA-256 of normalized identity (`model` + `system`/`instructions` + `tools` + `tool_choice` + `thinking`/`reasoning`) |
+| `fingerprint_hash` | TEXT NOT NULL | SHA-256 of normalized identity (`model` + `system`/`instructions` + `tools` + `tool_choice` + `thinking`/`reasoning` + Anthropic `output_config`) |
 | `fingerprint_json` | TEXT NOT NULL | Serialized `LineageFingerprint` for replay / diagnostics |
 | `root_node_id` | TEXT NOT NULL | UUID of the conversation's synthetic empty-messages root node |
 | `first_seen` / `last_seen` | TEXT | ISO 8601 timestamps |
@@ -394,7 +394,7 @@ Stores lifecycle events: `proxy_started`, `proxy_stopped`, `session_expired`.
 
 ### `proxy_request_content`
 
-Stores request/response captures. When the request has content-tree coordinates, the cache-identity fields (`model`, `system`/`instructions`, `tools`, `tool_choice`, `thinking`/`reasoning`), the messages stack (`messages` for Anthropic, `input` for OpenAI Responses), and `previous_response_id` are stripped from the stored body and replaced with refs back to the conversation and node:
+Stores request/response captures. When the request has content-tree coordinates, the cache-identity fields (`model`, `system`/`instructions`, `tools`, `tool_choice`, `thinking`/`reasoning`, Anthropic `output_config`), the messages stack (`messages` for Anthropic, `input` for OpenAI Responses), and `previous_response_id` are stripped from the stored body and replaced with refs back to the conversation and node:
 
 ```json
 {

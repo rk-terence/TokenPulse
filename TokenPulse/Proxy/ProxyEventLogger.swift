@@ -337,8 +337,9 @@ actor ProxyEventLogger {
         let now = isoFormatter.string(from: Date())
         // Serialize the full fingerprint so every conversation row captures
         // the cache-identity payload (model + system + tools + tool_choice +
-        // thinking). Keep-alive and diagnostics can rebuild a valid replay
-        // body without needing the original request.
+        // thinking/reasoning + Anthropic output_config). Keep-alive and
+        // diagnostics can rebuild a valid replay body without needing the
+        // original request.
         let fingerprintJSON: String
         if let data = try? JSONEncoder().encode(context.fingerprint),
            let text = String(data: data, encoding: .utf8) {
@@ -1121,7 +1122,7 @@ actor ProxyEventLogger {
             let messagesKey: String
             switch lineage.flavor {
             case .anthropicMessages:
-                fingerprintKeys = ["model", "system", "tools", "tool_choice", "thinking"]
+                fingerprintKeys = ["model", "system", "tools", "tool_choice", "thinking", "output_config"]
                 messagesKey = "messages"
             case .openAIResponses:
                 fingerprintKeys = ["model", "instructions", "tools", "tool_choice", "reasoning"]
