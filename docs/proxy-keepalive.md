@@ -15,11 +15,11 @@ The first iteration of keep-alive ships as a manual MVP:
 - Anthropic Messages only
 - Claude Code sessions only (Anthropic-flavored sessions in the proxy)
 - one selected lineage path per conversation; activating on a new request replaces the previous selection for that conversation
-- visible in the proxy UI as the **orange leaf indicator** on the selected done row, **a yellow ⚡ row while a warm is in flight**, **a gray ⚡ row at the bottom of the session for the latest completed warm**, and an inline **`ka $xx (n_ka)`** cluster in the session header carrying the cumulative warm-cost subtotal and warm-attempt count
+- visible in the proxy UI as the **orange KA anchor indicator** on the selected done row, **a yellow ⚡ row while a warm is in flight**, **a gray ⚡ row at the bottom of the session for the latest completed warm**, and an inline **`ka $xx (n_ka)`** cluster in the session header carrying the cumulative warm-cost subtotal and warm-attempt count
 - excluded from the content tree as real conversation work — synthetic warm requests never become tree nodes
 - logged and costed separately from organic requests via the `proxy_keepalives` SQLite table (event-log schema v7) and the per-session `KeepaliveSessionHistory` bucket (`ProxySessionStore.keepaliveHistoryBySession`)
 
-Automatic idle keep-alive can be considered later, but only after the manual path proves that synthetic requests consistently produce high cache reads and low incremental cache writes.
+TokenPulse may remind the user to manually send a warm request near the likely cache TTL, but it does not send automatic keep-alive requests.
 
 # References
 
@@ -35,6 +35,8 @@ Relevant Anthropic documentation:
 - **Organic request**: a request sent by the client tool, such as Claude Code.
 - **Warm request**: a synthetic request sent by TokenPulse to refresh prompt-cache state.
 - **Selected path**: the single root-to-leaf lineage path chosen by the user for keep-alive.
+- **KA anchor**: the selected successful done request on that path, shown as the orange selected row in the proxy UI.
+- **KA source request**: the request whose observed body/headers would currently be used by the warm request (`latestSourceRequestID`). This is usually the KA anchor, but can temporarily be the single active successor while that successor is in flight.
 - **Frontier**: the latest content block TokenPulse wants the next real Claude Code request to reuse from cache.
 - **Breakpoint**: the block carrying Anthropic `cache_control`.
 - **Synthetic suffix**: the minimal user-side tail appended after the breakpoint so Anthropic returns a tiny response.
@@ -65,7 +67,7 @@ A request is eligible for manual keep-alive activation only when all of these ar
 
 - The selected request belongs to Anthropic Messages traffic.
 - The request reached a successful terminal state (`succeeded == true`).
-- The request's full upstream exchange (raw request body + headers + raw response) is still cached in TokenPulse's bounded recent-exchange ring (capacity `ProxySessionStore.recentKeepaliveExchangeCapacity`, currently 64). Older requests roll out of the ring; the user must pick a fresher leaf.
+- The request's full upstream exchange (raw request body + headers + raw response) is still cached in TokenPulse's bounded recent-exchange ring (capacity `ProxySessionStore.recentKeepaliveExchangeCapacity`, currently 64). Older requests roll out of the ring; the user must pick a fresher KA anchor.
 
 `ProxySessionStore.activateKeepalive(forRequestID:)` enforces these and returns one of:
 
@@ -155,7 +157,19 @@ Manual warm requests route to exact replay only while the latest keep-alive path
 
 # Timing
 
-The MVP fires warm requests synchronously in response to the user's "Send keep-alive" click — there is no scheduler. The default Anthropic ephemeral cache lifetime is still 5 minutes; the user is responsible for spacing their clicks.
+The MVP fires warm requests only in response to the user's "Send keep-alive" click or the `Send keep-alive request` notification action. The timer may issue reminder notifications, but it must not send warm requests by itself.
+
+Reminder notifications are evaluated from the current KA source request's quiet reference:
+
+- active KA source request: latest meaningful activity (`lastDataAt`) when present, otherwise its start/waiting timestamp
+- completed KA source request: terminal finish time
+- after a warm attempt: the warm attempt start time, until newer organic KA source activity supersedes it
+
+A reminder is due at `quietReferenceAt + 270s` (4m30s). TokenPulse skips issuing it if that due time is already more than 20 seconds old. Each source request/node/quiet-reference tuple emits at most one reminder unless source activity changes or a new warm attempt resets the reference.
+
+The reminder action is intentionally short-lived. Clicking `Send keep-alive request` validates atomically in `ProxySessionStore.beginReminderKeepaliveDispatch(...)` before the forwarder sends: the click must arrive within 20 seconds of issue time; the selection must still exist; the KA source request, source node, source session, and quiet reference must still match; no warm can already be in flight; and no KA attempt may have started after the notification was issued. Failed validation no-ops and logs only.
+
+Stale reminders are removed from Notification Center as soon as their backing selection changes or ends. `NotificationService.sendProxyKeepaliveReminder` drops the previously delivered reminder for a conversation when issuing a new one (e.g. after the KA source flips), and `NotificationService.clearProxyKeepaliveReminder(forConversationID:)` drops it on every selection end. `LocalProxyController.onKeepaliveSelectionEnded` fires that cleanup for both manual `Stop keep-alive` clicks and the auto-deactivation paths described below; the auto paths additionally fire `onKeepaliveDeactivated` so the user-facing "keep-alive stopped" banner surfaces.
 
 Auto-deactivation runs in the session store. All paths remove the selection entirely; per-session history in `keepaliveHistoryBySession` is not affected:
 
@@ -181,17 +195,17 @@ The proxy popover row distinguishes:
 
 - **Organic active requests** — left edge accent: the system accent color, drawn by `RequestActivityRow` when `isActive == true`.
 - **Organic done requests** — no left-edge indicator.
-- **Selected keep-alive leaf** — left edge accent: orange (`Color.orange`), drawn by `RequestActivityRow` when `isKeepaliveLeaf == true`. A done row is never simultaneously the active indicator and the keep-alive indicator, so the two colors never appear on the same row.
+- **Selected KA anchor** — left edge accent: orange (`Color.orange`), drawn by `RequestActivityRow` when `isKeepaliveAnchor == true`. A done row is never simultaneously the active indicator and the keep-alive indicator, so the two colors never appear on the same row.
 - **Warm active rows** — left edge accent: a yellow ⚡ glyph (`Image(systemName: "bolt.fill")`), drawn whenever `request.kind == .keepalive && isActive == true`. The row carries the same stat fields as an organic active row (model name, ↑ bytes, ↓ bytes, ttft, age) because `ProxyForwarder.sendKeepaliveWarmRequest` registers the warm as a real `ProxyRequestActivity` and drives it via `StreamingDelegate`.
 - **Warm done row (latest only)** — left edge accent: a gray ⚡ glyph. Pinned at the bottom of the session's done list. Only one survives per session: each new completion replaces the previous (the activity snapshot lives on `KeepaliveSessionHistory.lastWarmActivity` in `ProxySessionStore.keepaliveHistoryBySession`, updated during `recordKeepaliveResult`). The stat fields differ — instead of the standard ↑/↓/e2e/$ block, the warm done row shows `R%` (cache read), `W%` (cache creation), `e2e`, and `$cost`. For Anthropic, the cache-quality denominator is `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` because cached input tokens are reported separately.
 
 The session header carries an inline `ka $xx (n_ka)` cluster (between `done N` and `$T`) when the session has any completed warm attempts. `$xx` is `keepaliveCostUSD` and `n_ka` is `keepaliveDoneCount` — both read from the per-session `KeepaliveSessionHistory` bucket and persist across stop/restart cycles. The trailing `$T` is the **total** session cost (organic + KA — the rollup happens in `ProxySessionStore.recordKeepaliveResult`). The proxy-wide `$T` at the top of the popover similarly includes warm cost via the `accumulateCost` call inside the same method.
 
-Right-click context menus on done request rows expose **Activate keep-alive** (when no selection exists for this leaf) or **Send keep-alive** / **Stop keep-alive** (when this row is the selected leaf). Clicking Stop removes the selection; to restart, the user must right-click a done row again and pick **Activate keep-alive** — there is no Resume action. The session header menu adds matching **Send keep-alive** / **Stop keep-alive** entries beside **Hide session** when at least one selection exists in the session. The **Activate** entry is gated on `ConfigService.keepaliveEnabled`; **Send** / **Stop** stay visible for already-active selections so a user who toggles the global flag off can still wind down. Warm rows themselves expose no menu — `RequestActivityRow.supportsKeepaliveMenu` filters on `request.kind.storesDoneActivity` which `.keepalive` returns false for.
+Right-click context menus on done request rows expose **Activate keep-alive** (when no selection exists for this KA anchor) or **Send keep-alive** / **Stop keep-alive** (when this row is the selected KA anchor). Clicking Stop removes the selection; to restart, the user must right-click a done row again and pick **Activate keep-alive** — there is no Resume action. The session header menu adds matching **Send keep-alive** / **Stop keep-alive** entries beside **Hide session** when at least one selection exists in the session. The **Activate** entry is gated on `ConfigService.keepaliveEnabled`; **Send** / **Stop** stay visible for already-active selections so a user who toggles the global flag off can still wind down. Warm rows themselves expose no menu — `RequestActivityRow.supportsKeepaliveMenu` filters on `request.kind.storesDoneActivity` which `.keepalive` returns false for.
 
 # Concurrency
 
-At most one warm runs per conversation at any given time. The actor-level check-and-set is `ProxySessionStore.beginManualKeepaliveDispatch(forConversationID:)`, which atomically returns `.dispatched(KeepaliveWarmSource, warmID:)` (and stamps `inFlightWarmRequestID = warmID` on the selection) only when no warm is currently in flight; otherwise it returns `.alreadyInFlight`. `recordKeepaliveResult` clears `inFlightWarmRequestID` matching the warm UUID on every exit path (success, failure, refused, cancelled).
+At most one warm runs per conversation at any given time. The manual actor-level check-and-set is `ProxySessionStore.beginManualKeepaliveDispatch(forConversationID:)`, which atomically returns `.dispatched(KeepaliveWarmSource, warmID:)` (and stamps `inFlightWarmRequestID = warmID` on the selection) only when no warm is currently in flight; otherwise it returns `.alreadyInFlight`. Reminder actions use `ProxySessionStore.beginReminderKeepaliveDispatch(reminder:)`, which performs stale-click validation and marks the warm in-flight in the same actor turn. `recordKeepaliveResult` clears `inFlightWarmRequestID` matching the warm UUID on every exit path (success, failure, refused, cancelled).
 
 The popup gates the menu off the same flag: `SessionActivity.hasKeepaliveInFlight` disables the session-menu **Send keep-alive**, and `SessionActivity.isKeepaliveInFlight(forConversationID:)` disables the row-level **Send keep-alive**. The actor-level refusal remains as a defensive backstop in case a click slips through between render and dispatch.
 

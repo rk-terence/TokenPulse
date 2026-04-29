@@ -590,7 +590,7 @@ private struct SessionActivityRow: View {
                     RequestActivityRow(
                         request: request,
                         isActive: true,
-                        isKeepaliveLeaf: false,
+                        isKeepaliveAnchor: false,
                         sessionAPIFlavor: activity.apiFlavor,
                         proxyController: proxyController
                     )
@@ -606,7 +606,7 @@ private struct SessionActivityRow: View {
                     RequestActivityRow(
                         request: request,
                         isActive: false,
-                        isKeepaliveLeaf: activity.isKeepaliveLeaf(requestID: request.id),
+                        isKeepaliveAnchor: activity.isKeepaliveAnchor(requestID: request.id),
                         isKeepaliveInFlight: request.conversationID
                             .map(activity.isKeepaliveInFlight(forConversationID:)) ?? false,
                         sessionAPIFlavor: activity.apiFlavor,
@@ -651,7 +651,7 @@ private struct SessionActivityRow: View {
             // Anthropic-flavored sessions that already have a selection;
             // activation itself is a per-row action (right-click a done
             // request) since the menu would otherwise need to disambiguate
-            // which leaf the user wants.
+            // which KA anchor the user wants.
             if !activity.keepaliveSelections.isEmpty {
                 Button(
                     NSLocalizedString(
@@ -784,9 +784,9 @@ private struct RequestActivityRow: View {
     let request: ProxyRequestActivity
     let isActive: Bool
     /// True when this done row is the conversation's currently-selected
-    /// keep-alive leaf. Drives the orange overlay and adjusts the context
+    /// KA anchor. Drives the orange overlay and adjusts the context
     /// menu (Stop instead of Activate).
-    var isKeepaliveLeaf: Bool = false
+    var isKeepaliveAnchor: Bool = false
     /// True when the conversation backing this row already has a warm in
     /// flight, so the row-level "Send keep-alive" can be disabled. Affects
     /// only the keep-alive-anchor row (the one that owns the menu).
@@ -817,7 +817,7 @@ private struct RequestActivityRow: View {
     /// Done rows of Anthropic conversations get the keep-alive context
     /// menu; all other rows (in-flight, OpenAI, untracked) skip it. The
     /// global flag suppresses the menu entirely unless this row is already
-    /// the selected leaf — in which case Send/Stop remain available so the
+    /// the selected KA anchor — in which case Send/Stop remain available so the
     /// user can wind down a session they previously anchored.
     private var supportsKeepaliveMenu: Bool {
         guard sessionAPIFlavor == .anthropicMessages,
@@ -826,7 +826,7 @@ private struct RequestActivityRow: View {
               request.conversationID != nil else {
             return false
         }
-        if isKeepaliveLeaf {
+        if isKeepaliveAnchor {
             return true
         }
         return ConfigService.shared.keepaliveEnabled
@@ -879,7 +879,7 @@ private struct RequestActivityRow: View {
                     .frame(width: 2)
                     .offset(x: -6)
                     .allowsHitTesting(false)
-            } else if isKeepaliveLeaf {
+            } else if isKeepaliveAnchor {
                 RoundedRectangle(cornerRadius: 1)
                     .fill(Color.orange)
                     .frame(width: 2)
@@ -892,7 +892,7 @@ private struct RequestActivityRow: View {
 
     @ViewBuilder
     private var keepaliveMenuItems: some View {
-        if isKeepaliveLeaf, let conversationID = request.conversationID {
+        if isKeepaliveAnchor, let conversationID = request.conversationID {
             Button(
                 NSLocalizedString(
                     "proxy.row.sendKeepalive",

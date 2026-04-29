@@ -55,9 +55,9 @@ final class LocalProxyController {
             keepaliveSelections.contains { $0.inFlightWarmRequestID != nil }
         }
         /// True when at least one selection in this session points at the
-        /// given request — used by the row UI to draw the orange leaf
+        /// given request — used by the row UI to draw the orange KA anchor
         /// indicator.
-        func isKeepaliveLeaf(requestID: UUID) -> Bool {
+        func isKeepaliveAnchor(requestID: UUID) -> Bool {
             keepaliveSelections.contains { $0.requestID == requestID }
         }
         /// True when this conversation already has a warm in flight, so the
@@ -114,6 +114,17 @@ final class LocalProxyController {
     /// session store (path branched, pruned, session expired). Wired up by
     /// phase 6 to surface a notification; left nil otherwise.
     var onKeepaliveDeactivated: ((UUID, ProxySessionStore.KeepaliveDeactivationReason) -> Void)?
+    /// Fired when an active KA selection's source has been quiet long enough
+    /// to offer a manual warm reminder. The callback must not auto-send.
+    var onKeepaliveReminder: ((KeepaliveReminder) -> Void)?
+    /// Fired whenever a KA selection ends, regardless of cause (manual stop
+    /// via the popover or auto-deactivation through the session store). Used
+    /// by AppDelegate to drop any lingering reminder notification so the
+    /// "Send keep-alive request" button does not survive the selection it
+    /// backed. `onKeepaliveDeactivated` still fires alongside this for the
+    /// auto paths because that callback also drives the user-facing
+    /// "keep-alive stopped" banner.
+    var onKeepaliveSelectionEnded: ((UUID) -> Void)?
 
     private var server: ProxyHTTPServer?
     private var serverGeneration: UInt64 = 0
@@ -189,6 +200,7 @@ final class LocalProxyController {
             await store.setKeepaliveDeactivatedCallback { [weak self] conversationID, reason in
                 Task { @MainActor [weak self] in
                     self?.onKeepaliveDeactivated?(conversationID, reason)
+                    self?.onKeepaliveSelectionEnded?(conversationID)
                     self?.scheduleTrafficRefresh()
                 }
             }
@@ -603,6 +615,7 @@ final class LocalProxyController {
 
                 let capturedHidden = await MainActor.run { self?.hiddenSessions ?? [:] }
                 let snapshot = await metStore.snapshot()
+                let dueKeepaliveReminders = await sessStore.dueKeepaliveReminders(now: now)
                 let activitySnapshots = await sessStore.snapshotSessionActivities()
                 let uploadSize  = await sessStore.lastUploadSize()
                 let bytesRx     = await sessStore.cumulativeBytesReceived()
@@ -626,6 +639,9 @@ final class LocalProxyController {
 
                 await MainActor.run {
                     guard !Task.isCancelled else { return }
+                    for reminder in dueKeepaliveReminders {
+                        self?.onKeepaliveReminder?(reminder)
+                    }
                     for id in stalledHideIDs { self?.hiddenSessions.removeValue(forKey: id) }
                     self?.sessionActivities   = activities
                     self?.lastUploadBytes     = uploadSize
@@ -749,9 +765,11 @@ final class LocalProxyController {
 
     /// User-initiated deactivation. Auto-deactivation paths (path branched,
     /// pruned, session expired) come through `onKeepaliveDeactivated`
-    /// instead.
+    /// instead. `onKeepaliveSelectionEnded` fires for both manual and auto
+    /// paths.
     func stopKeepalive(forConversationID conversationID: UUID) async {
         await sessionStore.deactivateKeepalive(forConversationID: conversationID)
+        onKeepaliveSelectionEnded?(conversationID)
         scheduleTrafficRefresh()
     }
 
@@ -769,6 +787,18 @@ final class LocalProxyController {
         await forwarder.sendKeepaliveWarmRequest(
             conversationID: conversationID,
             sessionStore: sessionStore
+        )
+        scheduleTrafficRefresh()
+    }
+
+    /// Send a reminder-triggered warm only if the reminder still matches the
+    /// current KA source and quiet-reference state.
+    func triggerKeepaliveReminder(_ reminder: KeepaliveReminder) async {
+        guard let forwarder = anthropicForwarder else { return }
+        await forwarder.sendKeepaliveWarmRequest(
+            conversationID: reminder.conversationID,
+            sessionStore: sessionStore,
+            reminder: reminder
         )
         scheduleTrafficRefresh()
     }

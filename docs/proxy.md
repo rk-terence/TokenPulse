@@ -22,7 +22,7 @@ Outbound forwarding from this local proxy follows TokenPulse's upstream proxy se
 
 The proxy provides visibility that upstream APIs do not surface directly in local tools: per-request token usage, per-session aggregation, model selection, byte counts, request timing, and estimated cost. It also assembles proxied requests into a **content tree** — a conversation-level structure where each tree node is a content checkpoint (a point in the conversation's message-prefix space) and each attached request is an attempt at that checkpoint. Nodes dedupe shared conversation prefixes across requests, so the event logger stores message content once per node instead of once per request.
 
-Keep-alive (cache-warming replay requests) ships as a manual MVP. The full design lives in [proxy-keepalive.md](proxy-keepalive.md): synthetic Anthropic warm requests derived from a selected lineage path, excluded from the content tree as real work, and logged/costed separately in `proxy_keepalives` (event-log schema v7).
+Keep-alive (cache-warming replay requests) ships as a manual MVP. The full design lives in [proxy-keepalive.md](proxy-keepalive.md): synthetic Anthropic warm requests derived from a selected lineage path, excluded from the content tree as real work, and logged/costed separately in `proxy_keepalives` (event-log schema v7). TokenPulse may issue manual reminder notifications near the likely cache TTL; reminders do not auto-send warm requests.
 
 # Architecture
 
@@ -264,12 +264,13 @@ Keep-alive (cache-warming replay requests) ships as a manual MVP. Full spec — 
 
 In summary:
 
-- The user activates keep-alive by right-clicking a recent successful Anthropic done request in the proxy popover. `ProxySessionStore.activateKeepalive(forRequestID:)` activates the conversation's selected path at that request and retains source exchanges by request ID.
-- Each "Send keep-alive" click uses the latest source on the selected path. Done sources run `KeepaliveSynthesizer.synthesize(...)` to extend the source response frontier with `cache_control` on the last assistant text or `tool_use` block. Active sources run exact replay of the latest observed request body with `stream: false`, because no response frontier exists yet. Warm requests bypass `attachToTree`, organic session totals, and the per-request UI activity row.
+- The user activates keep-alive by right-clicking a recent successful Anthropic done request in the proxy popover. `ProxySessionStore.activateKeepalive(forRequestID:)` activates the conversation's selected path at that request, making it the KA anchor, and retains source exchanges by request ID.
+- Each "Send keep-alive" click uses the latest KA source request on the selected path. Done sources run `KeepaliveSynthesizer.synthesize(...)` to extend the source response frontier with `cache_control` on the last assistant text or `tool_use` block. Active sources run exact replay of the latest observed request body with `stream: false`, because no response frontier exists yet. Warm requests bypass `attachToTree` and organic session totals, but appear as warm activity rows.
 - Outcomes are recorded on `KeepaliveSelection` (cumulative cost, age timer, last cache-read/cache-creation percentages) and audited in the `proxy_keepalives` SQLite table.
 - Auto-deactivation drops the selection when the selected path branches with more than one active successor, when the source request/node/conversation is pruned, or when the source session expires; each fires `LocalProxyController.onKeepaliveDeactivated` which the AppDelegate forwards to `NotificationService.sendProxyKeepaliveDisabled`.
+- When a KA selection is active and the current KA source request has been quiet for 4m30s, the refresh loop may issue a reminder notification with the `Send keep-alive request` action. Clicking it sends only after actor-isolated stale validation; old or mismatched reminders no-op.
 
-Manual-only by design. Automatic timer-driven keep-alive is future work.
+Manual-only by design. Automatic timer-driven keep-alive requests are future work.
 
 # Error handling
 

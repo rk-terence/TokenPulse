@@ -21,6 +21,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         proxyController = LocalProxyController()
         providerManager.proxyController = proxyController
 
+        NotificationService.shared.onKeepaliveReminderAction = { [weak self] reminder in
+            Task { @MainActor [weak self] in
+                await self?.proxyController?.triggerKeepaliveReminder(reminder)
+            }
+        }
+
         // Surface auto-deactivation of keep-alive selections (path branched,
         // pruned, source session expired) as a user-facing notification.
         // Manual deactivation through the popover doesn't fire this.
@@ -38,6 +44,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 sessionID: conversationID.uuidString,
                 reason: reasonText
             )
+        }
+        proxyController?.onKeepaliveReminder = { reminder in
+            NotificationService.shared.sendProxyKeepaliveReminder(reminder)
+        }
+        proxyController?.onKeepaliveSelectionEnded = { conversationID in
+            NotificationService.shared.clearProxyKeepaliveReminder(forConversationID: conversationID)
         }
 
         // Set up status bar

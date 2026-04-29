@@ -5,6 +5,8 @@ import UserNotifications
 final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
 
     static let shared = NotificationService()
+    nonisolated static let keepaliveReminderCategoryIdentifier = "proxy.keepalive.reminder"
+    nonisolated static let keepaliveReminderActionIdentifier = "proxy.keepalive.reminder.send"
 
     private struct ProviderSnapshot {
         var fiveHourUtilization: Double?
@@ -13,15 +15,44 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
     }
 
     private var snapshots: [String: ProviderSnapshot] = [:]
+    /// Latest delivered KA reminder identifier, keyed by conversation. Used
+    /// to drop stale notifications when a new reminder issues for the same
+    /// conversation (source flip) or the selection ends (manual stop / auto
+    /// deactivation). The action button on a stale notification still
+    /// no-ops via actor-isolated validation, but we don't want to leave
+    /// dead "Send keep-alive request" buttons sitting in Notification
+    /// Center.
+    private var pendingKeepaliveReminderIDs: [UUID: String] = [:]
+    var onKeepaliveReminderAction: ((KeepaliveReminder) -> Void)?
 
     private override init() {
         super.init()
         let center = UNUserNotificationCenter.current()
         center.delegate = self
+        registerCategories(center: center)
     }
 
     func requestAuthorization() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    private func registerCategories(center: UNUserNotificationCenter) {
+        let sendKeepaliveAction = UNNotificationAction(
+            identifier: Self.keepaliveReminderActionIdentifier,
+            title: NSLocalizedString(
+                "notification.proxy.keepaliveReminder.action",
+                value: "Send keep-alive request",
+                comment: "Action button title for a keep-alive reminder notification"
+            ),
+            options: []
+        )
+        let category = UNNotificationCategory(
+            identifier: Self.keepaliveReminderCategoryIdentifier,
+            actions: [sendKeepaliveAction],
+            intentIdentifiers: [],
+            options: []
+        )
+        center.setNotificationCategories([category])
     }
 
     /// Called after each successful provider refresh with the latest entries.
@@ -74,6 +105,52 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
             title: String(localized: "Proxy keep-alive stopped"),
             body: message
         )
+    }
+
+    /// Notify the user that the selected KA source is nearing the prompt-cache
+    /// TTL. The action button only routes back through stale-click validation.
+    func sendProxyKeepaliveReminder(_ reminder: KeepaliveReminder) {
+        guard let userInfo = Self.userInfo(for: reminder) else { return }
+        let id = "proxy-keepalive-reminder-\(reminder.conversationID.uuidString)-\(reminder.sourceRequestID.uuidString)"
+        if let previousID = pendingKeepaliveReminderIDs[reminder.conversationID], previousID != id {
+            removeKeepaliveReminderNotification(id: previousID)
+        }
+        pendingKeepaliveReminderIDs[reminder.conversationID] = id
+        let sessionID = ProxySessionID.shortDisplayID(for: reminder.sourceSessionID)
+        let body = String(
+            format: NSLocalizedString(
+                "notification.proxy.keepaliveReminder.body",
+                value: "Session %@ has been quiet for 4m30s.",
+                comment: "Keep-alive reminder notification body; parameter is a short proxy session ID"
+            ),
+            sessionID
+        )
+        send(
+            id: id,
+            title: NSLocalizedString(
+                "notification.proxy.keepaliveReminder.title",
+                value: "Keep-alive reminder",
+                comment: "Keep-alive reminder notification title"
+            ),
+            body: body,
+            categoryIdentifier: Self.keepaliveReminderCategoryIdentifier,
+            userInfo: userInfo
+        )
+    }
+
+    /// Drop any pending or delivered KA reminder notification for the given
+    /// conversation. Called from both the auto-deactivation and manual-stop
+    /// paths so a "Send keep-alive request" button never lingers after the
+    /// selection that backed it has gone away.
+    func clearProxyKeepaliveReminder(forConversationID conversationID: UUID) {
+        guard let id = pendingKeepaliveReminderIDs.removeValue(forKey: conversationID) else { return }
+        removeKeepaliveReminderNotification(id: id)
+    }
+
+    private func removeKeepaliveReminderNotification(id: String) {
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: [id])
+        center.removeDeliveredNotifications(withIdentifiers: [id])
     }
 
     // MARK: - Threshold checks
@@ -173,14 +250,36 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
         )
     }
 
-    private func send(id: String, title: String, body: String) {
+    private func send(
+        id: String,
+        title: String,
+        body: String,
+        categoryIdentifier: String? = nil,
+        userInfo: [AnyHashable: Any] = [:]
+    ) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.sound = .default
+        if let categoryIdentifier {
+            content.categoryIdentifier = categoryIdentifier
+        }
+        content.userInfo = userInfo
 
         let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
+    }
+
+    nonisolated static let keepaliveReminderUserInfoKey = "keepaliveReminderPayload"
+
+    nonisolated private static func userInfo(for reminder: KeepaliveReminder) -> [AnyHashable: Any]? {
+        guard let data = try? JSONEncoder().encode(reminder) else { return nil }
+        return [keepaliveReminderUserInfoKey: data]
+    }
+
+    nonisolated private static func reminder(from userInfo: [AnyHashable: Any]) -> KeepaliveReminder? {
+        guard let data = userInfo[keepaliveReminderUserInfoKey] as? Data else { return nil }
+        return try? JSONDecoder().decode(KeepaliveReminder.self, from: data)
     }
 
     // MARK: - UNUserNotificationCenterDelegate
@@ -190,5 +289,18 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
         [.banner, .sound]
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        guard response.actionIdentifier == Self.keepaliveReminderActionIdentifier else { return }
+        guard let reminder = Self.reminder(from: response.notification.request.content.userInfo) else {
+            return
+        }
+        await MainActor.run {
+            self.onKeepaliveReminderAction?(reminder)
+        }
     }
 }

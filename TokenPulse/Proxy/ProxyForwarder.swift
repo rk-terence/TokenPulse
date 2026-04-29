@@ -880,16 +880,22 @@ final class ProxyForwarder: Sendable {
     /// dropped (e.g. auto-deactivated mid-click).
     func sendKeepaliveWarmRequest(
         conversationID: UUID,
-        sessionStore: ProxySessionStore
+        sessionStore: ProxySessionStore,
+        reminder: KeepaliveReminder? = nil
     ) async {
         guard apiFlavor == .anthropicMessages else { return }
 
         let attemptID = UUID()
         let startedAt = Date()
 
-        let dispatch = await sessionStore.beginManualKeepaliveDispatch(
-            forConversationID: conversationID
-        )
+        let dispatch: ProxySessionStore.KeepaliveDispatchOutcome
+        if let reminder {
+            dispatch = await sessionStore.beginReminderKeepaliveDispatch(reminder: reminder)
+        } else {
+            dispatch = await sessionStore.beginManualKeepaliveDispatch(
+                forConversationID: conversationID
+            )
+        }
         let warmID: UUID
         let selection: ProxySessionStore.KeepaliveSelection
         let exchange: ProxySessionStore.KeepaliveExchange

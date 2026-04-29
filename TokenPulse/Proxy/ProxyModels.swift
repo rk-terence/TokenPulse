@@ -156,6 +156,18 @@ struct ProxySessionIdentity: Sendable {
     }
 }
 
+/// Payload carried by a manual keep-alive reminder notification. It captures
+/// the exact KA source/ref state that was actionable when the notification was
+/// issued so the click handler can reject stale actions before sending.
+struct KeepaliveReminder: Codable, Equatable, Sendable {
+    let conversationID: UUID
+    let sourceNodeID: UUID
+    let sourceRequestID: UUID
+    let sourceSessionID: String
+    let quietReferenceAt: Date
+    let issuedAt: Date
+}
+
 // MARK: - Lightweight model for the proxy passthrough
 
 /// For Phase 1 passthrough, we store the raw body as Data and only extract

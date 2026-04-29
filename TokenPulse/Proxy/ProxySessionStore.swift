@@ -10,6 +10,9 @@ import Foundation
 ///   body has been parsed — before upstream is contacted. Every displayable
 ///   done row is derived from the tree's content nodes.
 actor ProxySessionStore {
+    private static let keepaliveReminderDelaySeconds: TimeInterval = 270
+    private static let keepaliveReminderActionWindowSeconds: TimeInterval = 20
+
 
     struct CostSnapshot: Sendable {
         let totalEstimatedCostUSD: Double
@@ -81,6 +84,10 @@ actor ProxySessionStore {
         var latestSourceSessionID: String
         var latestSourceIsActive: Bool
         let activatedAt: Date
+        var lastWarmStartedAt: Date?
+        var lastReminderSourceNodeID: UUID?
+        var lastReminderSourceRequestID: UUID?
+        var lastReminderQuietReferenceAt: Date?
         /// UUID of the warm request currently in flight for this conversation,
         /// or nil when no warm is mid-flight. The UI gates the "Send keep-alive"
         /// menu off this; the actor uses it as a defensive backstop so a stale
@@ -114,7 +121,7 @@ actor ProxySessionStore {
         /// Conversation is not Anthropic Messages flavored — the manual MVP
         /// only supports Claude Code traffic.
         case unsupportedFlavor
-        /// The raw request/response capture for this leaf has rolled out of
+        /// The raw request/response capture for this KA anchor has rolled out of
         /// the recent-exchange ring. The user must pick a fresher request.
         case sourceBodyUnavailable
     }
@@ -162,7 +169,7 @@ actor ProxySessionStore {
     private var treeDoneActivities: [UUID: ProxyRequestActivity] = [:]
 
     /// The in-memory content tree. Requests attach the moment their body is
-    /// parsed; leaf requests are consulted for UI display.
+    /// parsed; displayable tree requests are consulted for UI display.
     private var contentTree: ContentTree = ContentTree()
 
     // Byte counters for throughput and one-shot upload display.
@@ -618,7 +625,7 @@ actor ProxySessionStore {
                 // Untracked traffic: keep a short-lived copy in the done bucket.
                 insertUntrackedDoneRequest(entry.activity, for: entry.sessionID)
             } else if entry.activity.kind.storesDoneActivity {
-                // Tracked traffic: cache the full activity so tree-leaf rendering has
+                // Tracked traffic: cache the full activity so displayable tree rows have
                 // model name / byte counts / timing / cost even after the in-flight
                 // entry is dropped.
                 treeDoneActivities[id] = entry.activity
@@ -657,7 +664,8 @@ actor ProxySessionStore {
         }
 
         // Displayable requests come from the content tree — every successful
-        // request at a leaf-ish node, bucketed into the session that sent it.
+        // request without a successful descendant, bucketed into the session
+        // that sent it.
         // `isPendingReplacement` flags rows whose node has a descendant with
         // an in-flight request so the UI can dim them pending completion.
         // A conversation can span multiple sessions (rare but legal) so we
@@ -665,7 +673,7 @@ actor ProxySessionStore {
         // `ProxyRequestActivity` captured at completion so rows show
         // model / bytes / cost; fall back to a tree-only synthesis if the
         // cache has already expired.
-        var leafActivityBySession: [String: [ProxyRequestActivity]] = [:]
+        var displayableActivityBySession: [String: [ProxyRequestActivity]] = [:]
         for displayable in contentTree.displayableRequests() {
             guard let request = contentTree.requests[displayable.requestID] else { continue }
             var activity: ProxyRequestActivity
@@ -695,13 +703,13 @@ actor ProxySessionStore {
                 )
             }
             activity.isPendingReplacement = displayable.isPendingReplacement
-            leafActivityBySession[request.sessionID, default: []].append(activity)
+            displayableActivityBySession[request.sessionID, default: []].append(activity)
         }
 
         // For untracked sessions ("other" or missing flavor) merge in the
         // short-retention done bucket.
         for (sessionID, requests) in doneRequestsBySession {
-            leafActivityBySession[sessionID, default: []].append(contentsOf: requests)
+            displayableActivityBySession[sessionID, default: []].append(contentsOf: requests)
         }
 
         var selectionsBySession: [String: [KeepaliveSelection]] = [:]
@@ -714,7 +722,7 @@ actor ProxySessionStore {
             // most recent warm done from the session history bucket at the very
             // end — per docs/proxy-keepalive.md, warm done rows live outside the
             // lineage tree and only the latest survives per session.
-            var doneRequests = (leafActivityBySession[session.sessionID] ?? [])
+            var doneRequests = (displayableActivityBySession[session.sessionID] ?? [])
                 .sorted { ($0.completedAt ?? $0.startedAt) < ($1.completedAt ?? $1.startedAt) }
             let history = keepaliveHistoryBySession[session.sessionID]
             if let warm = history?.lastWarmActivity {
@@ -772,7 +780,7 @@ actor ProxySessionStore {
             doneRequestsBySession.removeValue(forKey: id)
             keepaliveHistoryBySession.removeValue(forKey: id)
         }
-        // Drop cached done-leaf activities whose tree-side request belonged
+        // Drop cached done activities whose tree-side request belonged
         // to an expired session. Rare (the content tree usually outlives
         // sessions) but keeps memory from leaking across evictions.
         treeDoneActivities = treeDoneActivities.filter { requestID, _ in
@@ -851,6 +859,10 @@ actor ProxySessionStore {
             latestSourceSessionID: request.sessionID,
             latestSourceIsActive: false,
             activatedAt: Date(),
+            lastWarmStartedAt: nil,
+            lastReminderSourceNodeID: nil,
+            lastReminderSourceRequestID: nil,
+            lastReminderQuietReferenceAt: nil,
             inFlightWarmRequestID: nil
         )
         keepaliveSelections[conversation.id] = selection
@@ -858,7 +870,7 @@ actor ProxySessionStore {
         return .activated(selection)
     }
 
-    /// Manual deactivation. Removes the selection entirely — the orange leaf
+    /// Manual deactivation. Removes the selection entirely — the orange KA anchor
     /// accent disappears and path tracking stops. Historical KA stats survive
     /// in the per-session `keepaliveHistoryBySession` bucket. Does not fire
     /// the auto-deactivate callback because the user took the action.
@@ -913,13 +925,110 @@ actor ProxySessionStore {
         if selection.inFlightWarmRequestID != nil {
             return .alreadyInFlight
         }
+        let startedAt = Date()
         let warmID = UUID()
         selection.inFlightWarmRequestID = warmID
+        selection.lastWarmStartedAt = startedAt
         keepaliveSelections[conversationID] = selection
         return .dispatched(
             KeepaliveWarmSource(selection: selection, exchange: exchange),
             warmID: warmID
         )
+    }
+
+    /// Atomically validate a reminder action and begin a warm dispatch.
+    /// Stale notification clicks no-op before the forwarder sees any source
+    /// material or sends anything upstream.
+    func beginReminderKeepaliveDispatch(
+        reminder: KeepaliveReminder,
+        now: Date = Date()
+    ) -> KeepaliveDispatchOutcome {
+        let reminderExpiresAt = reminder.issuedAt.addingTimeInterval(Self.keepaliveReminderActionWindowSeconds)
+        guard now <= reminderExpiresAt else {
+            ProxyLogger.log("Keep-alive: stale reminder action expired for conversation \(reminder.conversationID)")
+            return .notSelected
+        }
+        guard var selection = keepaliveSelections[reminder.conversationID],
+              let exchange = keepaliveExchangesByRequestID[selection.latestSourceRequestID] else {
+            ProxyLogger.log("Keep-alive: stale reminder action has no active selection for conversation \(reminder.conversationID)")
+            return .notSelected
+        }
+        guard selection.conversationID == reminder.conversationID,
+              selection.latestSourceNodeID == reminder.sourceNodeID,
+              selection.latestSourceRequestID == reminder.sourceRequestID,
+              selection.latestSourceSessionID == reminder.sourceSessionID else {
+            ProxyLogger.log("Keep-alive: stale reminder action source changed for conversation \(reminder.conversationID)")
+            return .notSelected
+        }
+        guard let currentReference = keepaliveQuietReference(for: selection),
+              currentReference == reminder.quietReferenceAt else {
+            ProxyLogger.log("Keep-alive: stale reminder action reference changed for conversation \(reminder.conversationID)")
+            return .notSelected
+        }
+        if let lastWarmStartedAt = selection.lastWarmStartedAt,
+           lastWarmStartedAt > reminder.issuedAt {
+            ProxyLogger.log("Keep-alive: stale reminder action follows a newer warm attempt for conversation \(reminder.conversationID)")
+            return .notSelected
+        }
+        if selection.inFlightWarmRequestID != nil {
+            ProxyLogger.log("Keep-alive: refusing reminder warm — already in flight for conversation \(reminder.conversationID)")
+            return .alreadyInFlight
+        }
+
+        let warmID = UUID()
+        selection.inFlightWarmRequestID = warmID
+        selection.lastWarmStartedAt = now
+        keepaliveSelections[reminder.conversationID] = selection
+        return .dispatched(
+            KeepaliveWarmSource(selection: selection, exchange: exchange),
+            warmID: warmID
+        )
+    }
+
+    /// Returns reminder notifications whose source has been quiet for 4m30s.
+    /// Each source request/node/quiet-reference tuple emits at most once.
+    func dueKeepaliveReminders(now: Date = Date()) -> [KeepaliveReminder] {
+        var reminders: [KeepaliveReminder] = []
+        for (conversationID, var selection) in keepaliveSelections {
+            guard selection.inFlightWarmRequestID == nil,
+                  let quietReferenceAt = keepaliveQuietReference(for: selection) else {
+                continue
+            }
+
+            let dueAt = quietReferenceAt.addingTimeInterval(Self.keepaliveReminderDelaySeconds)
+            guard now >= dueAt else { continue }
+            // Issuance window is intentionally short. Past `dueAt + 20s`
+            // (i.e. ~5m of source quiet) the Anthropic ephemeral cache is
+            // already at or beyond TTL, so a "reminder" loses its purpose
+            // — sending a warm then would create new cache rather than
+            // refresh existing cache. The refresh loop ticks frequently
+            // enough during normal proxy use that the window is rarely
+            // missed; we accept the silent drop in pathological cases
+            // (machine sleep/wake, suspended popover) instead of issuing
+            // a misleading reminder for a cache that's already gone.
+            let expiresAt = dueAt.addingTimeInterval(Self.keepaliveReminderActionWindowSeconds)
+            guard now <= expiresAt else { continue }
+
+            let alreadyReminded = selection.lastReminderSourceNodeID == selection.latestSourceNodeID
+                && selection.lastReminderSourceRequestID == selection.latestSourceRequestID
+                && selection.lastReminderQuietReferenceAt == quietReferenceAt
+            guard !alreadyReminded else { continue }
+
+            selection.lastReminderSourceNodeID = selection.latestSourceNodeID
+            selection.lastReminderSourceRequestID = selection.latestSourceRequestID
+            selection.lastReminderQuietReferenceAt = quietReferenceAt
+            keepaliveSelections[conversationID] = selection
+
+            reminders.append(KeepaliveReminder(
+                conversationID: conversationID,
+                sourceNodeID: selection.latestSourceNodeID,
+                sourceRequestID: selection.latestSourceRequestID,
+                sourceSessionID: selection.latestSourceSessionID,
+                quietReferenceAt: quietReferenceAt,
+                issuedAt: now
+            ))
+        }
+        return reminders
     }
 
     func keepaliveSelection(forConversationID conversationID: UUID) -> KeepaliveSelection? {
@@ -1069,6 +1178,29 @@ actor ProxySessionStore {
     private func keepaliveSourceIsReferenced(_ requestID: UUID) -> Bool {
         keepaliveSelections.values.contains {
             $0.requestID == requestID || $0.latestSourceRequestID == requestID
+        }
+    }
+
+    private func keepaliveQuietReference(for selection: KeepaliveSelection) -> Date? {
+        let sourceReference: Date?
+        if selection.latestSourceIsActive {
+            if let active = activeRequests[selection.latestSourceRequestID]?.activity {
+                sourceReference = active.lastDataAt ?? active.startedAt
+            } else {
+                sourceReference = nil
+            }
+        } else if let request = contentTree.requests[selection.latestSourceRequestID] {
+            sourceReference = request.finishedAt
+        } else {
+            sourceReference = treeDoneActivities[selection.latestSourceRequestID]?.completedAt
+        }
+
+        guard let sourceReference else { return nil }
+        switch selection.lastWarmStartedAt {
+        case .some(let warm):
+            return max(sourceReference, warm)
+        case .none:
+            return sourceReference
         }
     }
 
