@@ -205,6 +205,15 @@ The OpenAI Responses detection rule above is based on local observations from 20
 
 These observations are strong enough for conservative session identification. The lineage tree links child-thread traffic via `previous_response_id` when available.
 
+## Content blocklist gate
+
+After the body is parsed and the lineage fingerprint computed, but before registering the request in the session store and forwarding, the forwarder runs a content-filter check when `contentBlocklistEntries` is non-empty (`isEmpty` is O(1), so the gate is free when unconfigured):
+
+1. `sessionStore.previewTreeAttach(...)` computes the prefix-delta messages this request would add to the content tree — the same delta that would be stored as a new node — without mutating any state.
+2. `DeltaTextExtractor.scannableText(...)` extracts user-authored text only: Anthropic user-role `text` blocks and `tool_result` blocks, OpenAI `input_text` blocks and `function_call_output` items. Assistant turns, reasoning items, and non-text blocks are skipped.
+3. The compiled `ContentBlocklist` (built once at proxy start from `contentBlocklistEntries`) calls `firstMatch(in:)`. A blocking match at position P is exempted only when its full range is contained inside some whitelist match in the same text.
+4. On a positive match the forwarder returns `403` with body `"Blocked by content filter: matched <rule>"`, logs `error: "content-blocklist: <rule>"`, increments the failed metric, and writes a status snapshot. The request never registers in `ProxySessionStore`, never attaches to the tree, and never reaches upstream.
+
 ## Streaming path
 
 When the request body has `"stream": true`:
@@ -419,11 +428,40 @@ Stores a bounded source-of-truth copy of the exact proxied exchange without line
 | `request_json` | TEXT | Serialized raw request capture |
 | `response_json` | TEXT | Serialized raw response capture |
 
+### `proxy_keepalives`
+
+One row per completed keep-alive warm attempt. There is no FK to `proxy_requests` because warm requests do not get `proxy_requests` rows. Pruned on the same 24-hour cycle as `proxy_requests`. See [proxy-keepalive.md](proxy-keepalive.md) for spec-field mapping and frontier-kind semantics.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | TEXT PK | Keepalive attempt UUID |
+| `started_at` | TEXT NOT NULL | ISO 8601 start timestamp |
+| `completed_at` | TEXT NOT NULL | ISO 8601 completion timestamp |
+| `conversation_id` | TEXT NOT NULL | Conversation UUID (no FK constraint) |
+| `source_request_id` | TEXT NOT NULL | UUID of the source request used as the KA anchor |
+| `source_node_id` | TEXT NOT NULL | UUID of the source content-tree node |
+| `source_session` | TEXT NOT NULL | Session ID of the source request |
+| `frontier_kind` | TEXT NOT NULL | Synthesis case (`assistantText`, `toolUse`, `exactReplay`, …) |
+| `frontier_descriptor` | TEXT | Optional descriptor for the frontier (e.g. model name or tool name) |
+| `placeholder_inserted` | INTEGER NOT NULL | `1` when a synthetic assistant placeholder was injected |
+| `placeholder_tool_use_ids` | TEXT | JSON array of injected tool-use IDs, when applicable |
+| `upstream_status` | INTEGER | HTTP status returned by upstream |
+| `upstream_request_id` | TEXT | Upstream `request-id` when available |
+| `input_tokens` | INTEGER | Input tokens charged for the warm request |
+| `output_tokens` | INTEGER | Output tokens charged for the warm request |
+| `cache_read_tokens` | INTEGER | Cache-read tokens (indicates cache hit) |
+| `cache_creation_tokens` | INTEGER | Cache-creation tokens (indicates cache write) |
+| `estimated_cost_usd` | REAL | Estimated cost in USD |
+| `succeeded` | INTEGER NOT NULL | `1` on upstream 2xx, `0` otherwise |
+| `failure_reason` | TEXT | Error description on failure |
+
+Indexes: `started_at`, `conversation_id`.
+
 ## Retention and pruning
 
 - maximum event age: 24 hours
 - prune check interval: at most once every 5 minutes, opportunistically on writes
-- SQLite prune targets: `proxy_requests`, `proxy_lifecycle`
+- SQLite prune targets: `proxy_requests`, `proxy_lifecycle`, `proxy_keepalives`
 - `proxy_request_content` is cascade-deleted with its parent `proxy_requests` row
 - `proxy_raw_request_response` is cascade-deleted with its parent `proxy_requests` row and independently capped to the newest 1000 rows
 - `proxy_nodes` and `proxy_conversations` rows are removed via `ProxyEventLogger.pruneLineageMirror(...)` after the in-memory `ContentTree.prune(...)` drops them, so both sides stay in sync
@@ -482,8 +520,13 @@ Proxy settings live in `~/.tokenpulse/config.json` and are managed by `ConfigSer
 | `openAIUpstreamURL` | String | `"https://api.openai.com"` | Base URL for OpenAI Responses forwarding |
 | `saveProxyEventLog` | Bool | `true` | Master on/off for `ProxyEventLogger`. When enabled, the logger persists SQLite metadata, lineage-deduplicated request/response payloads, bounded raw exact request/response captures, and status snapshots. When disabled, no SQLite database is opened and no status snapshot is written. |
 | `keepaliveEnabled` | Bool | `false` | Manual keep-alive feature gate. When false the popover hides the **Activate keep-alive** affordance. Existing selections continue to function so a user toggling the flag off can wind down. Persisted only when true. |
+| `useSystemUpstreamProxy` | Bool | `true` | When no custom upstream proxy is enabled, the proxy uses the macOS system HTTP/HTTPS proxy settings for outbound forwarded traffic. When false, falls back to a direct connection. |
+| `upstreamHTTPSProxyEnabled` | Bool | `false` | Enable custom upstream HTTP/HTTPS proxy overrides. When true, the custom URLs below are used instead of the system proxy. The proxy must be restarted for upstream-proxy changes to take effect. |
+| `upstreamHTTPProxyURL` | String | `""` | Custom HTTP proxy URL for forwarded HTTP traffic only. Validated when `upstreamHTTPSProxyEnabled` is true. |
+| `upstreamHTTPSProxyURL` | String | `""` | Custom HTTPS proxy URL for forwarded HTTPS traffic only. Validated when `upstreamHTTPSProxyEnabled` is true. |
+| `contentBlocklistEntries` | `[ContentBlocklistEntry]` | `[]` | Content-filter rules applied to the user-authored portion of each request's lineage delta before forwarding. Each entry has a `keyword` (case-insensitive substring, or `re:`-prefixed regex) and an optional `whitelist` of exception patterns. Changes take effect on the next proxy restart. |
 
-The legacy `keepaliveIntervalSeconds`, `proxyInactivityTimeoutSeconds`, and `saveProxyPayloads` fields are still tolerated by the config migration (they were fields in version 6) but are no longer written or read by the live code. `keepaliveEnabled` was previously in the same legacy bucket; it is now read and written again as part of the manual keep-alive MVP. The current config schema version is `7`.
+The legacy `keepaliveIntervalSeconds`, `proxyInactivityTimeoutSeconds`, and `saveProxyPayloads` fields are still tolerated by the config migration (they were fields in version 6) but are no longer written or read by the live code. `keepaliveEnabled` was previously in the same legacy bucket; it is now read and written again as part of the manual keep-alive MVP. The v11→v12 migration folded the flat `[String]` field `contentBlocklistKeywords` into structured `[ContentBlocklistEntry]` rows; `contentBlocklistKeywords` is still decoded for migration and the entries are promoted with empty whitelists, but it is never written back. The current config schema version is `12`.
 
 Legacy `proxyUpstreamURL` is still read during config migration and mapped to `anthropicUpstreamURL`.
 

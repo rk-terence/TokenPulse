@@ -13,14 +13,13 @@ swift build
 # Package a release .app bundle (adhoc-signed) at dist/TokenPulse.app
 bash Scripts/package_app.sh
 
-# Install for local use: replace ~/Applications/TokenPulse.app
-mkdir -p ~/Applications
-rm -rf ~/Applications/TokenPulse.app
-ditto dist/TokenPulse.app ~/Applications/TokenPulse.app
+# Install for local use: package + replace ~/Applications/TokenPulse.app
+# (runs package_app.sh, then dittos into place)
+bash Scripts/install.sh
 ```
 
 - If the user asks to "build" the app, default to `swift build` (debug).
-- If the user asks to "install" the app, default to `bash Scripts/package_app.sh` + the `ditto` copy above.
+- If the user asks to "install" the app, default to `bash Scripts/install.sh`.
 - `Scripts/package_app.sh` honors `CONFIGURATION` (default `release`), `OUTPUT_DIR` (default `dist/`), and `TOKENPULSE_SIGNING` from the current shell environment or `./.env`:
   - `adhoc` (default) — `codesign --sign -` with `TokenPulse/TokenPulse.entitlements`. No developer account needed, but the signature hash changes every rebuild, which re-prompts Keychain ACLs and invalidates Login Items approval.
   - `off` — skip codesign entirely (the bundle won't launch on Apple Silicon).
@@ -52,6 +51,7 @@ ditto dist/TokenPulse.app ~/Applications/TokenPulse.app
 - Notifications fire when 5-hour utilization crosses 50% or 80%, and when quota windows reset, with jitter filtering.
 - File I/O for config and usage export must use `.atomic` writes.
 - Proxy must listen on `127.0.0.1` only, never all interfaces.
+- Content blocklist is a forwarder-side gate that runs before upstream forwarding and before the request is registered in `ProxySessionStore`; each `ContentBlocklistEntry` is a `keyword` (case-insensitive substring, or `re:`-prefixed regex) plus an optional `whitelist` of exception patterns. The forwarder previews the would-be lineage delta via `ProxySessionStore.previewTreeAttach(...)`, extracts user-authored text only via `DeltaTextExtractor` (skipping assistant turns, reasoning, and non-text blocks), and rejects with `403` when any rule has a blocking match not fully covered by one of that rule's whitelist matches; blocked requests never attach to the content tree, never accrue cost, and log `error: "content-blocklist: <rule>"`. Rules are compiled at proxy start; entry changes require restart.
 - Keep-alive ships as a manual MVP for Anthropic Messages traffic; full design in [docs/proxy-keepalive.md](docs/proxy-keepalive.md). Synthetic warm requests bypass the content tree and organic session totals; per-conversation cumulative cost and warm-attempt counts persist in the per-session `KeepaliveSessionHistory` bucket. Reminder notifications may issue near the prompt-cache TTL but never auto-send warm requests; the action button routes back through actor-isolated stale-click validation in `ProxySessionStore.beginReminderKeepaliveDispatch(...)`.
 - Proxy content-tree tracking is universal across supported providers (Anthropic Messages, OpenAI Responses), but lineage normalization is provider-specific and minimally destructive. Anthropic strips prompt-caching markers and coalesces equivalent consecutive turns; OpenAI preserves ordered non-message `input` items and normalizes string message `content` to typed text input. Requests with a lineage fingerprint attach to the in-memory `ContentTree` before upstream; node deltas are immutable, `done`/`active` live on requests, and terminal requests prune after 24 hours.
 - Event logging uses SQLite with `journal_mode = WAL`, `synchronous = NORMAL`, and 24-hour retention. A single `saveProxyEventLog` toggle controls metadata, lineage-deduplicated payload capture, and the bounded raw source-of-truth request/response table; there is no separate payload or raw-capture opt-in. Raw exact captures are capped to the newest 1000 rows.

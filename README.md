@@ -23,6 +23,7 @@ A macOS menu bar app that monitors AI platform token usage and adds local proxy 
 - **Traffic indicator** — Menu bar arrows and bar animate when the proxy forwards requests and completions
 - **Event logging** — Structured SQLite event log with 24-hour retention, lineage-deduplicated payload capture, and a bounded raw request/response table for exact source-of-truth copies
 - **Status snapshots** — Atomic JSON snapshots at `~/.tokenpulse/proxy_status.json` for external tooling whenever `saveProxyEventLog` is enabled
+- **Content blocklist** — Configured rules block proxy requests containing certain keywords or regexes (with per-rule whitelist exceptions). Only user-authored content is scanned; blocked requests return `403` before reaching upstream.
 
 ### General
 
@@ -45,7 +46,7 @@ A macOS menu bar app that monitors AI platform token usage and adds local proxy 
 - **Local observability proxy** — TokenPulse can sit between your AI tools and the upstream API, adding per-session traffic, token, and cost visibility plus a universal lineage tree for popup display, lineage-aware payload deduplication, and bounded raw request/response capture. It gives you a view into usage that upstream tools usually do not expose locally.
 - **ZenMux support** — TokenPulse supports ZenMux out of the box via their official Management API. ZenMux is a niche provider that CodexBar doesn't cover, and likely too niche for them to want to maintain.
 - **One glance, no mode switch** — CodexBar shows two stacked bars per provider with multiple display modes. TokenPulse shows the active provider's primary-window utilization directly in the icon, so you can read current usage without opening a detail view.
-- **Minimal by design** — TokenPulse is ~28 source files with a simple `UsageProvider` protocol and an actor-based proxy subsystem. No SwiftSyntax macros, no helper processes, no multi-strategy fallback chains. The entire codebase is easy to audit, fork, and modify.
+- **Minimal by design** — TokenPulse is ~32 source files with a simple `UsageProvider` protocol and an actor-based proxy subsystem. No SwiftSyntax macros, no helper processes, no multi-strategy fallback chains. The entire codebase is easy to audit, fork, and modify.
 - **Machine-readable output** — Provider refresh results write a normalized snapshot to `~/.tokenpulse/raw_usage.json`, and the proxy can write status snapshots to `~/.tokenpulse/proxy_status.json` whenever proxy logging infrastructure is enabled. Shell scripts and external tools can consume both without scraping or IPC.
 
 If you use many AI providers and want comprehensive coverage, use CodexBar. If you use Codex and/or ZenMux and want something small and direct with local proxy observability, TokenPulse is for you.
@@ -66,10 +67,8 @@ swift build
 # Release .app bundle at dist/TokenPulse.app (adhoc-signed)
 bash Scripts/package_app.sh
 
-# Install to ~/Applications
-mkdir -p ~/Applications
-rm -rf ~/Applications/TokenPulse.app
-ditto dist/TokenPulse.app ~/Applications/TokenPulse.app
+# Or, build + package + install to ~/Applications in one step
+bash Scripts/install.sh
 ```
 
 #### Signing mode
@@ -139,6 +138,7 @@ The proxy is a full HTTP/1.1 server built on Network.framework. Anthropic Messag
 - **Forwarding** — Requests are forwarded to the upstream URL with streaming SSE passthrough. Token usage is parsed from JSON responses and from terminal usage events in SSE streams.
 - **Cost tracking** — Per-session counters track input/output/cache-read/cache-write tokens, completed server-side Web Search calls, and estimated cost using provider-specific pricing tables. The popover shows active sessions with their request counts and running cost.
 - **Traffic indicator** — When the proxy forwards a request, the menu bar arrows glow and the bar/particle track animates to reflect request and completion activity.
+- **Content blocklist** — Optional rules block requests whose user-authored content matches a configured keyword or regex; matched requests fail fast with `403` before forwarding upstream and never accrue cost. Configure under Settings > Proxy > Content Blocklist.
 
 ### Keepalive status
 
@@ -167,6 +167,7 @@ All fields are in `~/.tokenpulse/config.json`:
 | `upstreamHTTPProxyURL` | `""` | Custom HTTP proxy URL for HTTP traffic only |
 | `upstreamHTTPSProxyURL` | `""` | Custom HTTPS proxy URL for HTTPS traffic only |
 | `saveProxyEventLog` | `true` | Master on/off for the proxy event log. When enabled, SQLite metadata, lineage-deduplicated payloads, bounded raw request/response captures, and status snapshots are written; when disabled, no database is opened |
+| `contentBlocklistEntries` | `[]` | Array of content-blocking rules. Each entry has a `keyword` (case-insensitive substring, or `re:`-prefixed regex) and an optional `whitelist` of exception patterns. A request is blocked when any rule's blocking-keyword match isn't fully covered by one of that rule's whitelist matches in the same scannable user-authored text. Changes take effect on the next proxy restart. |
 
 ## Data export
 
@@ -201,8 +202,8 @@ TokenPulse/
 ├── App/            # AppDelegate, StatusBarController, entry point
 ├── Models/         # UsageData, ProviderStatus, ProviderConfig
 ├── Providers/      # UsageProvider protocol + Codex and ZenMux implementations
-├── Services/       # KeychainService, ConfigService, PollingManager, ProviderManager, NotificationService
-├── Proxy/          # HTTP server, route handlers, request forwarder, session store, event logger, metrics
+├── Services/       # KeychainService, ConfigService, PollingManager, ProviderManager, NotificationService, UsageExporter, UpstreamNetworking
+├── Proxy/          # HTTP server, route handlers, request forwarder, session store, event logger, metrics, keep-alive synthesizer, content blocklist
 ├── Views/          # PopoverView, SettingsView (SwiftUI)
 └── Rendering/      # BarIconRenderer (Core Graphics)
 ```

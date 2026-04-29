@@ -224,6 +224,7 @@ Every warm request emits one row to the `proxy_keepalives` table (added in event
 | placeholder inserted | `placeholder_inserted` |
 | placeholder tool_use IDs (JSON array) | `placeholder_tool_use_ids` |
 | upstream HTTP status / request id | `upstream_status`, `upstream_request_id` |
+| `input_tokens` (Anthropic billed input tokens — the small synthetic suffix delta plus any actual cache miss) | `input_tokens` |
 | `cache_read_input_tokens` | `cache_read_tokens` |
 | `cache_creation_input_tokens` | `cache_creation_tokens` |
 | output tokens | `output_tokens` |
